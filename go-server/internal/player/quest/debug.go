@@ -52,7 +52,14 @@ func HandleTest(c Conn, d Deps, data []byte) {
 			fin := def != nil && q.Stage >= def.StageCount
 			reply = fmt.Sprintf("m11:%s=%d/%d fin=%v", pkt.Key, q.Stage, q.SubStage, fin)
 		case "ach":
-			reply = fmt.Sprintf("m11:ach:%s=%d/%d", pkt.Key, st.Achs[pkt.Key], Achs[pkt.Key].StageCount)
+			// Nil-guard: unknown achievement keys previously panicked on
+			// Achs[key].StageCount dereference.
+			def := Achs[pkt.Key]
+			if def == nil {
+				reply = fmt.Sprintf("m11:ach:%s=?/?", pkt.Key)
+				break
+			}
+			reply = fmt.Sprintf("m11:ach:%s=%d/%d", pkt.Key, st.Achs[pkt.Key], def.StageCount)
 		case "pending":
 			reply = fmt.Sprintf("m11:pending:%s=%v", pkt.Key, st.PendingStart[pkt.Key])
 		case "drops": // gate probe: how many codersglitch drops available

@@ -123,6 +123,7 @@ func MaxDamageFloat(damageBonus, damageLevel int, attackStyle string, critical b
 // 1), melee sums the positive schools. The root reads the bot's
 // archer/magic flags and crush/slash/stab/magicStat/archery stats; here they
 // are explicit args.
+// Deprecated: use AccuracyModifier for triangle-advantage-aware weight.
 func AccuracyWeight(archer, magic bool, crush, slash, stab, magicStat, archery int) float64 {
 	if archer {
 		if archery > 0 {
@@ -148,19 +149,102 @@ func AccuracyWeight(archer, magic bool, crush, slash, stab, magicStat, archery i
 	return total
 }
 
+// AccuracyModifier computes the accuracy weight modifier with triangle
+// advantage (formulas.ts getAccuracyWeight). Per-style weight is
+// (attackStat - defenseStat) / 3. For melee, the primary attack style
+// (highest attack stat) vs primary defense style (highest defense stat)
+// determines the crush>slash>stab>crush triangle bonus/penalty. For
+// archers/mages, the own-school weight is always a bonus.
+func AccuracyModifier(archer, magic bool,
+	atkCrush, atkSlash, atkStab, atkMagic, atkArchery int,
+	defCrush, defSlash, defStab, defMagic, defArchery int) float64 {
+	if archer {
+		w := float64(atkArchery-defArchery) / 3
+		if w < 0 {
+			w = 0
+		}
+		return math.Max(w, 1)
+	}
+	if magic {
+		w := float64(atkMagic-defMagic) / 3
+		if w < 0 {
+			w = 0
+		}
+		return math.Max(w, 1)
+	}
+	// Melee: per-school (attack - defense) / 3, positives summed.
+	wCrush := float64(atkCrush-defCrush) / 3
+	wSlash := float64(atkSlash-defSlash) / 3
+	wStab := float64(atkStab-defStab) / 3
+	total := 0.0
+	for _, w := range []float64{wCrush, wSlash, wStab} {
+		if w > 0 {
+			total += w
+		}
+	}
+	// Primary attack style (highest attack stat).
+	primaryAtk, primaryAtkVal := 0, atkCrush // 0=crush
+	if atkSlash > primaryAtkVal {
+		primaryAtk, primaryAtkVal = 1, atkSlash
+	}
+	if atkStab > primaryAtkVal {
+		primaryAtk = 2
+	}
+	// Primary defense style (highest defense stat).
+	primaryDef, primaryDefVal := 0, defCrush // 0=crush
+	if defSlash > primaryDefVal {
+		primaryDef, primaryDefVal = 1, defSlash
+	}
+	if defStab > primaryDefVal {
+		primaryDef = 2
+	}
+	// No triangle step when primary styles match or no attack stat.
+	if primaryAtk == primaryDef || primaryAtkVal == 0 {
+		if total < 1 {
+			total = 1
+		}
+		return total
+	}
+	// Triangle: crush>slash>stab>crush.
+	var wSchool float64
+	switch primaryAtk {
+	case 0:
+		wSchool = wCrush
+	case 1:
+		wSchool = wSlash
+	case 2:
+		wSchool = wStab
+	}
+	advantage := (primaryAtk == 0 && primaryDef == 1) || // crush > slash
+		(primaryAtk == 1 && primaryDef == 2) || // slash > stab
+		(primaryAtk == 2 && primaryDef == 0) // stab > crush
+	if advantage {
+		total += wSchool
+	} else {
+		total -= wSchool / 2
+	}
+	if total < 1 {
+		total = 1
+	}
+	return total
+}
+
 // Accuracy mirrors combatAccuracy (main.go): MAX_ACCURACY + bonus term +
-// level term + target defense term (dummy defense level 1) + stat-weight
-// term, -0.15 on crit, clamped to [0.7, 2.0]. The root reads
-// ModulesMaxAccuracy/ModulesMaxLevel plus the bot's accuracyBonus,
-// accuracyLevel and weight; here every input is an explicit arg.
-func Accuracy(maxAccuracy float64, maxLevel, accuracyBonus, accuracyLevel int, weight float64, critical bool) float64 {
+// level term + target defense term + stat-weight term, -0.15 on crit,
+// clamped to [0.7, 2.0]. Negative weight applies a flat +1.5 penalty
+// (formulas.ts triangle disadvantage); positive weight uses the sqrt curve.
+func Accuracy(maxAccuracy float64, maxLevel, accuracyBonus, accuracyLevel int, defenseLevel int, weight float64, critical bool) float64 {
 	acc := maxAccuracy
 	if bonus := float64(accuracyBonus); bonus <= 70 {
 		acc += 1 - bonus/70
 	}
 	acc += float64(maxLevel-accuracyLevel+1) * 0.01
-	acc += 1 * 0.0175 // dummy defense level 1
-	acc += -(math.Sqrt(weight) / 22.36) + 1
+	acc += float64(defenseLevel) * 0.0175
+	if weight < 0 {
+		acc += 1.5
+	} else {
+		acc += -(math.Sqrt(weight) / 22.36) + 1
+	}
 	if critical {
 		acc -= 0.15
 	}
@@ -190,4 +274,24 @@ func RollDamage(maxDamage, accuracy, r float64, remainingHP int) int {
 		dmg = 0
 	}
 	return dmg
+}
+
+// HeroMaxHPForLevel mirrors formulas.ts getMaxHitPoints: 39 + level * 30.
+// The TS server scales hero max HP by combat level; the Go stub previously
+// used a hardcoded 100 (level-1 value).
+func HeroMaxHPForLevel(level int) int {
+	if level < 1 {
+		level = 1
+	}
+	return 39 + level*30
+}
+
+// HeroMaxManaForLevel mirrors formulas.ts getMaxMana: 20 + level * 24.
+// The TS server scales hero max mana by combat level; the Go stub previously
+// used a hardcoded 50 (level-1 value).
+func HeroMaxManaForLevel(level int) int {
+	if level < 1 {
+		level = 1
+	}
+	return 20 + level*24
 }

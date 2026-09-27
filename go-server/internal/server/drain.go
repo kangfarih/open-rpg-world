@@ -9,8 +9,8 @@
 // flush barrier runs (persist + quests + guilds/friends rows), and the
 // process exits.
 //
-// Started from m5Init (same frozen boot step; BootOrder unchanged). The old
-// m5Init "signal -> final flush -> exit" handler is replaced by this
+// Started from initPlayerState (same frozen boot step; BootOrder unchanged). The old
+// initPlayerState "signal -> final flush -> exit" handler is replaced by this
 // driver: with zero players connected the observable behavior is the same
 // (flush + exit), preceded by the DRAINING state flip.
 package server
@@ -102,16 +102,17 @@ func evacuateStragglers() {
 }
 
 // preShutdownFlush is the DRAINING -> SHUTDOWN barrier: per-user persist
-// rows (m5 player rows sync, m11 quest rows, social friends rows) for any
-// still-online players — the disconnect hooks already covered the gone
-// ones — then the final dirty sweep. Guild rows write through on every
-// mutation, so no guild queue exists to flush.
+// rows (m5 player rows sync, m11 quest rows, abilities unlocks, social
+// friends rows) for any still-online players — the disconnect hooks already
+// covered the gone ones — then the final dirty sweep. Guild rows write
+// through on every mutation, so no guild queue exists to flush.
 func preShutdownFlush() {
-	for _, n := range m7PlayerUsernames() {
-		m5SaveSync(n)
-		m11PersistQuests(n)
+	for _, n := range playerUsernames() {
+		savePlayerSync(n)
+		persistQuests(n)
 		social.FlushUser(n)
 	}
+	abFlushShutdown()
 	flushDirty()
 }
 
@@ -136,9 +137,9 @@ func startShardClient() {
 	}
 	c := hub.NewClient(addr, hub.SharedToken(), hub.ShardName(), hub.NewRouter(), nil, deliverRelayToLocal)
 	c.SetBuild(version.BuildID, version.GVer, app.ListenAddr(os.Getenv("PORT")))
-	c.SetPlayersProvider(m7PlayerUsernames)
+	c.SetPlayersProvider(playerUsernames)
 	c.SetRegions(hub.ShardRegions())
-	c.SetLocalCheck(func(username string) bool { return m7PlayerByName(username) != nil })
+	c.SetLocalCheck(func(username string) bool { return playerByName(username) != nil })
 	c.SetHandoffHandler(applyHandoffRequest)
 	c.SetOnPreferred(func(string) { bannerOnPreferredAll() })
 	shardHubClient = c

@@ -87,15 +87,19 @@ func doorStage(raw json.RawMessage) int {
 
 // loadDoors links raw door entries like map.ts loadDoors. width is the map
 // width for coordToIndex. Returns the entry-index -> linked-door table.
+// A non-positive width yields an empty table (no valid tile indexes).
 func loadDoors(raw []rawDoor, width int) map[int]*Door {
+	out := make(map[int]*Door)
+	if width <= 0 {
+		return out
+	}
 	clone := make([]rawDoor, len(raw))
 	copy(clone, raw)
 	byID := make(map[int]*rawDoor, len(clone))
 	for i := range clone {
 		byID[clone[i].ID] = &clone[i]
 	}
-	out := make(map[int]*Door)
-	for _, d := range raw {
+	for _, d := range clone {
 		if d.Destination == 0 {
 			continue // no destination (6 entries in the shipped map)
 		}
@@ -130,6 +134,9 @@ func loadDoors(raw []rawDoor, width int) map[int]*Door {
 func DoorAt(x, y int) *Door {
 	areasMu.Lock()
 	defer areasMu.Unlock()
+	if areasWidth <= 0 {
+		return nil
+	}
 	return doors[doorIndex(x, y)]
 }
 

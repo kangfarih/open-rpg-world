@@ -16,15 +16,17 @@
 //  8. teleport to the linked destination.
 //
 // Parity notes (documented divergences):
-//   - Quest doorCallback: the Go quest engine has NO per-quest doorCallback
-//     seam. TS quest/impl defines two custom handleDoor overrides
+//   - Quest doorCallback: the Go quest engine exposes HandleDoor for the
+//     default Quest.handleDoor semantics (stage gate + isDoorTask progress).
+//     TS quest/impl defines two custom handleDoor overrides
 //     (anvilsechoes: NPC "don't go in there" talk instead of the plain
 //     notify; evilsanta: WHY_GO_THERE / DONT_THINK_GO_IN notifies + its own
 //     reqItem leg before super). The port applies the DEFAULT Quest
 //     handleDoor semantics for every quest door: stage < door.stage blocks
-//     with misc:CANNOT_PASS_DOOR, otherwise the door teleports. Door-task
-//     progression (isDoorTask -> progress) is skipped — the Go engine
-//     models quest progress via talk/kill/resource only.
+//     with misc:CANNOT_PASS_DOOR, otherwise the door teleports AND a
+//     `task: door` stage progresses via quest.HandleDoor (wired below).
+//     The per-quest custom notifies stay unported (same user-visible
+//     block, different string) — documented, not diverged silently.
 //   - Unknown quest/achievement keys block (CANNOT_PASS_DOOR /
 //     NO_*_DOOR with an empty name). TS would dereference undefined
 //     (quest.doorCallback on a missing quest); blocking is the safe port.
@@ -34,6 +36,7 @@ import (
 	"fmt"
 
 	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/player/quest"
 )
 
 // doorCtx carries everything the gate reads (built from globals by the
@@ -101,7 +104,7 @@ func planDoor(d *entity.Door, ctx doorCtx) doorPlan {
 		return plan
 	}
 
-	// Achievement finish rides the quest.Finish path (m11FinishAchievement).
+	// Achievement finish rides the quest.Finish path (finishAchievement).
 	if d.Achievement != "" {
 		plan.FinishAch = d.Achievement
 	}
@@ -139,7 +142,7 @@ func planDoor(d *entity.Door, ctx doorCtx) doorPlan {
 // doorCtxFor builds the gate context for a live connection.
 func doorCtxFor(c *playerConn, d *entity.Door) doorCtx {
 	var ctx doorCtx
-	st := m5StateFor(c.Username)
+	st := playerStateFor(c.Username)
 	pstateMu.Lock()
 	ctx.CombatLevel = st.Level
 	if d.Skill != "" {
@@ -153,28 +156,28 @@ func doorCtxFor(c *playerConn, d *entity.Door) doorCtx {
 	pstateMu.Unlock()
 
 	if d.Quest != "" {
-		if def := m11Q[d.Quest]; def != nil {
+		if def := questDefs[d.Quest]; def != nil {
 			ctx.QuestKnown = true
 			ctx.QuestName = def.Raw.Name
-			ctx.QuestStage = m11StateFor(c.Username).PlayerState.Quest(d.Quest).Stage
+			ctx.QuestStage = questStateFor(c.Username).PlayerState.Quest(d.Quest).Stage
 		}
 	}
 	if d.ReqAchievement != "" {
-		if def := m11A[d.ReqAchievement]; def != nil {
+		if def := achDefs[d.ReqAchievement]; def != nil {
 			ctx.ReqAchKnown = true
 			ctx.ReqAchName = def.Raw.Name
-			ctx.ReqAchFinished = m11StateFor(c.Username).PlayerState.Achs[d.ReqAchievement] >= def.StageCount
+			ctx.ReqAchFinished = questStateFor(c.Username).PlayerState.Achs[d.ReqAchievement] >= def.StageCount
 		}
 	}
 	if d.ReqQuest != "" {
-		if def := m11Q[d.ReqQuest]; def != nil {
+		if def := questDefs[d.ReqQuest]; def != nil {
 			ctx.ReqQuestKnown = true
 			ctx.ReqQuestName = def.Raw.Name
-			ctx.ReqQuestFinished = m11StateFor(c.Username).PlayerState.IsFinished(d.ReqQuest)
+			ctx.ReqQuestFinished = questStateFor(c.Username).PlayerState.IsFinished(d.ReqQuest)
 		}
 	}
 	if d.ReqItem != "" {
-		ctx.InvCount = m6InvCount(c.Username, d.ReqItem)
+		ctx.InvCount = invCount(c.Username, d.ReqItem)
 	}
 	return ctx
 }
@@ -196,10 +199,10 @@ func handleDoorStep(c *playerConn) {
 
 	// Achievement finish fires before the req gates (TS order).
 	if plan.FinishAch != "" {
-		m11FinishAchievement(c, plan.FinishAch)
+		finishAchievement(c, plan.FinishAch)
 	}
 	if plan.BlockMsg != "" {
-		m6Notify(c, plan.BlockMsg)
+		notifyPlayer(c, plan.BlockMsg)
 		return
 	}
 	if plan.ConsumeItem {
@@ -207,10 +210,16 @@ func handleDoorStep(c *playerConn) {
 		if need < 1 {
 			need = 1
 		}
-		m6RemoveItem(c.Username, d.ReqItem, need)
+		invRemoveItem(c.Username, d.ReqItem, need)
 		if plan.Crumble {
-			m6Notify(c, "misc:DOOR_KEY_CRUMBLES")
+			notifyPlayer(c, "misc:DOOR_KEY_CRUMBLES")
 		}
 	}
-	m7Teleport(c, d.DestX, d.DestY)
+	// Quest door-task progress (quest.ts handleDoor isDoorTask parity): the
+	// stage gate above already passed, so a `task: door` stage advances here.
+	// Teleport stays below (HandleDoor progresses only — no double teleport).
+	if d.Quest != "" {
+		quest.HandleDoor(questWrapConn(c), questDeps(), c.Username, d.Quest)
+	}
+	teleport(c, d.DestX, d.DestY)
 }

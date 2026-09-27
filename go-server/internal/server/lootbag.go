@@ -47,6 +47,9 @@ func lootBagOpenItems(inst string) ([]any, bool) {
 // sendLootBagOpen unicasts LootBag Open {items} and records the opener
 // (lootbag.open parity). Reports false when inst is not a live bag.
 func sendLootBagOpen(c *playerConn, inst string) bool {
+	if c == nil || c.Conn == nil || inst == "" {
+		return false
+	}
 	items, ok := lootBagOpenItems(inst)
 	if !ok {
 		return false
@@ -62,16 +65,19 @@ func sendLootBagOpen(c *playerConn, inst string) bool {
 // lootBagOwnerDenied mirrors the handleMovementStop gate: a bag owned by
 // someone else notifies the attempter and stays shut.
 func lootBagOwnerDenied(c *playerConn, owner string) bool {
-	if owner == "" || owner == c.Username {
+	if c == nil || owner == "" || owner == c.Username {
 		return false
 	}
-	m6Notify(c, "This lootbag belongs to "+owner+".")
+	notifyPlayer(c, "This lootbag belongs to "+owner+".")
 	return true
 }
 
 // openLootBagFor is the Step entry: owner gate, then Open only (no take —
 // TS opens instead of instant-take on movement stop).
 func openLootBagFor(c *playerConn, inst string) {
+	if c == nil || c.Conn == nil || inst == "" {
+		return
+	}
 	l, ok := entity.FindLoot(inst)
 	if !ok || !l.Bag {
 		return
@@ -110,6 +116,9 @@ func handleLootBagReq(c *playerConn, frame clientFrame) {
 // ownership, distance, slot-exists, owner-failsafe, space, transfer, and
 // destroy-vs-Take-broadcast.
 func takeLootBagItem(c *playerConn, index int) {
+	if c == nil || c.Conn == nil {
+		return
+	}
 	inst, ok := entity.ActiveBag(c.Instance)
 	if !ok {
 		log.Printf("lootbag: %s take without an open bag (ignored)", c.Instance)
@@ -120,7 +129,7 @@ func takeLootBagItem(c *playerConn, index int) {
 		return
 	}
 	if l.Owner != "" && l.Owner != c.Username {
-		m6Notify(c, "item:CANNOT_ACCESS_LOOTBAG")
+		notifyPlayer(c, "item:CANNOT_ACCESS_LOOTBAG")
 		return
 	}
 	if dx, dy := abs(c.Sess.PlayerX-l.X), abs(c.Sess.PlayerY-l.Y); dx+dy > 1 {
@@ -143,22 +152,22 @@ func takeLootBagItem(c *playerConn, index int) {
 		return
 	}
 	if l.Owner != "" && l.Owner != c.Username {
-		m6Notify(c, "item:CANNOT_ACCESS_LOOTBAG")
+		notifyPlayer(c, "item:CANNOT_ACCESS_LOOTBAG")
 		return
 	}
-	st := m5StateFor(c.Username)
+	st := playerStateFor(c.Username)
 	pstateMu.Lock()
 	invLen := len(st.Inv)
 	pstateMu.Unlock()
 	if ModulesInventorySize-invLen < 1 {
-		m6Notify(c, "misc:NO_SPACE")
+		notifyPlayer(c, "misc:NO_SPACE")
 		return
 	}
 	taken, remaining, ok := entity.TakeBagItem(inst, index)
 	if !ok {
 		return
 	}
-	idx := m5AddItem(c.Username, taken.Key, taken.Count)
+	idx := addItem(c.Username, taken.Key, taken.Count)
 	_ = gnet.Send(c.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 		Type: ContainerTypeInventory,
 		Slot: &slotData{Index: idx, Key: taken.Key, Count: taken.Count, Enchantments: map[string]any{}},

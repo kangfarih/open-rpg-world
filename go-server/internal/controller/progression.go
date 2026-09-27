@@ -406,14 +406,18 @@ func AdminProgressionCommands(c CommandConn, command string, blocks []string, d 
 			d.Bus.Notify(c.InstanceID(), "Malformed command, expected /setrank username rank")
 			return
 		}
-		target, ok := d.Peers.ByUsername(username)
-		if !ok {
-			d.Ranks.SetRankOffline(username, RankNameToID[rankText])
-			return
-		}
+		// The rank token validates on both paths: an unknown name must
+		// notify Invalid rank, never persist the zero value offline
+		// (TS only guards the online path — the offline NaN write is
+		// the bug being fixed here).
 		rank, ok := RankNameToID[rankText]
 		if !ok {
 			d.Bus.Notify(c.InstanceID(), fmt.Sprintf("Invalid rank: %s", rankText))
+			return
+		}
+		target, ok := d.Peers.ByUsername(username)
+		if !ok {
+			d.Ranks.SetRankOffline(username, rank)
 			return
 		}
 		d.Ranks.SetRank(target, rank)

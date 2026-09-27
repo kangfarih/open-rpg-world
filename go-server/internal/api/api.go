@@ -33,8 +33,15 @@ package api
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
+
+	"github.com/getsentry/sentry-go"
+	sentryhttp "github.com/getsentry/sentry-go/http"
 )
 
 // ---------------------------------------------------------------------------
@@ -107,6 +114,35 @@ type Health struct {
 	GVer    string `json:"gVer,omitempty"`
 }
 
+// LeaderboardProvider supplies leaderboard data (TS hub GET /leaderboards
+// parity). The provider is called by the handler; caching lives in the
+// leaderboard package, not here.
+type LeaderboardProvider interface {
+	TotalExperience() ([]LeaderboardEntry, error)
+	SkillExperience(skillID int) ([]LeaderboardEntry, error)
+	MobKills(mobKey string) ([]LeaderboardEntry, error)
+	PvPKills() ([]LeaderboardEntry, error)
+	AvailableMobs() map[string]string
+	ValidSkill(id int) bool
+}
+
+// LeaderboardEntry is a single leaderboard row (generic shape; the handler
+// serialises with the TS-matching JSON keys per category).
+type LeaderboardEntry struct {
+	Username string `json:"username"`
+	Value    int    `json:"-"` // handler maps to the right JSON key
+	// Typed fields for each category (only one is set per entry).
+	TotalXP int `json:"totalExperience,omitempty"`
+	XP      int `json:"experience,omitempty"`
+	Kills   int `json:"kills,omitempty"`
+	PvPKills int `json:"pvpKills,omitempty"`
+}
+
+// UptimeProvider supplies the server start time for the admin dashboard.
+type UptimeProvider interface {
+	StartTime() time.Time
+}
+
 // ---------------------------------------------------------------------------
 // Server.
 // ---------------------------------------------------------------------------
@@ -117,37 +153,67 @@ type Health struct {
 // Health is optional (nil => /healthz reports a static RUNNING stub);
 // set it after construction to report the live drain state.
 type Server struct {
-	Players Players
-	Guilds  Guilds
-	Status  StatusProvider
-	Health  HealthProvider
+	Players     Players
+	Guilds      Guilds
+	Status      StatusProvider
+	Health      HealthProvider
+	Leaderboards LeaderboardProvider
+	Uptime      UptimeProvider
+
+	// SentryDSN enables Sentry error tracking when non-empty (TS config.sentryDsn
+	// parity). Initialize Sentry before constructing the Server; the middleware
+	// wraps the handler to capture panics and errors.
+	SentryDSN string
 
 	mux *http.ServeMux
 }
 
-// NewServer wires GET /status, GET /guilds, GET /players/{name} and GET
-// /healthz. Providers may be nil (see per-handler fallbacks), but callers
-// normally supply all three. NewServer registers routes only; it starts
-// nothing.
+// NewServer wires GET /status, GET /guilds, GET /players/{name}, GET
+// /healthz, GET /leaderboards, and GET /admin. Providers may be nil (see
+// per-handler fallbacks), but callers normally supply all three. NewServer
+// registers routes only; it starts nothing.
 func NewServer(players Players, guilds Guilds, status StatusProvider) *Server {
 	s := &Server{Players: players, Guilds: guilds, Status: status, mux: http.NewServeMux()}
 	s.mux.HandleFunc("GET /status", s.handleStatus)
 	s.mux.HandleFunc("GET /guilds", s.handleGuilds)
 	s.mux.HandleFunc("GET /players/{name}", s.handlePlayer)
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
+	s.mux.HandleFunc("GET /leaderboards", s.handleLeaderboards)
+	s.mux.HandleFunc("GET /admin", s.handleAdmin)
 	return s
 }
 
 // Handler returns the read-only route set for the caller's http.Server.
-func (s *Server) Handler() http.Handler { return s.mux }
+// When SentryDSN is set, the handler is wrapped with Sentry middleware
+// (request handler + error handler; TS Sentry.Handlers.requestHandler +
+// errorHandler parity). Tracing is enabled via tracesSampleRate 1.0.
+func (s *Server) Handler() http.Handler {
+	var h http.Handler = s.mux
+	if s.SentryDSN != "" {
+		// Sentry middleware (TS api.ts lines 35-38 parity): requestHandler +
+		// errorHandler. The sentryhttp package provides a single handler that
+		// covers both (it captures panics, sets up the hub, and reports errors).
+		h = sentryhttp.New(sentryhttp.Options{
+			Repanic:         true, // Re-panic after capturing (TS default).
+			WaitForDelivery: false,
+		}).Handle(h)
+	}
+	return h
+}
 
 // ServeHTTP delegates to the internal mux.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
 // AddrFromEnv returns the listen address derived from API_PORT. ok is false
 // when API_PORT is unset or empty (default-off); the caller must not start
-// the server in that case. Values already containing a colon (e.g.
-// ":8080", "127.0.0.1:8080") are used as-is; bare ports gain a ":" prefix.
+// the server in that case.
+//
+// Bind default (changed 2026-09: loopback-only): bare ports bind to
+// 127.0.0.1 (e.g. "8080" -> "127.0.0.1:8080") instead of ":8080" (all
+// interfaces). Values already containing a colon (e.g. ":8080",
+// "127.0.0.1:8080", "0.0.0.0:8080") are used as-is, so operators can still
+// opt into a wider bind with an explicit addr. API_PORT="0.0.0.0:8080"
+// therefore listens publicly; the default stays loopback-only.
 func AddrFromEnv() (addr string, ok bool) {
 	port := os.Getenv("API_PORT")
 	if port == "" {
@@ -158,7 +224,34 @@ func AddrFromEnv() (addr string, ok bool) {
 			return port, true
 		}
 	}
-	return ":" + port, true
+	return "127.0.0.1:" + port, true
+}
+
+// InitSentry initializes Sentry error tracking when dsn is non-empty (TS
+// config.sentryDsn parity). Returns the DSN for the caller to pass to
+// Server.SentryDSN. When dsn is empty, returns "" and does nothing (Sentry
+// is off; tests and dev environments without a DSN are unaffected).
+//
+// TS parity: Sentry.init({dsn, integrations, tracesSampleRate: 1}). The
+// sentry-go SDK defaults are used for integrations; tracesSampleRate is set
+// to 1.0 to match TS. The caller must invoke sentry.Flush before shutdown
+// to ensure pending events are delivered.
+func InitSentry(dsn string) string {
+	if dsn == "" {
+		return ""
+	}
+	if err := sentry.Init(sentry.ClientOptions{
+		Dsn:              dsn,
+		TracesSampleRate: 1.0,
+		// TS uses Http integration with tracing: true and Express integration.
+		// sentry-go auto-instruments http.Client and net/http servers when
+		// attached; explicit integrations are not required for the stdlib
+		// handler path.
+	}); err != nil {
+		// TS logs and continues; we do the same (Sentry off, server runs).
+		return ""
+	}
+	return dsn
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +321,186 @@ func (s *Server) handlePlayer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, p)
+}
+
+// ---------------------------------------------------------------------------
+// Leaderboards (TS hub GET /leaderboards parity).
+// ---------------------------------------------------------------------------
+
+func (s *Server) handleLeaderboards(w http.ResponseWriter, r *http.Request) {
+	if s.Leaderboards == nil {
+		writeError(w, http.StatusServiceUnavailable, "leaderboards unavailable")
+		return
+	}
+	q := r.URL.Query()
+
+	// ?skill=<id> — per-skill XP leaderboard.
+	if skillStr := q.Get("skill"); skillStr != "" {
+		id, err := strconv.Atoi(skillStr)
+		if err != nil || id < 0 || !s.Leaderboards.ValidSkill(id) {
+			writeError(w, http.StatusBadRequest, "invalid")
+			return
+		}
+		entries, err := s.Leaderboards.SkillExperience(id)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "query failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "success", "list": entries})
+		return
+	}
+
+	// ?mob=<key> — mob kills leaderboard.
+	if mobKey := q.Get("mob"); mobKey != "" {
+		mobs := s.Leaderboards.AvailableMobs()
+		if _, ok := mobs[mobKey]; !ok {
+			writeError(w, http.StatusBadRequest, "invalid")
+			return
+		}
+		entries, err := s.Leaderboards.MobKills(mobKey)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "query failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "success", "list": entries})
+		return
+	}
+
+	// ?pvp — PvP kills leaderboard.
+	if q.Has("pvp") {
+		entries, err := s.Leaderboards.PvPKills()
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "query failed")
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"status": "success", "list": entries})
+		return
+	}
+
+	// Default — total XP + availableMobs.
+	entries, err := s.Leaderboards.TotalExperience()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "query failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "success",
+		"list":           entries,
+		"availableMobs":  s.Leaderboards.AvailableMobs(),
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Admin dashboard (TS packages/admin parity — single-page read-only view).
+// ---------------------------------------------------------------------------
+
+// adminAllowed reports whether the request's remote IP is localhost.
+// The TS admin panel middleware whitelist is [127.0.0.1] only.
+func adminAllowed(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
+}
+
+func (s *Server) handleAdmin(w http.ResponseWriter, r *http.Request) {
+	if !adminAllowed(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+
+	// Collect status data.
+	var st Status
+	if s.Status != nil {
+		st = s.Status.Status()
+	}
+	var h Health
+	if s.Health != nil {
+		h = s.Health.Health()
+	}
+
+	uptime := ""
+	if s.Uptime != nil {
+		d := time.Since(s.Uptime.StartTime()).Truncate(time.Second)
+		uptime = d.String()
+	}
+
+	players := 0
+	if s.Players != nil {
+		players = len(s.Players.ListPlayers())
+	}
+
+	guilds := 0
+	if s.Guilds != nil {
+		guilds = len(s.Guilds.ListGuilds())
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="robots" content="noindex">
+<title>Admin — %s</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         max-width: 720px; margin: 40px auto; padding: 0 20px; background: #0d1117; color: #c9d1d9; }
+  h1 { color: #58a6ff; border-bottom: 1px solid #21262d; padding-bottom: 12px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 20px; margin: 16px 0; }
+  .row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid #21262d; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #8b949e; }
+  .value { color: #f0f6fc; font-weight: 600; }
+  .ok { color: #3fb950; }
+  .warn { color: #d29922; }
+  a { color: #58a6ff; }
+</style>
+</head>
+<body>
+<h1>Server Admin</h1>
+<div class="card">
+  <div class="row"><span class="label">Server</span><span class="value">%s</span></div>
+  <div class="row"><span class="label">Status</span><span class="value %s">%s</span></div>
+  <div class="row"><span class="label">Port</span><span class="value">%d</span></div>
+  <div class="row"><span class="label">Game Version</span><span class="value">%s</span></div>
+  <div class="row"><span class="label">Build ID</span><span class="value">%s</span></div>
+  <div class="row"><span class="label">Protocol</span><span class="value">%s</span></div>
+</div>
+<div class="card">
+  <div class="row"><span class="label">Players Online</span><span class="value">%d / %d</span></div>
+  <div class="row"><span class="label">Guilds</span><span class="value">%d</span></div>
+  <div class="row"><span class="label">Uptime</span><span class="value">%s</span></div>
+</div>
+<div class="card">
+  <div class="row"><span class="label">API Endpoints</span><span class="value">
+    <a href="/status">/status</a> ·
+    <a href="/guilds">/guilds</a> ·
+    <a href="/leaderboards">/leaderboards</a> ·
+    <a href="/healthz">/healthz</a>
+  </span></div>
+</div>
+</body>
+</html>`,
+		st.Name,
+		st.Name,
+		healthClass(h.State), h.State,
+		st.Port,
+		st.GameVersion,
+		st.BuildID,
+		st.GVer,
+		players, st.MaxPlayers,
+		guilds,
+		uptime,
+	)
+}
+
+func healthClass(state string) string {
+	if state == "RUNNING" || state == "" {
+		return "ok"
+	}
+	return "warn"
 }
 
 // Divergences from TS (documented):

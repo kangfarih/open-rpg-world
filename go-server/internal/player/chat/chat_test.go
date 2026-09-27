@@ -95,35 +95,58 @@ func TestBucketMethod(t *testing.T) {
 	}
 }
 
-// TestGlobalCooldown pins the rank-based global cooldowns: 60s default,
-// 5s for mods/admins, duration floored at 1 minute.
+// TestGlobalCooldown pins the rank-based global cooldowns (player.ts
+// getGlobalChatCooldown parity): 60min default, 5s for mods/admins,
+// 15-55min patron tiers, duration floored at 1 minute.
 func TestGlobalCooldown(t *testing.T) {
-	if CooldownFor(RankNone) != 60_000 {
-		t.Fatalf("default cooldown = %d, want 60000", CooldownFor(RankNone))
+	if CooldownFor(RankNone) != 60*60_000 {
+		t.Fatalf("default cooldown = %d, want 3600000", CooldownFor(RankNone))
 	}
-	if CooldownFor(RankModerator) != 5000 || CooldownFor(RankAdmin) != 5000 {
+	if CooldownFor(RankModerator) != 5000 || CooldownFor(RankAdmin) != 5000 || CooldownFor(RankHollowAdmin) != 5000 {
 		t.Fatal("mod/admin cooldown must be 5000")
 	}
-	now := int64(1_000_000)
-	if !GlobalReady(RankNone, now-60_001, now) {
-		t.Fatal("default rank must be ready after 60s")
+	for rank, want := range map[int]int64{
+		RankTierOne: 55 * 60_000, RankTierTwo: 50 * 60_000,
+		RankTierThree: 45 * 60_000, RankTierFour: 40 * 60_000,
+		RankTierFive: 35 * 60_000, RankTierSix: 30 * 60_000,
+		RankTierSeven: 15 * 60_000,
+	} {
+		if got := CooldownFor(rank); got != want {
+			t.Fatalf("tier rank %d cooldown = %d, want %d", rank, got, want)
+		}
 	}
-	if GlobalReady(RankNone, now-60_000, now) {
-		t.Fatal("default rank must not be ready at exactly 60s (strict >)")
+	// Unranked variants stay on the 60min default.
+	for _, rank := range []int{RankVeteran, RankPatron, RankArtist, RankCheater, RankBooster} {
+		if got := CooldownFor(rank); got != 60*60_000 {
+			t.Fatalf("rank %d cooldown = %d, want 3600000", rank, got)
+		}
+	}
+	now := int64(10_000_000)
+	if !GlobalReady(RankNone, now-60*60_000-1, now) {
+		t.Fatal("default rank must be ready after 60min")
+	}
+	if GlobalReady(RankNone, now-60*60_000, now) {
+		t.Fatal("default rank must not be ready at exactly 60min (strict >)")
 	}
 	if !GlobalReady(RankAdmin, now-5001, now) {
 		t.Fatal("admin must be ready after 5s")
 	}
-	if got := GlobalDuration(RankNone, now-1000, now); got != 1 {
-		t.Fatalf("duration floors at 1, got %d", got)
+	if !GlobalReady(RankTierSeven, now-15*60_000-1, now) {
+		t.Fatal("tier seven must be ready after 15min")
 	}
-	if got := GlobalDuration(RankNone, now-1000, now-1000+30_000); got != 1 {
-		t.Fatalf("near-expiry duration = %d, want 1", got)
+	if got := GlobalDuration(RankNone, now-1000, now); got != 59 {
+		t.Fatalf("duration = %d, want 59", got)
+	}
+	if got := GlobalDuration(RankNone, now-1000, now-1000+30_000); got != 59 {
+		t.Fatalf("near-expiry duration = %d, want 59", got)
+	}
+	if got := GlobalDuration(RankModerator, now-1000, now); got != 1 {
+		t.Fatalf("mod near-expiry duration floors at 1, got %d", got)
 	}
 }
 
-// TestSplitCommand pins Commands.parse parity: prefix strip, space split,
-// empty command rejected.
+// TestSplitCommand pins Commands.parse parity: single-prefix strip, space
+// split, empty command rejected.
 func TestSplitCommand(t *testing.T) {
 	cmd, args, ok := SplitCommand("/players")
 	if !ok || cmd != "players" || len(args) != 0 {
@@ -139,11 +162,16 @@ func TestSplitCommand(t *testing.T) {
 	if _, _, ok := SplitCommand(""); ok {
 		t.Fatal("empty text must not parse")
 	}
+	// Single-strip parity (TS slice(1)): a double prefix keeps the second
+	// char as part of the command word.
+	if cmd, _, ok := SplitCommand("/;cmd"); !ok || cmd != ";cmd" {
+		t.Fatalf("SplitCommand(/;cmd) = %q %v, want %q true", cmd, ok, ";cmd")
+	}
 }
 
-// TestParsePrivateMessage pins the /pm Node quirk: the username is the text
-// between the `*` markers (lowercased) and the delivered message keeps every
-// block after the username's blocks.
+// TestParsePrivateMessage pins the /pm resolution: the username is the text
+// between the `*` markers (lowercased) and the delivered message is every
+// block after the username's blocks (no `*wrapper*` kept).
 func TestParsePrivateMessage(t *testing.T) {
 	user, msg, ok := ParsePrivateMessage([]string{"*bob*", "hello"})
 	if !ok || user != "bob" || msg != "hello" {

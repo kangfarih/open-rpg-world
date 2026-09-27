@@ -45,7 +45,30 @@ const SchemaVersionKey = "schema_version"
 // DB round-trip). Expand-only: a new column with a DEFAULT that no older
 // query names, so v3 binaries keep reading and writing every column they
 // know.
-const CurrentSchemaVersion = 4
+//
+// v5 folds the subsystem tables into the same version gate (abilities,
+// guilds/guild_members, friends, quests/achievements — DDL identical to
+// the owner packages' EnsureTables, CREATE IF NOT EXISTS so the owners'
+// own EnsureTables stay idempotent). Previously those tables were created
+// outside the gate: a stale binary could boot a DB whose subsystem tables
+// it did not understand. Now the single schema_version covers them.
+//
+// v6 adds guild metadata columns (expand-only): `guilds.invite_only`,
+// `guilds.creation_date`, `guilds.decoration` (JSON), and
+// `guild_members.join_date`. Older binaries never name these columns, so
+// they keep reading and writing every column they know.
+//
+// v7 adds home-point columns (expand-only): `players.homex` and
+// `players.homey` (DEFAULT spawn coords 100,96). The respawn path reads
+// these instead of the hardcoded HeroSpawn constants, so /sethome+/home
+// survive restarts. Older binaries never name these columns.
+//
+// v8 adds daily/weekly reset timestamps (expand-only):
+// `players.last_daily_reset` and `players.last_weekly_reset` (DEFAULT 0
+// = never reset). The background ticker and login path call resets.MaybeReset
+// to detect boundary crossings and bump the timestamps. Older binaries
+// never name these columns.
+const CurrentSchemaVersion = 8
 
 // checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
 // row) are stamped with the current version; older versions are re-stamped

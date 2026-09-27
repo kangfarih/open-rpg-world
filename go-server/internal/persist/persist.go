@@ -72,17 +72,24 @@ type Skill struct {
 }
 
 // StatsBlob is one player's gameplay statistics snapshot (counters ported
-// from statistics.ts: mobKills/mobExamines/resources/drops). Stored as a
-// JSON blob in the additive `statistics` table (one row per player): a blob
-// keeps the counters schemaless like the TS StatisticsData object, so future
-// counter additions need no DDL. Time fields (creationTime/totalTimePlayed/
-// averageTimePlayed/lastLogin/loginCount) are intentionally not persisted —
-// see internal/player/stats for the skip rationale.
+// from statistics.ts: mobKills/mobExamines/resources/drops plus PvP counters
+// and session/lifecycle fields). Stored as a JSON blob in the additive
+// `statistics` table (one row per player): a blob keeps the counters
+// schemaless like the TS StatisticsData object, so future counter additions
+// need no DDL.
 type StatsBlob struct {
 	MobKills    map[string]int `json:"mobKills,omitempty"`
 	MobExamines []string       `json:"mobExamines,omitempty"`
 	Resources   map[string]int `json:"resources,omitempty"`
 	Drops       map[string]int `json:"drops,omitempty"`
+	// PvP counters (handler.ts handleKill/handleDeath when isPlayer).
+	PvPKills  int `json:"pvpKills,omitempty"`
+	PvPDeaths int `json:"pvpDeaths,omitempty"`
+	// Session/lifecycle tracking (statistics.ts construction + serialize).
+	CreationTime    int64 `json:"creationTime,omitempty"`
+	TotalTimePlayed int64 `json:"totalTimePlayed,omitempty"`
+	LastLogin       int64 `json:"lastLogin,omitempty"`
+	LoginCount      int   `json:"loginCount,omitempty"`
 }
 
 // State is the persist snapshot for one player: position/level/vitals plus
@@ -98,6 +105,10 @@ type State struct {
 	Level  int
 	HP     int
 	Rank   int
+	HomeX  int // home-point x (respawn target; DEFAULT spawn)
+	HomeY  int // home-point y (respawn target; DEFAULT spawn)
+	LastDailyReset  int64 // epoch ms of last daily reset (0 = never)
+	LastWeeklyReset int64 // epoch ms of last weekly reset (0 = never)
 	Inv    []Slot
 	Bank   []Slot
 	Equip  []Slot
@@ -105,10 +116,13 @@ type State struct {
 	Stats  StatsBlob
 }
 
-// Snapshot deep-copies a State (nil-safe for the Skills map).
+// Snapshot deep-copies a State (nil-safe for the Skills map and the
+// Stats blob maps/slices — statistics must survive every flush).
 func (s *Store) Snapshot(st State) State {
 	cp := State{
 		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
+		HomeX: st.HomeX, HomeY: st.HomeY,
+		LastDailyReset: st.LastDailyReset, LastWeeklyReset: st.LastWeeklyReset,
 		Skills: make(map[int]Skill, len(st.Skills)),
 	}
 	cp.Inv = append(cp.Inv, st.Inv...)
@@ -117,6 +131,34 @@ func (s *Store) Snapshot(st State) State {
 	for id, sk := range st.Skills {
 		cp.Skills[id] = sk
 	}
+	if st.Stats.MobKills != nil {
+		cp.Stats.MobKills = make(map[string]int, len(st.Stats.MobKills))
+		for k, v := range st.Stats.MobKills {
+			cp.Stats.MobKills[k] = v
+		}
+	}
+	if st.Stats.MobExamines != nil {
+		cp.Stats.MobExamines = append([]string(nil), st.Stats.MobExamines...)
+	}
+	if st.Stats.Resources != nil {
+		cp.Stats.Resources = make(map[string]int, len(st.Stats.Resources))
+		for k, v := range st.Stats.Resources {
+			cp.Stats.Resources[k] = v
+		}
+	}
+	if st.Stats.Drops != nil {
+		cp.Stats.Drops = make(map[string]int, len(st.Stats.Drops))
+		for k, v := range st.Stats.Drops {
+			cp.Stats.Drops[k] = v
+		}
+	}
+	// Scalar stats: value types, safe to copy directly (no aliasing).
+	cp.Stats.PvPKills = st.Stats.PvPKills
+	cp.Stats.PvPDeaths = st.Stats.PvPDeaths
+	cp.Stats.CreationTime = st.Stats.CreationTime
+	cp.Stats.TotalTimePlayed = st.Stats.TotalTimePlayed
+	cp.Stats.LastLogin = st.Stats.LastLogin
+	cp.Stats.LoginCount = st.Stats.LoginCount
 	return cp
 }
 
@@ -160,12 +202,15 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// EnsureSchema creates the five persist tables when missing (verbatim DDL
+// EnsureSchema creates the persist tables when missing (verbatim DDL
 // from the old m5Init), then stamps/gates meta.schema_version (see
 // schema.go: fresh DBs are stamped, older re-stamped forward, newer refuse
 // boot). The DDL strings below are frozen; schema changes add new
 // expand-only statements in the same commit that bumps
-// CurrentSchemaVersion.
+// CurrentSchemaVersion. v5 additionally folds the subsystem tables
+// (abilities, guilds/guild_members, friends, quests/achievements — DDL
+// identical to the owner packages) into the same gate so one version
+// covers every table this binary reads or writes.
 func (s *Store) EnsureSchema() error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("ddl: nil store")
@@ -178,6 +223,14 @@ func (s *Store) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS skills(player TEXT, skill INT, level INT, xp INT, PRIMARY KEY(player, skill))`,
 		`CREATE TABLE IF NOT EXISTS statistics(player TEXT PRIMARY KEY, data TEXT)`,
 		`CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)`,
+		// v5 fold-in: subsystem tables gated by the same schema_version
+		// (owner EnsureTables remain idempotent; DDL strings identical).
+		`CREATE TABLE IF NOT EXISTS abilities(player TEXT, ability TEXT, level INT, PRIMARY KEY(player, ability))`,
+		`CREATE TABLE IF NOT EXISTS guilds(id TEXT PRIMARY KEY, name TEXT, owner TEXT, xp INT, invite_only INT DEFAULT 0, creation_date INT DEFAULT 0, decoration TEXT DEFAULT '{}')`,
+		`CREATE TABLE IF NOT EXISTS guild_members(guild TEXT, player TEXT, rank INT, join_date INT DEFAULT 0, PRIMARY KEY(guild, player))`,
+		`CREATE TABLE IF NOT EXISTS friends(player TEXT, friend TEXT, PRIMARY KEY(player, friend))`,
+		`CREATE TABLE IF NOT EXISTS quests(player TEXT, quest TEXT, stage INT, substage INT, PRIMARY KEY(player, quest))`,
+		`CREATE TABLE IF NOT EXISTS achievements(player TEXT, ach TEXT, stage INT, PRIMARY KEY(player, ach))`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return fmt.Errorf("ddl: %w", err)
@@ -191,6 +244,21 @@ func (s *Store) EnsureSchema() error {
 	// so pre-v4 rows read back '{}' (no enchantments). Ignore failure =
 	// column exists (rank precedent above).
 	_, _ = s.db.Exec(`ALTER TABLE equipment ADD COLUMN enchantments TEXT DEFAULT '{}'`)
+	// v6 migration (expand-only): guild fields — invite_only, creation_date,
+	// decoration on guilds; join_date on guild_members. Ignore failure =
+	// column exists (precedent above).
+	_, _ = s.db.Exec(`ALTER TABLE guilds ADD COLUMN invite_only INT DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE guilds ADD COLUMN creation_date INT DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE guilds ADD COLUMN decoration TEXT DEFAULT '{}'`)
+	_, _ = s.db.Exec(`ALTER TABLE guild_members ADD COLUMN join_date INT DEFAULT 0`)
+	// v7 migration (expand-only): home-point columns on players — DEFAULT
+	// spawn coords so pre-v7 rows respawn at the same tile as before.
+	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN homex INT DEFAULT 100`)
+	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN homey INT DEFAULT 96`)
+	// v8 migration (expand-only): daily/weekly reset timestamps on players —
+	// DEFAULT 0 (never reset) so pre-v8 rows trigger a reset on first login.
+	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN last_daily_reset INT DEFAULT 0`)
+	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN last_weekly_reset INT DEFAULT 0`)
 	return s.checkSchemaVersion()
 }
 
@@ -247,15 +315,30 @@ func (s *Store) DirtyList() []string {
 }
 
 // WritePlayer writes one player's full row set (players upsert + inventory +
-// bank + equipment + skills), verbatim SQL and log text from the old root
-// writePlayer. The error return is for tests/callers; failures are already
-// logged with the shipped "m5: ..." lines, so root callers ignore it.
+// bank + equipment + skills + statistics) inside a single BEGIN IMMEDIATE
+// transaction, verbatim SQL and log text from the old root writePlayer. The
+// transaction keeps the 7-table DELETE+INSERT sequence atomic: a mid-write
+// crash or error can no longer leave torn rows (e.g. inventory cleared but
+// skills not yet rewritten). The error return is for tests/callers;
+// failures are already logged with the shipped "m5: ..." lines, so root
+// callers ignore it.
 func (s *Store) WritePlayer(key string, st State) error {
 	if s == nil || s.db == nil {
 		return fmt.Errorf("m5: save %s: nil store", key)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		log.Printf("m5: save players %s: %v", key, err)
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
 	extra := map[string]any{"equip": []any{}}
 	if len(st.Equip) > 0 {
 		eqs := make([]any, 0, len(st.Equip))
@@ -268,37 +351,40 @@ func (s *Store) WritePlayer(key string, st State) error {
 		extra["equip"] = eqs
 	}
 	extraRaw, _ := json.Marshal(extra)
-	if _, err := s.db.Exec(
-		`INSERT INTO players(instance,name,x,y,level,hp,data,rank) VALUES(?,?,?,?,?,?,?,?) `+
+	if _, err := tx.Exec(
+		`INSERT INTO players(instance,name,x,y,level,hp,data,rank,homex,homey,last_daily_reset,last_weekly_reset) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) `+
 			`ON CONFLICT(instance) DO UPDATE SET name=excluded.name,x=excluded.x,y=excluded.y,`+
-			`level=excluded.level,hp=excluded.hp,data=excluded.data,rank=excluded.rank`,
-		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw), st.Rank); err != nil {
+			`level=excluded.level,hp=excluded.hp,data=excluded.data,rank=excluded.rank,`+
+			`homex=excluded.homex,homey=excluded.homey,`+
+			`last_daily_reset=excluded.last_daily_reset,last_weekly_reset=excluded.last_weekly_reset`,
+		key, key, st.X, st.Y, st.Level, st.HP, string(extraRaw), st.Rank, st.HomeX, st.HomeY,
+		st.LastDailyReset, st.LastWeeklyReset); err != nil {
 		log.Printf("m5: save players %s: %v", key, err)
 		return err
 	}
-	if _, err := s.db.Exec(`DELETE FROM inventory WHERE player=?`, key); err != nil {
+	if _, err := tx.Exec(`DELETE FROM inventory WHERE player=?`, key); err != nil {
 		log.Printf("m5: clear inventory %s: %v", key, err)
 		return err
 	}
 	for i, sl := range st.Inv {
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO inventory(player,slot,item,count,enchantments) VALUES(?,?,?,?,?)`, key, i, sl.Key, sl.Count, sl.Ench); err != nil {
 			log.Printf("m5: save inventory %s: %v", key, err)
 			return err
 		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM bank WHERE player=?`, key); err != nil {
+	if _, err := tx.Exec(`DELETE FROM bank WHERE player=?`, key); err != nil {
 		log.Printf("m5: clear bank %s: %v", key, err)
 		return err
 	}
 	for i, sl := range st.Bank {
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO bank(player,slot,item,count) VALUES(?,?,?,?)`, key, i, sl.Key, sl.Count); err != nil {
 			log.Printf("m5: save bank %s: %v", key, err)
 			return err
 		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM equipment WHERE player=?`, key); err != nil {
+	if _, err := tx.Exec(`DELETE FROM equipment WHERE player=?`, key); err != nil {
 		log.Printf("m5: clear equipment %s: %v", key, err)
 		return err
 	}
@@ -306,26 +392,31 @@ func (s *Store) WritePlayer(key string, st State) error {
 		if e.Key == "" || e.Count < 1 {
 			continue
 		}
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO equipment(player,type,item,count,enchantments) VALUES(?,?,?,?,?)`, key, t, e.Key, e.Count, e.Ench); err != nil {
 			log.Printf("m5: save equipment %s: %v", key, err)
 			return err
 		}
 	}
-	if _, err := s.db.Exec(`DELETE FROM skills WHERE player=?`, key); err != nil {
+	if _, err := tx.Exec(`DELETE FROM skills WHERE player=?`, key); err != nil {
 		log.Printf("m5: clear skills %s: %v", key, err)
 		return err
 	}
 	for id, sk := range st.Skills {
-		if _, err := s.db.Exec(
+		if _, err := tx.Exec(
 			`INSERT INTO skills(player,skill,level,xp) VALUES(?,?,?,?)`, key, id, sk.Level, sk.XP); err != nil {
 			log.Printf("m5: save skills %s: %v", key, err)
 			return err
 		}
 	}
-	if err := s.writeStatsLocked(key, st.Stats); err != nil {
+	if err := s.writeStatsTx(tx, key, st.Stats); err != nil {
 		return err
 	}
+	if err := tx.Commit(); err != nil {
+		log.Printf("m5: save players %s: %v", key, err)
+		return err
+	}
+	committed = true
 	log.Printf("m5: saved %s (pos %d,%d level %d inv %d skills %d)", key, st.X, st.Y, st.Level, len(st.Inv), len(st.Skills))
 	return nil
 }
@@ -346,6 +437,20 @@ func (s *Store) WriteStats(key string, blob StatsBlob) error {
 func (s *Store) writeStatsLocked(key string, blob StatsBlob) error {
 	raw, _ := json.Marshal(blob)
 	if _, err := s.db.Exec(
+		`INSERT INTO statistics(player,data) VALUES(?,?) `+
+			`ON CONFLICT(player) DO UPDATE SET data=excluded.data`,
+		key, string(raw)); err != nil {
+		log.Printf("m5: save stats %s: %v", key, err)
+		return err
+	}
+	return nil
+}
+
+// writeStatsTx is writeStatsLocked over an open transaction (the WritePlayer
+// atomic-write path).
+func (s *Store) writeStatsTx(tx *sql.Tx, key string, blob StatsBlob) error {
+	raw, _ := json.Marshal(blob)
+	if _, err := tx.Exec(
 		`INSERT INTO statistics(player,data) VALUES(?,?) `+
 			`ON CONFLICT(player) DO UPDATE SET data=excluded.data`,
 		key, string(raw)); err != nil {
@@ -396,8 +501,9 @@ func (s *Store) LoadPlayer(key string) (State, bool) {
 	st := State{Skills: map[int]Skill{}}
 	var data string
 	err := s.db.QueryRow(
-		`SELECT name,x,y,level,hp,data,rank FROM players WHERE instance=?`, key,
-	).Scan(&name, &st.X, &st.Y, &st.Level, &st.HP, &data, &st.Rank)
+		`SELECT name,x,y,level,hp,data,rank,homex,homey,last_daily_reset,last_weekly_reset FROM players WHERE instance=?`, key,
+	).Scan(&name, &st.X, &st.Y, &st.Level, &st.HP, &data, &st.Rank, &st.HomeX, &st.HomeY,
+		&st.LastDailyReset, &st.LastWeeklyReset)
 	if err != nil {
 		return State{}, false
 	}

@@ -40,6 +40,7 @@
 package entity
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"sync"
@@ -318,11 +319,7 @@ func spawnMinion(h PluginHost, boss, key string, x, y int, opts MinionOpts, atta
 	}
 	noteMinionSpawned(boss, inst, key)
 	if tgt, ok := pickRandomAttacker(attackers); ok {
-		if _, _, ok := w.PlayerPos(tgt); ok {
-			h.SetMobTarget(inst, tgt)
-		} else {
-			h.SetMobTarget(inst, tgt)
-		}
+		h.SetMobTarget(inst, tgt)
 	}
 	return inst
 }
@@ -591,14 +588,17 @@ func pluginOnAttack(m Mob, p MobProfile, w GameWorld) {
 		if st.special {
 			st.special = false
 			st.atkRangeOverride = 1
+			st.projectile = "" // clear override, use profile default (fireball)
 			return
 		}
 		if PluginRandInt(1, 6) != 2 {
+			st.projectile = "" // clear override, use profile default (fireball)
 			return
 		}
 		// Terror special: ranged terror attack (damage type visual-only).
 		st.atkRangeOverride = 9
 		st.special = true
+		st.projectile = "terror"
 
 	case "queenant":
 		st := stateFor(m.Instance())
@@ -657,7 +657,12 @@ func attackAllTerror(m Mob, p MobProfile, w GameWorld) {
 		if v.Defense > def {
 			def = v.Defense
 		}
-		dmg := RollMobDamage(p, def, MobDamageMult())
+		defStats := [5]int{v.DefCrush, v.DefSlash, v.DefStab, v.DefMagic, v.DefArchery}
+		dmg := RollMobDamage(p, def, MobDamageMult(), defStats)
+		// Damage reduction (formulas.ts getDamageReduction).
+		if v.DamageReduction > 0 && v.DamageReduction < 1 {
+			dmg = int(math.Floor(float64(dmg) * v.DamageReduction))
+		}
 		if hp := w.GetHeroHP(inst); dmg > hp {
 			dmg = hp
 		}
@@ -666,6 +671,30 @@ func attackAllTerror(m Mob, p MobProfile, w GameWorld) {
 		}
 		DamageHero(w, inst, v.Username, dmg, nil)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Plugin projectile override (strikeMob reads after pluginOnAttack).
+// ---------------------------------------------------------------------------
+
+// setPluginProjectile records a per-swing projectile override for the mob
+// (santa gift cycle, forestdragon terror special). Empty clears.
+func setPluginProjectile(mobInstance, projectile string) {
+	st := stateFor(mobInstance)
+	pluginMu.Lock()
+	st.projectile = projectile
+	pluginMu.Unlock()
+}
+
+// getPluginProjectile returns the per-swing projectile override set by
+// pluginOnAttack, or empty when none.
+func getPluginProjectile(mobInstance string) string {
+	pluginMu.Lock()
+	defer pluginMu.Unlock()
+	if st, ok := pluginStates[mobInstance]; ok {
+		return st.projectile
+	}
+	return ""
 }
 
 // ---------------------------------------------------------------------------
@@ -737,17 +766,19 @@ func PluginTick(m Mob, w GameWorld, now time.Time) {
 
 // combatLoopRange ports handleCombatLoop: hold the special-attack range,
 // else pick melee/ranged by Manhattan distance (TS also weighs the target's
-// ranged flag and movement, which the stub does not track).
+// ranged flag and movement, which the stub does not track). No state is
+// created for idle/in-special mobs (orphan window).
 func combatLoopRange(s pluginTickSnap, w GameWorld, key string) {
-	st := stateFor(s.inst)
-	pluginMu.Lock()
-	special := st.special
-	pluginMu.Unlock()
-	if special {
-		return
-	}
 	if s.target == "" {
 		return
+	}
+	if st, ok := getState(s.inst); ok {
+		pluginMu.Lock()
+		special := st.special
+		pluginMu.Unlock()
+		if special {
+			return
+		}
 	}
 	tx, ty, ok := w.PlayerPos(s.target)
 	if !ok {
@@ -761,6 +792,7 @@ func combatLoopRange(s pluginTickSnap, w GameWorld, key string) {
 			want = 12
 		}
 	}
+	st := stateFor(s.inst)
 	pluginMu.Lock()
 	st.atkRangeOverride = want
 	pluginMu.Unlock()

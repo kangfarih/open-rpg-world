@@ -262,7 +262,7 @@ func main() {
 
 	// Deterministic economy: seedGold=2000 tops the account up to 2000 gold
 	// server-side (TESTMAP e2e hook; Node e2e accounts start pre-loaded).
-	send(conn, `[2,{"opcode":0,"username":"m6tester","password":"x","seedGold":2000,"seedArrow":15}]`)
+	send(conn, `[2,{"opcode":0,"username":"m6tester","password":"x","seedGold":2000,"seedArrow":15,"seedRank":2}]`)
 	fmt.Println("login:", drain(2*time.Second))
 	// The seedArrow hook echoes a Container Add for the fresh arrow stack;
 	// track its slot index for the equipment checks below.
@@ -526,6 +526,12 @@ func main() {
 	send(conn, `[21,{"opcode":4,"type":1,"fromIndex":0,"value":1}]`)
 	counts = drain(600 * time.Millisecond)
 	check(counts[21] == 0, "inventory swap sends no packets (client-side)")
+	if counts[21] != 0 {
+		for _, f := range lastFrames {
+			fmt.Printf("DEBUG swap-window frame: id=%s data=%.200s\n", string(f[0]), string(f[1]))
+		}
+		fmt.Printf("DEBUG swap counts: %v\n", counts)
+	}
 
 	// --- Equipment: bluestoremannpc (n-show-8) sells arrows @5g infinite —
 	// buy a second stack so the equip-swap has a real echo, then walk the
@@ -647,7 +653,7 @@ func main() {
 	send(conn2, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
-	send(conn2, `[2,{"opcode":0,"username":"m6tester","password":"x"}]`)
+	send(conn2, `[2,{"opcode":0,"username":"m6tester","password":"x","seedRank":2}]`)
 	drain(2500 * time.Millisecond)
 	// Persistence proof: a bank Container Batch (type 0) arrives on login
 	// whenever the bank was non-empty at disconnect — it isn't (we withdrew

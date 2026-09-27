@@ -101,15 +101,62 @@ func TestDirtyFlushClears(t *testing.T) {
 func TestSnapshotDeepCopy(t *testing.T) {
 	s := openTestStore(t)
 	orig := testState()
+	orig.Stats = StatsBlob{
+		MobKills:    map[string]int{"rat": 3},
+		MobExamines: []string{"rat"},
+		Resources:   map[string]int{"wood": 5},
+		Drops:       map[string]int{"gold": 7},
+	}
 	cp := s.Snapshot(orig)
 	cp.Inv[0].Count = 999
 	cp.Skills[0] = Skill{Level: 9, XP: 9}
 	cp.Equip[0].Key = "changed"
+	cp.Stats.MobKills["rat"] = 999
+	cp.Stats.MobExamines[0] = "changed"
+	cp.Stats.Resources["wood"] = 999
+	cp.Stats.Drops["gold"] = 999
 	if orig.Inv[0].Count == 999 || orig.Skills[0].Level == 9 || orig.Equip[0].Key == "changed" {
 		t.Fatalf("Snapshot shares memory with the original: %+v", orig)
 	}
+	if orig.Stats.MobKills["rat"] == 999 || orig.Stats.MobExamines[0] == "changed" ||
+		orig.Stats.Resources["wood"] == 999 || orig.Stats.Drops["gold"] == 999 {
+		t.Fatalf("Snapshot shares Stats memory with the original: %+v", orig.Stats)
+	}
 	if !reflect.DeepEqual(cp.X, orig.X) {
 		t.Fatalf("Snapshot lost scalar fields")
+	}
+}
+
+func TestWritePlayerAtomicWithStats(t *testing.T) {
+	s := openTestStore(t)
+	want := testState()
+	want.Stats = StatsBlob{
+		MobKills:    map[string]int{"rat": 3},
+		MobExamines: []string{"rat"},
+		Resources:   map[string]int{"wood": 5},
+		Drops:       map[string]int{"gold": 7},
+	}
+	if err := s.WritePlayer("atomic", want); err != nil {
+		t.Fatalf("WritePlayer: %v", err)
+	}
+	got, ok := s.LoadPlayer("atomic")
+	if !ok {
+		t.Fatal("LoadPlayer(atomic) = false, want true (single-transaction write)")
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("atomic write mismatch:\n got=%+v\nwant=%+v", got, want)
+	}
+}
+
+func TestSubsystemTablesFoldedIn(t *testing.T) {
+	s := openTestStore(t)
+	for _, table := range []string{"abilities", "guilds", "guild_members", "friends", "quests", "achievements"} {
+		var name string
+		if err := s.DB().QueryRow(
+			`SELECT name FROM sqlite_master WHERE type='table' AND name=?`, table,
+		).Scan(&name); err != nil || name != table {
+			t.Fatalf("subsystem table %q missing (v5 fold-in): %v", table, err)
+		}
 	}
 }
 

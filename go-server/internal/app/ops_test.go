@@ -9,6 +9,11 @@ import (
 // Console trio (console.ts:117-147 parity): rank strips resolve online and
 // report 'Player is not logged in.' offline; unban clears without drops and
 // logs the exact TS text (which reads 'banned' even for unban).
+//
+// NOTE (UnbanIP wording): the "has been banned" text on the unban path is
+// verbatim upstream console.ts (ipban/unbanip share one log line) —
+// asserted exactly here so a future "fix" of the wording shows up as a
+// test failure, not silent drift.
 func TestConsoleTrioStripAndUnban(t *testing.T) {
 	old := opsDeps
 	t.Cleanup(func() { opsDeps = old })

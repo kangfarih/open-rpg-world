@@ -59,11 +59,14 @@ const OutboxSize = 64
 // movement anticheat state (main.go session). The math lives in
 // internal/world; this struct is the transport-owned record of it.
 type Session struct {
-	PlayerX, PlayerY int
-	Target           string
-	LastStep         time.Time
-	MovementSpeed    int // ms per tile (Welcome default 220)
-	CheatScore       int
+	PlayerX, PlayerY   int
+	Target             string
+	LastStep           time.Time
+	MovementSpeed      int // ms per tile (Welcome default 220)
+	CheatScore         int
+	LastRegionChange   time.Time // region change exemption (1.5s grace)
+	BypassAntiCheat    bool      // teleport bypass flag
+	LatencyMs          int       // client-reported one-way latency (ms); 0 until first timestamped packet
 }
 
 // Conn is the per-connection transport record (main.go playerConn, transport

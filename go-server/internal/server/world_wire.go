@@ -62,38 +62,38 @@ func worldWarpConn(c *playerConn) controller.WarpConn {
 	}
 }
 
-// worldConfigureWarps wires the warp-runner seams (called once from m5Init,
+// worldConfigureWarps wires the warp-runner seams (called once from initPlayerState,
 // before warps load or Warp frames route).
 func worldConfigureWarps() {
 	controller.ConfigureWarps(controller.WarpDeps{
-		IsJailed:         m13IsJailed,
+		IsJailed:         isJailed,
 		TutorialFinished: func(username string) bool { return loiterTutorialFinished(username) },
 		InCombat: func(instance string) bool {
 			// character.ts inCombat parity (warps.ts warp() combat gate) via
 			// the live-target indicators the stub already owns: the hero's
 			// live ability target (abTarget liveness through
 			// abilities.LiveTarget) or any live engine mob targeting the
-			// hero (m9MobTargeting). m6vitals.InCombat owns exactly this
+			// hero (mobTargeting). econVitals.InCombat owns exactly this
 			// composition (item-use combat gate precedent); reusing it keeps
 			// the warp gate and the item gate in agreement on "in combat".
 			// Combat-timestamp recency is deliberately NOT consulted: the
 			// stub tracks no per-hero combat clock, and the two live-target
 			// signals already cover both directions (hero attacking, hero
 			// attacked).
-			return m6vitals{}.InCombat(instance)
+			return econVitals{}.InCombat(instance)
 		},
-		PlayerLevel:   func(username string) int { return m5StateFor(username).Level },
-		QuestFinished: func(username, quest string) bool { return m11StateFor(username).isFinished(quest) },
+		PlayerLevel:   func(username string) int { return playerStateFor(username).Level },
+		QuestFinished: func(username, quest string) bool { return questStateFor(username).isFinished(quest) },
 		AchievementDone: func(username, ach string) bool {
-			def := m11A[ach]
-			st := m11StateFor(username)
+			def := achDefs[ach]
+			st := questStateFor(username)
 			return def != nil && st.Achs[ach] >= def.StageCount
 		},
-		FormatName: m7FormatName,
+		FormatName: formatName,
 		Notify: func(instance, message string) {
 			c, _ := worldcore.Find[*playerConn](instance)
 			if c != nil {
-				m6Notify(c, message)
+				notifyPlayer(c, message)
 			}
 		},
 		ApplyTeleport: worldApplyTeleport,
@@ -107,14 +107,17 @@ func worldApplyTeleport(instance string, lx, ly int) {
 	if c == nil {
 		return
 	}
-	c.Sess.PlayerX, c.Sess.PlayerY = lx, ly
-	worldcore.SetEntityPos(c.Instance, lx, ly)
-	worldcore.UpdateRegion(c, lx, ly)
-	worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: lx, Y: ly}))
-	c.markTeleported()
-	m10OnPositionUpdate(c)
-	m5TrackPos(c)
-	worldPushLights(c)
+	withTeleportBypass(c, func() {
+		c.Sess.PlayerX, c.Sess.PlayerY = lx, ly
+		c.regionsLoaded = nil // region streaming: force re-stream on landing
+		worldcore.SetEntityPos(c.Instance, lx, ly)
+		worldcore.UpdateRegion(c, lx, ly)
+		worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: lx, Y: ly}))
+		c.markTeleported()
+		areaPositionUpdate(c)
+		trackPos(c)
+		worldPushLights(c)
+	})
 }
 
 // worldBootWarps loads the warp registry + the menu-gating table from the
@@ -148,7 +151,7 @@ func worldDoWarp(c *playerConn, w *worldWarpExt) bool {
 // ---------------------------------------------------------------------------
 
 // worldConfigureEvents wires the event fan-out seam (called once from
-// m5Init, before the scheduler starts).
+// initPlayerState, before the scheduler starts).
 func worldConfigureEvents() {
 	controller.ConfigureEvents(controller.EventDeps{
 		Announce: func(eventName string) {
@@ -176,7 +179,7 @@ func worldEventTick() {
 // worldDoubleDrops duplicates a mob roll while the double-drops event is
 // active (events.ts doubleDropProbability parity, expressed as a repeated
 // roll). Dormant otherwise — callers pass the roll through unchanged.
-func worldDoubleDrops(drops []m5Drop) []m5Drop {
+func worldDoubleDrops(drops []dropDef) []dropDef {
 	return controller.DoubleDrops(drops)
 }
 
@@ -236,14 +239,18 @@ func (worldGlowWorld) SendLamp(instance string, l globals.Light) {
 	if c == nil {
 		return
 	}
+	inst := fmt.Sprintf("light-%d", l.ID)
+	if l.ID == 0 {
+		inst = fmt.Sprintf("light-%d-%d", l.X, l.Y)
+	}
 	_ = gnet.Send(c.Conn, pktOp(PacketOverlay, OverlayLamp, map[string]any{
 		"light": worldLightData{
-			Instance: fmt.Sprintf("light-%d-%d", l.X, l.Y),
-			X:        l.X, Y: l.Y, Colour: l.Colour,
-			Diffuse:          0.2,
+			Instance:         inst,
+			X:                l.X, Y: l.Y, Colour: l.Colour,
+			Diffuse:          l.Diffuse,
 			Distance:         l.Radius,
-			FlickerSpeed:     300,
-			FlickerIntensity: 1,
+			FlickerSpeed:     l.FlickerSpeed,
+			FlickerIntensity: l.FlickerIntensity,
 		},
 	}))
 }
@@ -292,6 +299,9 @@ func worldForgetPlayer(c *playerConn) {
 // player.ts handleObjectInteraction parity): Bubble Position with talkIndex
 // paging over the comma-split text. Reports whether a sign matched.
 func worldSignTalk(c *playerConn, instance string) bool {
+	if c == nil || c.Conn == nil || instance == "" {
+		return false
+	}
 	var msg string
 	var ok bool
 	// The talk cursor is session-locked (race fix): TalkWith
@@ -315,13 +325,18 @@ func worldBoot() {
 
 // ---------------------------------------------------------------------------
 // TESTMAP debug dispatcher ([46 {worldtest:...}], socialtest/pettest
-// precedent). All legs echo through m6Notify so the e2e can grep them.
+// precedent). All legs echo through notifyPlayer so the e2e can grep them.
 // The warp/event legs read the controller singletons; the lights/signs
 // legs read the worldmap shared glow.
 // ---------------------------------------------------------------------------
 
 func worldTestHandler(c *playerConn, data []byte) {
 	if !testMode || c == nil {
+		return
+	}
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client warp hole).
+	if !isAdmin(c) {
 		return
 	}
 	var d struct {
@@ -341,10 +356,10 @@ func worldTestHandler(c *playerConn, data []byte) {
 		if nl2, ns2, ok := worldmap.GlowStats(); ok {
 			nl, ns = nl2, ns2
 		}
-		m6Notify(c, fmt.Sprintf("world:ok warps=%d events=%d lights=%d signs=%d", nw, controller.DefaultEventCount(), nl, ns))
+		notifyPlayer(c, fmt.Sprintf("world:ok warps=%d events=%d lights=%d signs=%d", nw, controller.DefaultEventCount(), nl, ns))
 	case "warps":
 		names := controller.Warps.Names()
-		m6Notify(c, "world:warps ["+strings.Join(names, ",")+"]")
+		notifyPlayer(c, "world:warps ["+strings.Join(names, ",")+"]")
 	case "warp":
 		var w *worldWarpExt
 		if d.Name != "" {
@@ -353,33 +368,33 @@ func worldTestHandler(c *playerConn, data []byte) {
 			w = worldFindWarp(*d.ID)
 		}
 		if w == nil {
-			m6Notify(c, "world:warp unknown")
+			notifyPlayer(c, "world:warp unknown")
 			return
 		}
 		if worldDoWarp(c, w) {
-			m6Notify(c, fmt.Sprintf("world:warp %s x=%d y=%d", w.Name, c.Sess.PlayerX, c.Sess.PlayerY))
+			notifyPlayer(c, fmt.Sprintf("world:warp %s x=%d y=%d", w.Name, c.Sess.PlayerX, c.Sess.PlayerY))
 		}
 	case "at":
 		if d.X == nil || d.Y == nil || !controller.Warps.Loaded() {
 			return
 		}
 		if w := controller.Warps.At(*d.X, *d.Y); w != nil {
-			m6Notify(c, fmt.Sprintf("world:at %d,%d id=%d x=%d y=%d w=%d h=%d", *d.X, *d.Y, w.ID, w.X, w.Y, w.W, w.H))
+			notifyPlayer(c, fmt.Sprintf("world:at %d,%d id=%d x=%d y=%d w=%d h=%d", *d.X, *d.Y, w.ID, w.X, w.Y, w.W, w.H))
 		} else {
-			m6Notify(c, fmt.Sprintf("world:at %d,%d none", *d.X, *d.Y))
+			notifyPlayer(c, fmt.Sprintf("world:at %d,%d none", *d.X, *d.Y))
 		}
 	case "events":
 		active := controller.Events.ActiveKeys()
 		n, every := controller.Events.Fired(), controller.Events.Interval()
 		sort.Strings(active)
-		m6Notify(c, fmt.Sprintf("world:events active=[%s] fired=%d intervalMs=%d", strings.Join(active, ","), n, every))
+		notifyPlayer(c, fmt.Sprintf("world:events active=[%s] fired=%d intervalMs=%d", strings.Join(active, ","), n, every))
 	case "lights":
 		n := worldPushLightsForce(c)
-		m6Notify(c, fmt.Sprintf("world:lights n=%d", n))
+		notifyPlayer(c, fmt.Sprintf("world:lights n=%d", n))
 	case "signs":
 		sx, sy, text, n, ok := worldmap.FirstSign()
 		if !ok {
-			m6Notify(c, "world:signs n=0")
+			notifyPlayer(c, "world:signs n=0")
 			return
 		}
 		first := ""
@@ -389,10 +404,10 @@ func worldTestHandler(c *playerConn, data []byte) {
 			}
 			first = fmt.Sprintf(" first=%d-%d:%s", sx, sy, text)
 		}
-		m6Notify(c, fmt.Sprintf("world:signs n=%d%s", n, first))
+		notifyPlayer(c, fmt.Sprintf("world:signs n=%d%s", n, first))
 	case "sign":
 		if _, _, _, _, ok := worldmap.FirstSign(); !ok {
-			m6Notify(c, "world:sign none")
+			notifyPlayer(c, "world:sign none")
 			return
 		}
 		var text string
@@ -402,20 +417,20 @@ func worldTestHandler(c *playerConn, data []byte) {
 			text, ok = worldmap.SignAt(*d.X, *d.Y)
 			sx, sy = *d.X, *d.Y
 			if !ok {
-				m6Notify(c, fmt.Sprintf("world:sign %d-%d none", *d.X, *d.Y))
+				notifyPlayer(c, fmt.Sprintf("world:sign %d-%d none", *d.X, *d.Y))
 				return
 			}
 		} else {
 			var n int
 			sx, sy, text, n, ok = worldmap.FirstSign()
 			if !ok || n == 0 {
-				m6Notify(c, "world:sign none")
+				notifyPlayer(c, "world:sign none")
 				return
 			}
 		}
 		inst := strconv.Itoa(sx) + "-" + strconv.Itoa(sy)
 		c.resetTalk()
 		worldSignTalk(c, inst)
-		m6Notify(c, fmt.Sprintf("world:sign %s text=%s", inst, text))
+		notifyPlayer(c, fmt.Sprintf("world:sign %s text=%s", inst, text))
 	}
 }

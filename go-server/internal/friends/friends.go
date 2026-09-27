@@ -56,11 +56,23 @@ type OnlineNotify struct {
 
 // List tracks one owner's friends plus a block set. Names are stored
 // normalized (lowercase, trimmed); Owner is stored normalized too. The
-// zero value is unusable — build via New.
+// zero value is usable via lazy map init — build via New for a normalized
+// owner, or use a bare List and let Add/Block/Load allocate the maps.
 type List struct {
 	Owner   string
 	friends map[string]FriendInfo
 	blocked map[string]struct{}
+}
+
+// ensureMaps lazily allocates the friend/block maps so zero-value Lists
+// (and Lists decoded without maps) never panic on write.
+func (l *List) ensureMaps() {
+	if l.friends == nil {
+		l.friends = map[string]FriendInfo{}
+	}
+	if l.blocked == nil {
+		l.blocked = map[string]struct{}{}
+	}
 }
 
 // New returns an empty List for the given owner name.
@@ -87,6 +99,9 @@ func normalize(name string) string {
 // friend, or blocked. TS notify-key mapping, the database.exists check,
 // and the world.isOnline lookup are caller-owned — see divergences.
 func (l *List) Add(name string) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	if key == "" || len(key) > MaxUsernameLen {
 		return false
@@ -94,6 +109,7 @@ func (l *List) Add(name string) bool {
 	if key == l.Owner {
 		return false
 	}
+	l.ensureMaps()
 	if _, dup := l.friends[key]; dup {
 		return false
 	}
@@ -108,6 +124,9 @@ func (l *List) Add(name string) bool {
 // present (TS remove() notifies 'misc:FRIENDS_NOT_IN_LIST' when absent;
 // the caller maps a false return to that notice).
 func (l *List) Remove(name string) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	if _, ok := l.friends[key]; !ok {
 		return false
@@ -120,10 +139,14 @@ func (l *List) Remove(name string) bool {
 // when present. Blocking the owner themself or an empty name is a no-op
 // reporting false. There is no TS source — see divergences.
 func (l *List) Block(name string) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	if key == "" || key == l.Owner {
 		return false
 	}
+	l.ensureMaps()
 	delete(l.friends, key)
 	if _, dup := l.blocked[key]; dup {
 		return false
@@ -136,6 +159,9 @@ func (l *List) Block(name string) bool {
 // present. The name is NOT re-added as a friend — the caller must Add
 // them again. There is no TS source — see divergences.
 func (l *List) Unblock(name string) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	if _, ok := l.blocked[key]; !ok {
 		return false
@@ -147,6 +173,9 @@ func (l *List) Unblock(name string) bool {
 // IsFriend reports whether name is in the friend set (TS hasFriend
 // parity: `username in this.list`). The lookup normalizes case.
 func (l *List) IsFriend(name string) bool {
+	if l == nil {
+		return false
+	}
 	_, ok := l.friends[normalize(name)]
 	return ok
 }
@@ -154,13 +183,20 @@ func (l *List) IsFriend(name string) bool {
 // IsBlocked reports whether name is in the block set. There is no TS
 // source — see divergences.
 func (l *List) IsBlocked(name string) bool {
+	if l == nil {
+		return false
+	}
 	_, ok := l.blocked[normalize(name)]
 	return ok
 }
 
 // Members returns the sorted friend usernames (TS serialize() parity:
-// Object.keys(this.list), sorted here for determinism).
+// Object.keys(this.list), sorted here for determinism). Nil-safe: a nil
+// or zero List yields an empty (non-nil) slice.
 func (l *List) Members() []string {
+	if l == nil {
+		return []string{}
+	}
 	out := make([]string, 0, len(l.friends))
 	for name := range l.friends {
 		out = append(out, name)
@@ -177,6 +213,9 @@ func (l *List) Serialize() []string {
 // BlockedList returns the sorted blocked usernames. There is no TS
 // source — see divergences.
 func (l *List) BlockedList() []string {
+	if l == nil {
+		return []string{}
+	}
 	out := make([]string, 0, len(l.blocked))
 	for name := range l.blocked {
 		out = append(out, name)
@@ -189,8 +228,13 @@ func (l *List) BlockedList() []string {
 // (serverId -1). It mirrors friends.ts load() minus the presence lookup:
 // TS marks each entry online via world.isOnline; here the caller applies
 // SetStatus afterwards. Invalid entries (empty, too long, self,
-// duplicates) are skipped. The block set is untouched.
+// duplicates) are skipped. The block set is untouched. Nil-safe and
+// lazy-inits the map so zero-value Lists can Load.
 func (l *List) Load(names []string) {
+	if l == nil {
+		return
+	}
+	l.ensureMaps()
 	l.friends = make(map[string]FriendInfo, len(names))
 	for _, name := range names {
 		key := normalize(name)
@@ -207,6 +251,9 @@ func (l *List) Load(names []string) {
 // Info returns a copy of the stored FriendInfo for name, or false when
 // name is not a friend.
 func (l *List) Info(name string) (FriendInfo, bool) {
+	if l == nil {
+		return FriendInfo{}, false
+	}
 	info, ok := l.friends[normalize(name)]
 	return info, ok
 }
@@ -216,6 +263,9 @@ func (l *List) Info(name string) (FriendInfo, bool) {
 // reports false and changes nothing when name is not a friend. Status
 // callbacks to the client are caller-owned.
 func (l *List) SetStatus(name string, online bool, serverID int) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	info, ok := l.friends[key]
 	if !ok {
@@ -233,8 +283,11 @@ func (l *List) SetStatus(name string, online bool, serverID int) bool {
 
 // Inactive returns the sorted names of offline friends (TS
 // getInactiveFriends parity: keys where !online). The caller passes this
-// to the hub sync when needed.
+// to the hub sync when needed. Nil-safe: nil yields nil.
 func (l *List) Inactive() []string {
+	if l == nil {
+		return nil
+	}
 	var out []string
 	for name, info := range l.friends {
 		if !info.Online {
@@ -249,6 +302,9 @@ func (l *List) Inactive() []string {
 // fanned out to the list owner: name must be a friend and must not be
 // blocked. There is no TS source for the blocked half — see divergences.
 func (l *List) ShouldNotify(name string) bool {
+	if l == nil {
+		return false
+	}
 	key := normalize(name)
 	if _, ok := l.friends[key]; !ok {
 		return false
@@ -265,6 +321,9 @@ func (l *List) ShouldNotify(name string) bool {
 // notices. Offline transitions use SetStatus directly (no event); the
 // caller decides whether to emit logout notices.
 func (l *List) OnlineEvent(name string, serverID int) (ev OnlineNotify, ok bool) {
+	if l == nil {
+		return OnlineNotify{}, false
+	}
 	key := normalize(name)
 	if !l.ShouldNotify(key) {
 		return OnlineNotify{}, false

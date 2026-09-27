@@ -140,14 +140,20 @@ func BuildServerListForLogin(h *hub.Server, key string, pct int, warm *WarmTrack
 	if h == nil {
 		return out
 	}
-	if key != "" && pct > 0 {
-		if pick, ok := RouteLogin(h, key, pct); ok {
-			out.Preferred = pick.Addr
-			if out.Preferred == "" {
-				out.Preferred = pick.Name
+	// CanaryPct reports the active canary percentage whenever one is set
+	// (even for anonymous lists without a login key); the personalized
+	// Preferred pick additionally needs a key (pct<=0 keeps today's
+	// newest-RUNNING routing via BuildServerList).
+	if pct > 0 {
+		out.CanaryPct = pct
+		if key != "" {
+			if pick, ok := RouteLogin(h, key, pct); ok {
+				out.Preferred = pick.Addr
+				if out.Preferred == "" {
+					out.Preferred = pick.Name
+				}
 			}
 		}
-		out.CanaryPct = pct
 	}
 	if prev, ok := PreviousRunning(h); ok {
 		addr := prev.Addr
@@ -298,10 +304,26 @@ func awaitRouterDrain(lc *Lifecycle) {
 	os.Exit(0)
 }
 
+// CheckHubTokenForRole enforces the fail-closed posture for multi-server
+// roles: ROLE=router/shard require HUB_TOKEN (see hub.TokenRequiredForRole).
+// The all-in-one dev default stays open (empty token allowed, documented).
+// Callers surface the returned error instead of serving unauthenticated.
+func CheckHubTokenForRole(role string, token string) error {
+	if hub.TokenRequiredForRole(role) && strings.TrimSpace(token) == "" {
+		return fmt.Errorf("hub: HUB_TOKEN required for ROLE=%s (fail-closed; all-in-one dev default stays open)", role)
+	}
+	return nil
+}
+
 // RunRouter serves the hub server-list until the listener fails or SIGTERM
 // completes the drain. It runs no sim: SIGTERM observes DRAINING on
 // /healthz, then the process exits (see awaitRouterDrain above).
+// Fail-closed: without HUB_TOKEN the router refuses to serve (see
+// CheckHubTokenForRole); the all-in-one dev default stays open by design.
 func RunRouter(cfg Config) error {
+	if err := CheckHubTokenForRole(RoleRouter, hub.SharedToken()); err != nil {
+		return err
+	}
 	addr := RouterAddr()
 	h := hub.NewServer(hub.SharedToken(), nil)
 	h.StartSweeper(context.Background())

@@ -123,11 +123,15 @@ func NewLimiterWithLimits(l Limits) *Limiter {
 	}
 }
 
-// NewLimiterFromConfig builds a Limiter from the bus Config seam, honoring
-// Config.MaxConnectionsPerIP when positive and defaulting the msg/chat knobs
-// (bus.go only models the per-IP cap so far).
+// NewLimiterFromConfig builds a Limiter from the bus Config seam, passing
+// all knobs through (zero values fall back to defaults via normalize).
 func NewLimiterFromConfig(cfg Config) *Limiter {
-	return NewLimiterWithLimits(Limits{MaxConnectionsPerIP: cfg.MaxConnectionsPerIP})
+	return NewLimiterWithLimits(Limits{
+		MaxConnectionsPerIP: cfg.MaxConnectionsPerIP,
+		MaxMsgsPerSecond:    cfg.MaxMsgsPerSecond,
+		ChatBurst:           cfg.ChatBurst,
+		ChatRefillPerSec:    cfg.ChatRefillPerSec,
+	})
 }
 
 // Acquire admits one connection from ip, returning false when the per-IP cap

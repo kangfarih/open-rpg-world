@@ -192,7 +192,7 @@ func main() {
 	fmt.Println("handshake:", drain(1500*time.Millisecond))
 	lastFrames = nil
 
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, user))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedRank":2}]`, user))
 	fmt.Println("login:", drain(2500*time.Millisecond))
 
 	// Own instance from the Welcome frame.

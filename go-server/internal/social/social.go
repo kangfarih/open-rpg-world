@@ -61,9 +61,9 @@
 //     requires a pending Invite (package-documented). C->S Join maps to
 //     AcceptInvite; a join without an invite notifies 'guilds:NO_INVITE'
 //     (new string, no TS counterpart). Invites flow over `/guild invite`.
-//   - Decoration (banner/outline/crest) is kept in memory only: SchemaSQL has
-//     no decoration column, so banner choices do not survive a reboot (Login
-//     frames echo the in-memory choice, client fallbacks apply otherwise).
+//   - Decoration (banner/outline/crest) is now persisted to SQLite via the
+//     guilds.decoration JSON column (v6 schema migration). The in-memory
+//     socDeco map remains for fast Login frame assembly.
 //   - Hub relay for offline members is a skip in all-in-one: TS
 //     synchronize() relays to offline members over the hub socket; all-in-one
 //     the Router resolves the online subset and offline members get nothing
@@ -203,6 +203,12 @@ type Deps struct {
 	IsNonBlank func(string) bool
 	// FormatName formats a display name (m7FormatName parity).
 	FormatName func(string) string
+	// GuildCreationGates checks the economy/progression gates for guild
+	// creation (TS guilds.ts create() parity): has 30,000 gold, tutorial
+	// finished. Returns (ok, errMsg); when ok=false the caller notifies
+	// errMsg and returns. The remove-gold step is implicit: when ok=true
+	// the gold has already been deducted.
+	GuildCreationGates func(username string) (ok bool, errMsg string)
 }
 
 var sdeps Deps
@@ -254,6 +260,7 @@ type socFriendInfo struct {
 type socGuildMember struct {
 	Username string `json:"username"`
 	Rank     *int   `json:"rank,omitempty"`
+	JoinDate *int64 `json:"joinDate,omitempty"`
 	ServerID *int   `json:"serverId,omitempty"`
 }
 
@@ -308,6 +315,9 @@ func LoadGuilds() {
 	type grow struct {
 		id, name, owner string
 		xp              int
+		inviteOnly      bool
+		creationDate    int64
+		decoration      guilds.Decoration
 	}
 	lockDB()
 	defer unlockDB()
@@ -323,11 +333,30 @@ func LoadGuilds() {
 		}
 	}
 	rows.Close()
-	// xp column predates some DBs; tolerate its absence (zero value).
+	// xp/invite_only/creation_date/decoration columns may be absent on older
+	// DBs; tolerate their absence (zero values).
 	for i := range gs {
 		var xp int
 		if err := sdeps.DB.QueryRow(`SELECT xp FROM guilds WHERE id=?`, gs[i].id).Scan(&xp); err == nil {
 			gs[i].xp = xp
+		}
+		var inviteOnly int
+		if err := sdeps.DB.QueryRow(`SELECT invite_only FROM guilds WHERE id=?`, gs[i].id).Scan(&inviteOnly); err == nil {
+			gs[i].inviteOnly = inviteOnly != 0
+		}
+		var creationDate int64
+		if err := sdeps.DB.QueryRow(`SELECT creation_date FROM guilds WHERE id=?`, gs[i].id).Scan(&creationDate); err == nil {
+			gs[i].creationDate = creationDate
+		}
+		var decoJSON string
+		if err := sdeps.DB.QueryRow(`SELECT decoration FROM guilds WHERE id=?`, gs[i].id).Scan(&decoJSON); err == nil && decoJSON != "" {
+			var deco guilds.Decoration
+			if json.Unmarshal([]byte(decoJSON), &deco) == nil {
+				gs[i].decoration = deco
+			}
+		}
+		if gs[i].decoration == (guilds.Decoration{}) {
+			gs[i].decoration = guilds.DefaultDecoration()
 		}
 	}
 	for _, g := range gs {
@@ -336,28 +365,53 @@ func LoadGuilds() {
 			continue
 		}
 		socGuildIDs[created.ID] = true
-		socDeco[created.ID] = socDefaultDeco()
-		mrows, merr := sdeps.DB.Query(`SELECT player,rank FROM guild_members WHERE guild=?`, created.ID)
+		// Overwrite the defaults Create() set with persisted values.
+		created.InviteOnly = g.inviteOnly
+		created.CreationDate = g.creationDate
+		created.Decoration = g.decoration
+		socMu.Lock()
+		socDeco[created.ID] = socDecoration{
+			Banner:        g.decoration.Banner,
+			Outline:       g.decoration.Outline,
+			OutlineColour: g.decoration.OutlineColour,
+			Crest:         g.decoration.Crest,
+		}
+		socMu.Unlock()
+		mrows, merr := sdeps.DB.Query(`SELECT player,rank,join_date FROM guild_members WHERE guild=?`, created.ID)
 		if merr != nil {
-			continue
+			// Fallback: older schema without join_date column.
+			mrows, merr = sdeps.DB.Query(`SELECT player,rank FROM guild_members WHERE guild=?`, created.ID)
+			if merr != nil {
+				continue
+			}
 		}
 		var members []struct {
-			name string
-			rank int
+			name     string
+			rank     int
+			joinDate int64
 		}
 		for mrows.Next() {
 			var m struct {
-				name string
-				rank int
+				name     string
+				rank     int
+				joinDate int64
 			}
-			if mrows.Scan(&m.name, &m.rank) == nil {
-				members = append(members, m)
+			if err := mrows.Scan(&m.name, &m.rank, &m.joinDate); err != nil {
+				// Fallback scan without join_date.
+				if err2 := mrows.Scan(&m.name, &m.rank); err2 != nil {
+					continue
+				}
 			}
+			members = append(members, m)
 		}
 		mrows.Close()
 		sort.Slice(members, func(a, b int) bool { return members[a].name < members[b].name })
 		for _, m := range members {
 			if m.name == g.owner {
+				// Restore owner's join date too.
+				if m.joinDate != 0 {
+					socGuilds.SetJoinDate(created.ID, g.owner, m.joinDate)
+				}
 				continue
 			}
 			if err := socGuilds.Invite(g.owner, m.name); err != nil {
@@ -366,6 +420,9 @@ func LoadGuilds() {
 			if err := socGuilds.AcceptInvite(m.name, created.ID); err != nil {
 				continue
 			}
+			if m.joinDate != 0 {
+				socGuilds.SetJoinDate(created.ID, m.name, m.joinDate)
+			}
 			if m.rank != int(guilds.RankFledgling) {
 				_ = socGuilds.SetRank(g.owner, m.name, guilds.Rank(m.rank))
 			}
@@ -373,6 +430,9 @@ func LoadGuilds() {
 		if g.xp != 0 {
 			_ = socGuilds.AddXP(g.owner, g.xp)
 		}
+		// Persist the restored state (now with correct creationDate etc.)
+		// so the DB reflects the restored guild.
+		socGuilds.SetGuildMeta(created.ID, g.inviteOnly, g.creationDate, g.decoration)
 	}
 	if len(gs) > 0 {
 		log.Printf("social: restored %d guilds", len(gs))
@@ -386,9 +446,15 @@ func saveGuildRows(g *guilds.Guild) {
 	}
 	lockDB()
 	defer unlockDB()
-	if _, err := sdeps.DB.Exec(`INSERT INTO guilds(id,name,owner,xp) VALUES(?,?,?,?) `+
-		`ON CONFLICT(id) DO UPDATE SET name=?,owner=?,xp=?`,
-		g.ID, g.Name, g.Owner, g.XP, g.Name, g.Owner, g.XP); err != nil {
+	decoJSON, _ := json.Marshal(g.Decoration)
+	inviteOnly := 0
+	if g.InviteOnly {
+		inviteOnly = 1
+	}
+	if _, err := sdeps.DB.Exec(`INSERT INTO guilds(id,name,owner,xp,invite_only,creation_date,decoration) VALUES(?,?,?,?,?,?,?) `+
+		`ON CONFLICT(id) DO UPDATE SET name=?,owner=?,xp=?,invite_only=?,creation_date=?,decoration=?`,
+		g.ID, g.Name, g.Owner, g.XP, inviteOnly, g.CreationDate, string(decoJSON),
+		g.Name, g.Owner, g.XP, inviteOnly, g.CreationDate, string(decoJSON)); err != nil {
 		log.Printf("social: save guild %s: %v", g.ID, err)
 		return
 	}
@@ -396,8 +462,9 @@ func saveGuildRows(g *guilds.Guild) {
 		return
 	}
 	for user, rank := range g.Members {
-		if _, err := sdeps.DB.Exec(`INSERT INTO guild_members(guild,player,rank) VALUES(?,?,?)`,
-			g.ID, user, int(rank)); err != nil {
+		joinDate := g.JoinDates[user]
+		if _, err := sdeps.DB.Exec(`INSERT INTO guild_members(guild,player,rank,join_date) VALUES(?,?,?,?)`,
+			g.ID, user, int(rank), joinDate); err != nil {
 			log.Printf("social: save member %s/%s: %v", g.ID, user, err)
 		}
 	}
@@ -618,7 +685,7 @@ func sendFriendsStatus(c *Conn, username string, online bool, serverID int) {
 }
 
 // guildLoginFrame builds the connect/Login frame (guilds.ts create/connect
-// parity: {name, owner, members, decoration}).
+// parity: {name, owner, members, decoration, creationDate, inviteOnly}).
 func guildLoginFrame(g *guilds.Guild) []any {
 	names := make([]string, 0, len(g.Members))
 	for u := range g.Members {
@@ -628,7 +695,11 @@ func guildLoginFrame(g *guilds.Guild) []any {
 	members := make([]socGuildMember, 0, len(names))
 	for _, u := range names {
 		r := int(g.Members[u])
-		members = append(members, socGuildMember{Username: u, Rank: &r})
+		m := socGuildMember{Username: u, Rank: &r}
+		if jd, ok := g.JoinDates[u]; ok && jd != 0 {
+			m.JoinDate = &jd
+		}
+		members = append(members, m)
 	}
 	socMu.Lock()
 	deco, ok := socDeco[g.ID]
@@ -638,6 +709,7 @@ func guildLoginFrame(g *guilds.Guild) []any {
 	}
 	return protocol.PktOp(protocol.PacketGuild, GuildLogin, map[string]any{
 		"name": g.Name, "owner": g.Owner, "members": members, "decoration": deco,
+		"creationDate": g.CreationDate, "inviteOnly": g.InviteOnly,
 	})
 }
 
@@ -840,9 +912,18 @@ func HandleGuild(c *Conn, data []byte) {
 	}
 }
 
-// guildCreate ports guilds.ts create() minus the economy/progression gates
-// (documented divergence): membership + name-uniqueness checks only.
+// guildCreate ports guilds.ts create(): economy/progression gates (30k gold,
+// tutorial finished) + membership + name-uniqueness checks.
 func CreateGuild(c *Conn, name, colour string, outline *int, outlineColour, crest string) {
+	// TS parity: economy/progression gates (guilds.ts create() lines 44-60).
+	if sdeps.GuildCreationGates != nil {
+		if ok, errMsg := sdeps.GuildCreationGates(c.Username); !ok {
+			if errMsg != "" {
+				c.Notify(errMsg)
+			}
+			return
+		}
+	}
 	if _, err := socGuilds.GuildOf(c.Username); err == nil {
 		c.Notify("guilds:ALREADY_IN_GUILD")
 		return
@@ -873,6 +954,14 @@ func CreateGuild(c *Conn, name, colour string, outline *int, outlineColour, cres
 	}
 	socDeco[g.ID] = deco
 	socMu.Unlock()
+	// Set decoration on the guild struct so saveGuildRows persists it.
+	g.Decoration = guilds.Decoration{
+		Banner:        deco.Banner,
+		Outline:       deco.Outline,
+		OutlineColour: deco.OutlineColour,
+		Crest:         deco.Crest,
+	}
+	socGuilds.SetGuildMeta(g.ID, g.InviteOnly, g.CreationDate, g.Decoration)
 	saveGuildRows(g)
 	c.Send(guildLoginFrame(g))
 	log.Printf("social: %s created guild %s (%s)", c.Username, g.Name, g.ID)
@@ -987,6 +1076,7 @@ func guildList(c *Conn, from, to int) {
 	}
 	var ids []string
 	names := map[string]string{}
+	inviteOnlyMap := map[string]bool{}
 	for rows.Next() {
 		var id, name, owner string
 		if rows.Scan(&id, &name, &owner) == nil {
@@ -995,6 +1085,13 @@ func guildList(c *Conn, from, to int) {
 		}
 	}
 	rows.Close()
+	// Read invite_only (tolerate missing column on older DBs).
+	for _, id := range ids {
+		var inv int
+		if err := sdeps.DB.QueryRow(`SELECT invite_only FROM guilds WHERE id=?`, id).Scan(&inv); err == nil {
+			inviteOnlyMap[id] = inv != 0
+		}
+	}
 	sort.Strings(ids)
 	var list []map[string]any
 	total := 0
@@ -1028,6 +1125,7 @@ func guildList(c *Conn, from, to int) {
 		}
 		list = append(list, map[string]any{
 			"name": names[id], "members": n, "decoration": deco,
+			"inviteOnly": inviteOnlyMap[id],
 		})
 	}
 	if list == nil {

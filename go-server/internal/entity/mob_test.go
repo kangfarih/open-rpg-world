@@ -197,7 +197,7 @@ func TestAggroChaseAndStrike(t *testing.T) {
 	if st.attacker != "mob-aggro" || st.target != "hero-1" {
 		t.Fatalf("strike = %+v", st)
 	}
-	if st.dmg < 0 || hp != HeroMaxHP-st.dmg {
+	if st.dmg < 0 || hp != 69-st.dmg {
 		t.Fatalf("strike dmg=%d heroHP=%d", st.dmg, hp)
 	}
 }
@@ -414,7 +414,7 @@ func TestDamageHeroDeathHook(t *testing.T) {
 	// Non-lethal: Points only.
 	DamageHero(w, "hero-1", "hero", 10, m)
 	w.mu.Lock()
-	if w.heroHP["hero-1"] != HeroMaxHP-10 || len(w.heroPts) != 1 || len(w.deaths) != 0 {
+	if w.heroHP["hero-1"] != 69-10 || len(w.heroPts) != 1 || len(w.deaths) != 0 {
 		w.mu.Unlock()
 		t.Fatalf("hp=%v pts=%v deaths=%v", w.heroHP, w.heroPts, w.deaths)
 	}
@@ -424,7 +424,7 @@ func TestDamageHeroDeathHook(t *testing.T) {
 	m.mu.Lock()
 	m.target = "hero-1"
 	m.mu.Unlock()
-	DamageHero(w, "hero-1", "hero", HeroMaxHP, m)
+	DamageHero(w, "hero-1", "hero", 69, m)
 	m.mu.Lock()
 	tgt := m.target
 	m.mu.Unlock()
@@ -441,7 +441,7 @@ func TestDamageHeroDeathHook(t *testing.T) {
 	// the HeroDied funnel still runs as an environmental death (empty
 	// mobInstance — no killer is invented).
 	w2 := newSimFake()
-	DamageHero(w2, "hero-1", "hero", HeroMaxHP, nil)
+	DamageHero(w2, "hero-1", "hero", 69, nil)
 	w2.mu.Lock()
 	defer w2.mu.Unlock()
 	if w2.heroHP["hero-1"] != 0 || len(w2.heroPts) != 1 {
@@ -455,7 +455,7 @@ func TestDamageHeroDeathHook(t *testing.T) {
 func TestRespawnHero(t *testing.T) {
 	w := newSimFake()
 
-	if RespawnHero(w, "hero-1") {
+	if RespawnHero(w, "hero-1", HeroSpawnX, HeroSpawnY) {
 		t.Fatal("live hero respawned")
 	}
 	w.mu.Lock()
@@ -466,12 +466,12 @@ func TestRespawnHero(t *testing.T) {
 	w.mu.Unlock()
 
 	w.SetHeroHP("hero-1", 0)
-	if !RespawnHero(w, "hero-1") {
+	if !RespawnHero(w, "hero-1", HeroSpawnX, HeroSpawnY) {
 		t.Fatal("dead hero did not respawn")
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.heroHP["hero-1"] != HeroMaxHP {
+	if w.heroHP["hero-1"] != 69 {
 		t.Fatalf("respawn hp = %d", w.heroHP["hero-1"])
 	}
 	if len(w.teleports) != 1 || w.teleports[0].x != HeroSpawnX || w.teleports[0].y != HeroSpawnY {
@@ -519,7 +519,7 @@ func TestRollMobDamageBounds(t *testing.T) {
 	p.Skills.Strength = str
 	maxDmg := int(float64(bonus+str)*1.25) + 1 // mult=1, floor(rand^acc*(max+1)) <= max
 	for i := 0; i < 200; i++ {
-		if d := RollMobDamage(p, 1, 1); d < 0 || d > maxDmg {
+		if d := RollMobDamage(p, 1, 1, [5]int{}); d < 0 || d > maxDmg {
 			t.Fatalf("damage %d out of [0,%d]", d, maxDmg)
 		}
 	}

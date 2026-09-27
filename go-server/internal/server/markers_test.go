@@ -52,7 +52,7 @@ func TestMarkerPopulateTestmapNoop(t *testing.T) {
 
 	baseRes := len(resourceSpawns)
 	baseReg := worldcore.EntityCount()
-	baseMobs := len(m9Mobs)
+	baseMobs := len(mobs)
 
 	got := populateMarkers()
 	if got.mobs != 0 || got.npcs != 0 || got.trees != 0 || got.unknown != 0 {
@@ -64,8 +64,8 @@ func TestMarkerPopulateTestmapNoop(t *testing.T) {
 	if worldcore.EntityCount() != baseReg {
 		t.Fatalf("registry grew in TESTMAP (%d -> %d)", baseReg, worldcore.EntityCount())
 	}
-	if len(m9Mobs) != baseMobs {
-		t.Fatalf("mob registry grew in TESTMAP (%d -> %d)", baseMobs, len(m9Mobs))
+	if len(mobs) != baseMobs {
+		t.Fatalf("mob registry grew in TESTMAP (%d -> %d)", baseMobs, len(mobs))
 	}
 	if len(markerNPCs) != 0 || len(markerMobSet) != 0 {
 		t.Fatal("marker registries non-empty after TESTMAP populate")
@@ -126,8 +126,8 @@ func TestMarkerBootCountRealMode(t *testing.T) {
 	if remaining := len(markerCounts_.mobQueue); remaining != 0 {
 		t.Fatalf("mob queue remaining = %d, want 0 (sync drain)", remaining)
 	}
-	if len(m9Mobs) < got.mobs {
-		t.Fatalf("engine mobs = %d, want >= %d", len(m9Mobs), got.mobs)
+	if len(mobs) < got.mobs {
+		t.Fatalf("engine mobs = %d, want >= %d", len(mobs), got.mobs)
 	}
 
 	// Sorcerer marker (tile 117058 -> 706,101) resolves as an NPC Who
@@ -151,7 +151,7 @@ func TestMarkerBootCountRealMode(t *testing.T) {
 	if probe.X != 706 || probe.Y != 101 {
 		t.Fatalf("sorcerer at %d,%d, want 706,101", probe.X, probe.Y)
 	}
-	if key := m6ResolveNPCKey(nil, "mk-n-117058"); key != "sorcerer" {
+	if key := resolveNPCKey(nil, "mk-n-117058"); key != "sorcerer" {
 		t.Fatalf("ResolveNPCKey(mk-n-117058) = %q, want sorcerer", key)
 	}
 
@@ -225,7 +225,7 @@ func TestMarkerNPCTalkOpensStore(t *testing.T) {
 	worldcore.SetEntityPos(c.Instance, 705, 101)
 	drainOutbox(c)
 
-	m6HandleNPCTarget(c, "mk-n-117058")
+	handleNPCTarget(c, "mk-n-117058")
 	if got := c.StoreOpen(); got != "sorcerer" {
 		t.Fatalf("storeOpen = %q, want sorcerer", got)
 	}
@@ -252,7 +252,7 @@ func TestMarkerStaggerDrainBatches(t *testing.T) {
 		markerSpawnSync = savedSync
 		resetMarkers()
 	})
-	m9LoadTables()
+	loadMobTables()
 
 	seeds := []markerMobSpawn{
 		{instance: "mk-test-1", key: "rat", x: 100, y: 96},
@@ -269,16 +269,16 @@ func TestMarkerStaggerDrainBatches(t *testing.T) {
 	if remaining := drainMarkerMobs(2); remaining != 1 {
 		t.Fatalf("drain(2) remaining = %d, want 1", remaining)
 	}
-	if m9MobFor("mk-test-1") == nil || m9MobFor("mk-test-2") == nil {
+	if mobFor("mk-test-1") == nil || mobFor("mk-test-2") == nil {
 		t.Fatal("first batch missing from the engine")
 	}
-	if m9MobFor("mk-test-3") != nil {
+	if mobFor("mk-test-3") != nil {
 		t.Fatal("third mob spawned before its batch")
 	}
 	if remaining := drainMarkerMobs(0); remaining != 0 {
 		t.Fatalf("drain all remaining = %d, want 0", remaining)
 	}
-	if m9MobFor("mk-test-3") == nil {
+	if mobFor("mk-test-3") == nil {
 		t.Fatal("third mob missing after full drain")
 	}
 	// Stagger cadence defaults (documented): 200 mobs per 50ms tick.

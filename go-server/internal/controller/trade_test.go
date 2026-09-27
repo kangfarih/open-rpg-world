@@ -439,8 +439,7 @@ func TestExchangeBlocked(t *testing.T) {
 func TestClampCraftCount(t *testing.T) {
 	reqs := []CraftRequirement{{Key: "a", Count: 2}, {Key: "b", Count: 1}}
 	have := func(k string) int { return map[string]int{"a": 5, "b": 9}[k] }
-	// a: 2*5 > 5 -> actual = 5/2 = 2; b: 1*5 > 9 is false -> kept (later
-	// requirements overwrite earlier ones, crafting.ts order parity).
+	// a: 2*5 > 5 -> candidate 5/2 = 2; b: 1*5 <= 9 -> no clamp. Min = 2.
 	if got := ClampCraftCount(5, reqs, have); got != 2 {
 		t.Fatalf("clamp = %d, want 2", got)
 	}

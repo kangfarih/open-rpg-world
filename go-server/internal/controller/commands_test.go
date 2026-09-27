@@ -189,6 +189,7 @@ func (m *cmdMobs) SpawnMob(instance, key string, x, y int) bool {
 	m.m[instance] = &cmdMob{instance: instance, key: key, x: x, y: y, hp: 50}
 	return true
 }
+func (m *cmdMobs) MobTalk(instance, message string) {}
 
 type cmdQuests struct {
 	questDefs  map[string]int

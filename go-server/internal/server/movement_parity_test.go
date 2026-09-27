@@ -115,9 +115,9 @@ func TestMovementTeleportBlocksRequest(t *testing.T) {
 	const user, inst = "mv-tp-user", "mv-tp-inst"
 	c := moveTestConn(t, inst, user)
 
-	m7Teleport(c, 102, 96) // funnel arms the flag + tracks the landing tile
+	teleport(c, 102, 96) // funnel arms the flag + tracks the landing tile
 	if !c.isTeleporting() {
-		t.Fatal("m7Teleport must arm the teleporting flag")
+		t.Fatal("teleport must arm the teleporting flag")
 	}
 	drainOutbox(c)
 
@@ -149,7 +149,7 @@ func TestMovementRequestClearsState(t *testing.T) {
 	t.Cleanup(func() { cleanupLootUser(user) })
 
 	c.SetCanAccess(true)
-	controller.HandleTest(c, []byte(`{"m12test":"craftif","iface":5}`), m12deps())
+	controller.HandleTest(c, []byte(`{"m12test":"craftif","iface":5}`), tradeDeps())
 	bag := entity.SpawnLootBag(user, 100, 96, []entity.Drop{{Key: "gold", Count: 5}, {Key: "logs", Count: 2}})
 	if bag == "" {
 		t.Fatal("SpawnLootBag returned empty instance")
@@ -177,13 +177,13 @@ func TestMovementRequestClearsState(t *testing.T) {
 	// Crafting with a cleared interface is rejected with CANNOT_DO_THAT
 	// (incoming.handleCrafting activeCraftingInterface===-1 parity).
 	raw, _ := json.Marshal(map[string]any{"opcode": protocol.CraftingSelect, "key": "sword"})
-	controller.HandleCrafting(c, raw, m12deps())
+	controller.HandleCrafting(c, raw, tradeDeps())
 	if frames := drainOutbox(c); !framesContain(frames, "misc:CANNOT_DO_THAT") {
 		t.Fatal("craft after move must be rejected with misc:CANNOT_DO_THAT")
 	}
 	// Take with a cleared opener transfers nothing.
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 0 {
+	if invCount(user, "gold") != 0 {
 		t.Fatal("take after move must transfer nothing")
 	}
 }

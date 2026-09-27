@@ -9,7 +9,6 @@
 package sim
 
 import (
-	"math"
 	"time"
 )
 
@@ -52,9 +51,24 @@ func TravelTime(dist int) time.Duration {
 	return time.Duration(dist*90) * time.Millisecond
 }
 
-// TravelBetween returns the flight time between two tiles (ceil of the
-// Euclidean distance, then TravelTime), mirroring the main.go launch path.
+// TravelBetween returns the flight time between two tiles (Manhattan
+// distance, then TravelTime), mirroring the projectile.ts getDistance rule
+// (entity.ts:120-122: Math.abs(dx) + Math.abs(dy)).
 func TravelBetween(x0, y0, x1, y1 int) time.Duration {
-	dist := int(math.Ceil(math.Hypot(float64(x1-x0), float64(y1-y0))))
+	dist := Manhattan(x0, y0, x1, y1)
 	return TravelTime(dist)
+}
+
+// Manhattan returns the Manhattan distance between two grid points
+// (entity.ts getDistance: Math.abs(dx) + Math.abs(dy)).
+func Manhattan(x0, y0, x1, y1 int) int {
+	dx := x1 - x0
+	dy := y1 - y0
+	if dx < 0 {
+		dx = -dx
+	}
+	if dy < 0 {
+		dy = -dy
+	}
+	return dx + dy
 }

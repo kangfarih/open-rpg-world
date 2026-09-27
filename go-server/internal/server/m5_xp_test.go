@@ -27,7 +27,7 @@ func TestNegativeAddXPSubtractsAndClamps(t *testing.T) {
 	if got := player.AddXP(d, nil, key, SkillFishing, 1000); got < 1 {
 		t.Fatalf("AddXP(+1000) = %d, want a level", got)
 	}
-	st := m5StateFor(key)
+	st := playerStateFor(key)
 	pstateMu.Lock()
 	xp := st.Skills[SkillFishing].XP
 	pstateMu.Unlock()
@@ -58,24 +58,24 @@ func TestNegativeAddXPSubtractsAndClamps(t *testing.T) {
 	}
 }
 
-// m5AwardCombatXP style/mana wiring (player.handleExperience parity,
+// awardCombatXP style/mana wiring (player.handleExperience parity,
 // player.ts:990-1107): the equipped weapon's class routes first
 // (heroIsArcher/heroIsMagic, exactly as the live swing sites pass),
 // then the attack-style store (session switch, else the weapon's first
 // style), with hasManaForAttack halving. Damage 10 -> xp 20.
 func TestAwardCombatXPStyleAndManaWiring(t *testing.T) {
 	for _, key := range []string{"goldsword", "woodenbow", "aquastaff"} {
-		if m6ItemInfoFor(key) == nil {
+		if itemInfoFor(key) == nil {
 			t.Skip("items catalogue entry missing (needs items.json)")
 		}
 	}
 
 	setup := func(user, inst, weapon string) *playerConn {
 		c, _ := deathConn(t, inst, user)
-		st := m5StateFor(user)
+		st := playerStateFor(user)
 		pstateMu.Lock()
 		if weapon != "" {
-			st.Equip[EquipmentWeapon] = m5Slot{Key: weapon, Count: 1}
+			st.Equip[EquipmentWeapon] = slotDef{Key: weapon, Count: 1}
 		}
 		pstateMu.Unlock()
 		t.Cleanup(func() {
@@ -85,11 +85,11 @@ func TestAwardCombatXPStyleAndManaWiring(t *testing.T) {
 			abilities.ForgetPlayer(inst)
 			controller.ForgetAttackStyle(user)
 		})
-		abilities.SetMana(inst, abilities.ManaMax())
+		abilities.SetMana(inst, abilities.ManaMax(inst))
 		return c
 	}
 	xpOf := func(user string, skill int) int {
-		st := m5StateFor(user)
+		st := playerStateFor(user)
 		pstateMu.Lock()
 		defer pstateMu.Unlock()
 		if s, ok := st.Skills[skill]; ok && s != nil {
@@ -99,7 +99,7 @@ func TestAwardCombatXPStyleAndManaWiring(t *testing.T) {
 	}
 	// Mirrors the live handlePlayerAttack call sites verbatim.
 	swing := func(c *playerConn, user string, dmg int) {
-		m5AwardCombatXP(c, user, dmg, heroIsArcher(user), heroIsMagic(user))
+		awardCombatXP(c, user, dmg, heroIsArcher(user), heroIsMagic(user))
 	}
 
 	// Sword defaults to its first style (Stab -> Accuracy). This is the
@@ -117,7 +117,7 @@ func TestAwardCombatXPStyleAndManaWiring(t *testing.T) {
 	}
 
 	// Explicit session Slash on the same sword -> Strength (unchanged).
-	controller.UpdateAttackStyle(c, m6deps(), controller.AttackStyleSlash)
+	controller.UpdateAttackStyle(c, econDeps(), controller.AttackStyleSlash)
 	swing(c, "xpstyle-sword", 10)
 	if got := xpOf("xpstyle-sword", SkillStrength); got != 15 {
 		t.Fatalf("slash Strength xp = %d, want 15", got)

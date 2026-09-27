@@ -124,6 +124,14 @@ type WorldLookup interface {
 	SyncFrame(instance string, x, y int) []any
 }
 
+// DropHooks abstracts world-item spawning for player inventory drops
+// (container.ts drop parity: removed item -> world Item entity).
+type DropHooks struct {
+	// SpawnItem creates a world item entity at (x,y) for the dropped item.
+	// Returns the spawned entity instance ("" on failure).
+	SpawnItem func(owner, key string, count, x, y int) string
+}
+
 // EconomyDeps bundles the economy seams for one call.
 type EconomyDeps struct {
 	Store  EconomyStore
@@ -136,6 +144,9 @@ type EconomyDeps struct {
 	// Nil = plugins report unhandled (no consume); the live adapter always
 	// sets it (m6deps).
 	Vitals Vitals
+	// Drops spawns world-item entities on player inventory drops.
+	// Nil = no world entity (item is just removed from inventory).
+	Drops DropHooks
 }
 
 // depsForEnchant converts economy deps to trade Deps for the shared
@@ -168,6 +179,32 @@ func economyDataPath(name string) string {
 // Item info (name/price/stackable/maxStackSize from items.json).
 // ---------------------------------------------------------------------------
 
+// ItemBonuses mirrors items.json `bonuses` (accuracy/strength/archery/magic).
+type ItemBonuses struct {
+	Accuracy int
+	Strength int
+	Archery  int
+	Magic    int
+}
+
+// ItemAttackStats mirrors items.json `attackStats` (crush/slash/stab/archery/magic).
+type ItemAttackStats struct {
+	Crush   int
+	Slash   int
+	Stab    int
+	Archery int
+	Magic   int
+}
+
+// ItemDefenseStats mirrors items.json `defenseStats`.
+type ItemDefenseStats struct {
+	Crush   int
+	Slash   int
+	Stab    int
+	Archery int
+	Magic   int
+}
+
 // ItemInfo mirrors m6ItemInfo: items.json catalogue entry.
 type ItemInfo struct {
 	Name         string
@@ -197,6 +234,21 @@ type ItemInfo struct {
 	ManaCost     int    // item.ts manaCost (staff swings; 0 = free)
 	Freezing     bool   // item.ts freezing (ice arrows)
 	Burning      bool   // item.ts burning (fire arrows)
+	// Combat stats (formulas.ts getMaxDamage / getDamageReduction parity).
+	TwoHanded    bool             // weapon.ts isTwoHanded (bows only in items.json)
+	Bonuses      ItemBonuses      // equipment totalBonuses per-item contribution
+	AttackStats  ItemAttackStats  // character attack stats from weapon
+	DefenseStats ItemDefenseStats // character defense stats from armor/weapon
+	// Gathering tool tiers (weapon.ts lumberjacking/mining/fishing).
+	// Non-zero means the item can be used for that gathering skill at the
+	// given tier level; zero means the item is not a tool for that skill.
+	Lumberjacking int // items.json `lumberjacking`
+	Mining        int // items.json `mining`
+	Fishing       int // items.json `fishing`
+	// MovementModifier is the equipment movement speed multiplier
+	// (items.json `movementModifier`; swiftboots=0.95). Zero means no
+	// modifier; the speed pipeline treats 1.0 and 0 identically (skip).
+	MovementModifier float64 `json:"movementModifier"`
 }
 
 var (
@@ -239,6 +291,31 @@ func LoadItems() error {
 			ManaCost     int     `json:"manaCost"`
 			Freezing     bool    `json:"freezing"`
 			Burning      bool    `json:"burning"`
+			TwoHanded    bool    `json:"twoHanded"`
+			Lumberjacking int    `json:"lumberjacking"`
+			Mining        int    `json:"mining"`
+			Fishing       int    `json:"fishing"`
+			MovementModifier float64 `json:"movementModifier"`
+			Bonuses      struct {
+				Accuracy int `json:"accuracy"`
+				Strength int `json:"strength"`
+				Archery  int `json:"archery"`
+				Magic    int `json:"magic"`
+			} `json:"bonuses"`
+			AttackStats struct {
+				Crush   int `json:"crush"`
+				Slash   int `json:"slash"`
+				Stab    int `json:"stab"`
+				Archery int `json:"archery"`
+				Magic   int `json:"magic"`
+			} `json:"attackStats"`
+			DefenseStats struct {
+				Crush   int `json:"crush"`
+				Slash   int `json:"slash"`
+				Stab    int `json:"stab"`
+				Archery int `json:"archery"`
+				Magic   int `json:"magic"`
+			} `json:"defenseStats"`
 		}
 		if err := json.Unmarshal(raw, &items); err != nil {
 			econItemsErr = err
@@ -255,7 +332,13 @@ func LoadItems() error {
 				HealAmount: v.HealAmount, HealPercent: v.HealPercent, ManaAmount: v.ManaAmount,
 				Effect: v.Effect, Duration: v.Duration, SmallBowl: v.SmallBowl, MediumBowl: v.MediumBowl,
 				WeaponType: v.WeaponType, AttackRange: v.AttackRange,
-				ManaCost: v.ManaCost, Freezing: v.Freezing, Burning: v.Burning}
+				ManaCost: v.ManaCost, Freezing: v.Freezing, Burning: v.Burning,
+				TwoHanded: v.TwoHanded,
+				Lumberjacking: v.Lumberjacking, Mining: v.Mining, Fishing: v.Fishing,
+				MovementModifier: v.MovementModifier,
+				Bonuses:      ItemBonuses{Accuracy: v.Bonuses.Accuracy, Strength: v.Bonuses.Strength, Archery: v.Bonuses.Archery, Magic: v.Bonuses.Magic},
+				AttackStats:  ItemAttackStats{Crush: v.AttackStats.Crush, Slash: v.AttackStats.Slash, Stab: v.AttackStats.Stab, Archery: v.AttackStats.Archery, Magic: v.AttackStats.Magic},
+				DefenseStats: ItemDefenseStats{Crush: v.DefenseStats.Crush, Slash: v.DefenseStats.Slash, Stab: v.DefenseStats.Stab, Archery: v.DefenseStats.Archery, Magic: v.DefenseStats.Magic}}
 		}
 		log.Printf("m6: items=%d", len(econItems))
 	})
@@ -291,6 +374,25 @@ func MaxStack(key string) int {
 func ItemPrice(key string) int {
 	if it := ItemInfoFor(key); it != nil {
 		return it.Price
+	}
+	return 0
+}
+
+// ToolTier returns the gathering tool tier for the given skill from an item.
+// Returns 0 if the item is unknown or not a tool for that skill.
+// Skill must be "lumberjacking", "mining", or "fishing" (not "foraging").
+func ToolTier(itemKey, skill string) int {
+	it := ItemInfoFor(itemKey)
+	if it == nil {
+		return 0
+	}
+	switch skill {
+	case "lumberjacking":
+		return it.Lumberjacking
+	case "mining":
+		return it.Mining
+	case "fishing":
+		return it.Fishing
 	}
 	return 0
 }
@@ -335,6 +437,11 @@ type EconStore struct {
 	Refresh      time.Duration
 	LastUpdate   time.Time
 	Items        []*EconStoreItem
+	// Original marks the keys shipped in stores.json (sold-out
+	// player-sold entries vanish; originals linger at 0 as out of
+	// stock — stores.ts isOriginalItem parity, note the inverted
+	// name there: true means NOT in the original stock).
+	Original map[string]bool
 }
 
 func (s *EconStore) itemAllowed(key string) bool {
@@ -350,6 +457,14 @@ var (
 	econStoresOnce sync.Once
 	econStores     = map[string]*EconStore{}
 	econStoresErr  error
+	// econStoresMu guards the live store lists: the refresh ticker
+	// mutates counts off-request while Buy/Sell mutate + read them.
+	// The registry map itself is stable after load (sync.Once), so
+	// StoreFor's map read stays lock-free; everything touching Items
+	// or LastUpdate goes through this mutex. Lock order is always
+	// econStoresMu -> Store seam (pstateMu) — the seam never calls
+	// back into the registry, so no inversion is possible.
+	econStoresMu sync.RWMutex
 )
 
 // LoadStores loads stores.json once (m6LoadStores parity).
@@ -391,6 +506,7 @@ func LoadStores() error {
 				LastUpdate:   time.Now(),
 			}
 			store.AllowedItems = append(store.AllowedItems, st.AllowedLower...)
+			store.Original = map[string]bool{}
 			seen := map[string]bool{}
 			for _, it := range st.Items {
 				if seen[it.Key] {
@@ -398,6 +514,7 @@ func LoadStores() error {
 					continue
 				}
 				seen[it.Key] = true
+				store.Original[it.Key] = true
 				price := it.Price
 				if price == 0 {
 					price = ItemPrice(it.Key)
@@ -438,7 +555,9 @@ func StartStoreTicker(d EconomyDeps) {
 		defer t.Stop()
 		for range t.C {
 			for key, store := range econStores {
+				econStoresMu.Lock()
 				if time.Since(store.LastUpdate) <= store.Refresh {
+					econStoresMu.Unlock()
 					continue
 				}
 				for _, it := range store.Items {
@@ -451,6 +570,7 @@ func StartStoreTicker(d EconomyDeps) {
 					}
 				}
 				store.LastUpdate = time.Now()
+				econStoresMu.Unlock()
 				UpdatePlayers(key, d)
 			}
 		}
@@ -459,6 +579,8 @@ func StartStoreTicker(d EconomyDeps) {
 
 // StoreItems snapshots the ordered item list.
 func StoreItems(store *EconStore) []EconStoreItem {
+	econStoresMu.RLock()
+	defer econStoresMu.RUnlock()
 	items := make([]EconStoreItem, len(store.Items))
 	for i, it := range store.Items {
 		items[i] = *it
@@ -466,8 +588,9 @@ func StoreItems(store *EconStore) []EconStoreItem {
 	return items
 }
 
-// FindStoreItem returns the position of itemKey in the store list or -1.
-func FindStoreItem(store *EconStore, itemKey string) int {
+// indexStoreItem is the lock-free position lookup; callers must hold
+// (at least) econStoresMu.RLock, or own the store outright (tests).
+func indexStoreItem(store *EconStore, itemKey string) int {
 	for i, it := range store.Items {
 		if it.Key == itemKey {
 			return i
@@ -476,8 +599,17 @@ func FindStoreItem(store *EconStore, itemKey string) int {
 	return -1
 }
 
+// FindStoreItem returns the position of itemKey in the store list or -1.
+func FindStoreItem(store *EconStore, itemKey string) int {
+	econStoresMu.RLock()
+	defer econStoresMu.RUnlock()
+	return indexStoreItem(store, itemKey)
+}
+
 // SerializeStore mirrors stores.ts serialize.
 func SerializeStore(store *EconStore) protocol.StorePacketData {
+	econStoresMu.RLock()
+	defer econStoresMu.RUnlock()
 	items := make([]protocol.StoreItemData, 0, len(store.Items))
 	for _, it := range store.Items {
 		name := it.Name
@@ -624,7 +756,7 @@ func Buy(c EconomyConn, d EconomyDeps, key string, index, count int) {
 	}
 
 	amount := d.Store.AddItem(c.PlayerName(), item.Key, count)
-	if amount < 1 {
+	if amount < 0 {
 		return
 	}
 	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
@@ -632,12 +764,22 @@ func Buy(c EconomyConn, d EconomyDeps, key string, index, count int) {
 		Slot: &protocol.SlotData{Index: amount, Key: item.Key, Count: count, Enchantments: map[string]any{}},
 	}))
 
-	if item.Count > 0 {
-		store.Items[index].Count -= amount
-		if store.Items[index].Count < 1 && FindStoreItem(store, item.Key) >= 0 && store.Items[index].MaxCnt >= 0 && store.Items[index].Count < 1 {
-			_ = 0
+	// Decrement by the bought count (TS `item.count -= amount` where
+	// amount is the added count — the seam always adds the full count).
+	// `amount` above is the inventory slot INDEX, never the count, so it
+	// must not touch stock or the <1 failure check (slot 0 is success).
+	econStoresMu.Lock()
+	if idx := indexStoreItem(store, item.Key); idx >= 0 && store.Items[idx].Count > 0 {
+		store.Items[idx].Count -= count
+		// Sold-out entries that were never original stock vanish
+		// (stores.ts purchase filter via isOriginalItem); originals
+		// linger at 0 as ITEM_OUT_OF_STOCK. Infinite stock (-1)
+		// never reaches here.
+		if store.Items[idx].Count < 1 && !store.Original[item.Key] {
+			store.Items = append(store.Items[:idx], store.Items[idx+1:]...)
 		}
 	}
+	econStoresMu.Unlock()
 
 	InventoryRemoveAt(c, d, c.PlayerName(), curIdx, need)
 	d.Store.MarkDirty(c.PlayerName())
@@ -711,6 +853,9 @@ func Sell(c EconomyConn, d EconomyDeps, key string, index, count int) {
 		storeCount = store.Items[storeIdx].Count
 	}
 	totalCoins := GetTotalCost(count, price, storeCount)
+	// Zero-coin sales are allowed (< 0 rejects) — stores.ts sell parity,
+	// not a missing clamp: haggling a worthless item down to 0 still
+	// moves it into the shop stock.
 	if totalCoins < 0 {
 		Notify(c, d, "store:CANNOT_SELL_ITEM")
 		return
@@ -724,14 +869,19 @@ func Sell(c EconomyConn, d EconomyDeps, key string, index, count int) {
 	}))
 	d.Store.MarkDirty(c.PlayerName())
 
-	if storeIdx < 0 {
+	// Increment the item count or add to store (key re-resolved under
+	// the lock: the snapshot index may have shifted under restock or a
+	// concurrent sale). Infinite stock (-1) never changes.
+	econStoresMu.Lock()
+	if idx := indexStoreItem(store, slot.Key); idx < 0 {
 		store.Items = append(store.Items, &EconStoreItem{
 			Key: slot.Key, Name: ItemName(slot.Key), Count: count,
 			Price: price, Stock: 1, MaxCnt: count,
 		})
-	} else if store.Items[storeIdx].Count != -1 {
-		store.Items[storeIdx].Count += count
+	} else if store.Items[idx].Count != -1 {
+		store.Items[idx].Count += count
 	}
+	econStoresMu.Unlock()
 
 	log.Printf("m6: %s sold %d %s for %d %s (store %s)", c.InstanceID(), count, slot.Key, totalCoins, store.Currency, key)
 	UpdatePlayers(key, d)

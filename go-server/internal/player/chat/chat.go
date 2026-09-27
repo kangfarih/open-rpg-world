@@ -17,19 +17,46 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Ranks (Modules.Ranks subset, modules.ts:327) + titles (modules.ts:365).
+// Ranks (Modules.Ranks, modules.ts:327) + titles (modules.ts:365).
+// Values pin the TS enum order so persisted rank ints compare correctly.
 // ---------------------------------------------------------------------------
 
 const (
-	RankNone      = 0
-	RankModerator = 1
-	RankAdmin     = 2
+	RankNone        = 0
+	RankModerator   = 1
+	RankAdmin       = 2
+	RankVeteran     = 3
+	RankPatron      = 4
+	RankArtist      = 5
+	RankCheater     = 6
+	RankTierOne     = 7
+	RankTierTwo     = 8
+	RankTierThree   = 9
+	RankTierFour    = 10
+	RankTierFive    = 11
+	RankTierSix     = 12
+	RankTierSeven   = 13
+	RankHollowAdmin = 14
+	RankBooster     = 15
 )
 
 // RankTitles prefixes chat display names for ranked players.
 var RankTitles = map[int]string{
-	RankModerator: "Mod",
-	RankAdmin:     "Admin",
+	RankModerator:   "Mod",
+	RankAdmin:       "Admin",
+	RankVeteran:     "Veteran",
+	RankPatron:      "Patron",
+	RankArtist:      "Artist",
+	RankCheater:     "Cheater",
+	RankTierOne:     "T1 Patron",
+	RankTierTwo:     "T2 Patron",
+	RankTierThree:   "T3 Patron",
+	RankTierFour:    "T4 Patron",
+	RankTierFive:    "T5 Patron",
+	RankTierSix:     "T6 Patron",
+	RankTierSeven:   "T7 Patron",
+	RankHollowAdmin: "Admin",
+	RankBooster:     "Booster",
 }
 
 // ---------------------------------------------------------------------------
@@ -42,8 +69,8 @@ const (
 	// RefillPerSec refills one message per 2 seconds (m7.go chatRefillPerSec).
 	RefillPerSec = 1.0 / 2.0
 	// GlobalCooldown is the default-rank global cooldown in ms
-	// (player.ts getGlobalChatCooldown default).
-	GlobalCooldown = int64(60_000)
+	// (player.ts getGlobalChatCooldown default: 60 minutes).
+	GlobalCooldown = int64(60 * 60_000)
 	// ModGlobalCooldown is the mod/admin global cooldown in ms.
 	ModGlobalCooldown = int64(5000)
 )
@@ -140,12 +167,30 @@ func AllowBucket(tokens float64, lastRefill, now time.Time) (bool, float64, time
 // Global cooldown (player.ts canGlobalChat / getGlobalChatDuration).
 // ---------------------------------------------------------------------------
 
-// CooldownFor returns the global-chat cooldown for a rank.
+// CooldownFor returns the global-chat cooldown for a rank (player.ts
+// getGlobalChatCooldown parity: patron tiers 15–55min, mods/admins 5s,
+// everyone else 60min).
 func CooldownFor(rank int) int64 {
-	if rank >= RankModerator {
+	switch rank {
+	case RankTierOne:
+		return 55 * 60_000
+	case RankTierTwo:
+		return 50 * 60_000
+	case RankTierThree:
+		return 45 * 60_000
+	case RankTierFour:
+		return 40 * 60_000
+	case RankTierFive:
+		return 35 * 60_000
+	case RankTierSix:
+		return 30 * 60_000
+	case RankTierSeven:
+		return 15 * 60_000
+	case RankModerator, RankHollowAdmin, RankAdmin:
 		return ModGlobalCooldown
+	default:
+		return GlobalCooldown
 	}
-	return GlobalCooldown
 }
 
 // GlobalReady ports canGlobalChat at an explicit now (ms).
@@ -201,10 +246,16 @@ func GlobalSource(displayName string) string {
 // Command parsing (controllers/commands.ts).
 // ---------------------------------------------------------------------------
 
-// SplitCommand ports Commands.parse: strip the prefix, split on spaces.
-// ok is false for an empty command ("/" alone).
+// SplitCommand ports Commands.parse: strip the single prefix char, split on
+// spaces. ok is false for an empty command ("/" alone).
+// VERIFY (double-strip): TS does rawText.slice(1) — exactly one char — while
+// the old TrimPrefix(TrimPrefix()) pair stripped two ("/;cmd" → "cmd" instead
+// of ";cmd"). Single-strip matches TS.
 func SplitCommand(rawText string) (command string, args []string, ok bool) {
-	blocks := strings.Split(strings.TrimPrefix(strings.TrimPrefix(rawText, "/"), ";"), " ")
+	if len(rawText) > 0 && (rawText[0] == '/' || rawText[0] == ';') {
+		rawText = rawText[1:]
+	}
+	blocks := strings.Split(rawText, " ")
 	if len(blocks) == 0 || blocks[0] == "" {
 		return "", nil, false
 	}
@@ -213,8 +264,12 @@ func SplitCommand(rawText string) (command string, args []string, ok bool) {
 
 // ParsePrivateMessage ports the /pm|/msg username resolution: username is the
 // text between the two `*` markers, and the message is every block after the
-// username's blocks (which keeps the `*username*` wrapper in the delivered
-// text — a Node quirk, preserved verbatim). The username is lowercased like
+// username's blocks.
+// VERIFY (PM comment fix): the old comment claimed the delivered message
+// keeps the `*username*` wrapper (a "Node quirk"). It does not — TS slices
+// the username's blocks off (blocks.slice(username.split(' ').length)), so
+// "*bob* hello" delivers "hello" and "*bob smith* hi" delivers "hi". Comment
+// corrected; parsing already matched TS. The username is lowercased like
 // the m7 caller.
 func ParsePrivateMessage(blocks []string) (username, message string, ok bool) {
 	joined := strings.Join(blocks, " ")

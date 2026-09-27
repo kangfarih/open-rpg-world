@@ -251,7 +251,7 @@ func login(user string) *websocket.Conn {
 	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	drain(800 * time.Millisecond)
 	lastFrames = nil
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, user))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedRank":2}]`, user))
 	drain(1200 * time.Millisecond)
 	for _, f := range lastFrames {
 		if f.ID == 3 { // PacketWelcome

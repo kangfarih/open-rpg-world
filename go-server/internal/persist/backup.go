@@ -61,9 +61,10 @@ func BackupOnBootFromEnv(getenv func(string) string) bool {
 }
 
 // archivePath renders <dir>/<UTC timestamp>-<base>.db. The timestamp has
-// second granularity plus nanoseconds-suffix-free uniqueness via the
-// caller retrying on collision (VACUUM INTO never overwrites, so a clash
-// surfaces as an error, never as silent data loss).
+// second granularity; uniqueness across rapid successive snapshots comes
+// from snapshotOwner's suffixed retry loop below (VACUUM INTO never
+// overwrites, so a clash surfaces as an error that the loop retries with
+// a fresh suffix, never as silent data loss).
 func archivePath(dir, srcPath string, now time.Time) string {
 	base := filepath.Base(srcPath)
 	if base == "" || base == "." || base == "/" {
@@ -91,50 +92,42 @@ func snapshotInto(db *sql.DB, dest string) error {
 }
 
 // snapshotOwner snapshots the already-open owner connection into a fresh
-// timestamped archive under dir, creating dir on demand. It reports the
-// archive path. A timestamp collision (VACUUM INTO refusing to overwrite)
-// retries once with a suffixed name.
+// timestamped archive under dir, creating dir on demand (0700: archives
+// may contain player rows). It reports the archive path. A timestamp
+// collision (VACUUM INTO refusing to overwrite) retries with incrementing
+// numeric suffixes (-1, -2, ...) until a fresh name lands.
 func snapshotOwner(db *sql.DB, srcPath, dir string, now time.Time) (string, error) {
 	if db == nil {
 		return "", fmt.Errorf("backup: nil db")
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", fmt.Errorf("backup: mkdir %s: %w", dir, err)
 	}
-	dest := archivePath(dir, srcPath, now)
-	if err := snapshotInto(db, dest); err != nil {
-		if !strings.Contains(err.Error(), "already exists") && !strings.Contains(strings.ToLower(err.Error()), "exists") {
-			return "", err
+	base := archivePath(dir, srcPath, now)
+	trimmed := strings.TrimSuffix(base, ".db")
+	for i := 0; i < 100; i++ {
+		dest := base
+		if i > 0 {
+			dest = fmt.Sprintf("%s-%d.db", trimmed, i)
 		}
-		dest = strings.TrimSuffix(dest, ".db") + "-1.db"
-		if err2 := snapshotInto(db, dest); err2 != nil {
-			return "", err2
+		if err := snapshotInto(db, dest); err != nil {
+			if !strings.Contains(err.Error(), "already exists") && !strings.Contains(strings.ToLower(err.Error()), "exists") {
+				return "", err
+			}
+			continue
 		}
+		return dest, nil
 	}
-	return dest, nil
-}
-
-// Snapshot copies the SQLite DB at srcPath to a fresh timestamped archive
-// under BACKUP_DIR (default ./backups) via VACUUM INTO through
-// database/sql, and reports the archive path. It opens its own
-// single-connection handle for the copy; the Store.SnapshotDB method below
-// snapshots through the already-open owner connection instead (used by the
-// BACKUP_ON_BOOT pre-migrate hook inside Open, where the owner handle is
-// already up).
-func Snapshot(srcPath string) (string, error) {
-	db, err := sql.Open("sqlite", srcPath)
-	if err != nil {
-		return "", fmt.Errorf("backup: open %s: %w", srcPath, err)
-	}
-	defer db.Close()
-	db.SetMaxOpenConns(1)
-	return snapshotOwner(db, srcPath, BackupDir(), time.Now())
+	return "", fmt.Errorf("backup: could not allocate archive name under %s", dir)
 }
 
 // SnapshotDB copies this Store's DB to a fresh timestamped archive under dir
 // (empty dir = BACKUP_DIR env, else ./backups) via VACUUM INTO on the owner
 // connection, and reports the archive path. The Store mutex is held across
-// the copy so no write interleaves with the snapshot.
+// the copy so no write interleaves with the snapshot. This is the only
+// supported live-DB snapshot route: there is no free (Store-less) Snapshot
+// function by design, since a second handle cannot serialize against the
+// owner's write transaction (torn-copy risk).
 //
 // (Named SnapshotDB — not Snapshot — because (*Store).Snapshot already
 // deep-copies the in-memory player State.)

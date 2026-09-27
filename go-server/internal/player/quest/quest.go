@@ -125,16 +125,21 @@ const (
 	AchievementProgress = 1
 )
 
-// Opcodes.Pointer (Location0/Remove3) + Notification Popup3: the pointer and
-// notification opcodes live outside internal/protocol (minigame-owned), so
-// the values are pinned here (m8.go parity: Location 0, Remove 3).
+// Opcodes.Pointer (Location0/Entity1/Relative2/Remove3) + Notification
+// Popup3: the pointer and notification opcodes live outside
+// internal/protocol (minigame-owned), so the values are pinned here (m8.go
+// parity: Location 0, Entity 1, Relative 2, Remove 3).
 const (
 	PointerLocation   = 0
+	PointerEntity     = 1
+	PointerRelative   = 2
 	PointerRemove     = 3
 	NotificationPopup = 3
 )
 
-// Skill ids mirror Modules.Skills order (m5.go parity).
+// Skill ids mirror Modules.Skills order (m5.go parity, utils.getSkill
+// parity: every enum key resolves, including Chiseling/Smelting which ride
+// the crafting UI but still resolve by name).
 const (
 	SkillLumberjacking = 0
 	SkillAccuracy      = 1
@@ -145,7 +150,16 @@ const (
 	SkillStrength      = 6
 	SkillDefense       = 7
 	SkillFishing       = 8
+	SkillCooking       = 9
+	SkillSmithing      = 10
+	SkillCrafting      = 11
+	SkillChiseling     = 12
+	SkillFletching     = 13
+	SkillSmelting      = 14
 	SkillForaging      = 15
+	SkillEating        = 16
+	SkillLoitering     = 17
+	SkillAlchemy       = 18
 )
 
 // StageData mirrors RawStage (impl/quest.ts) for the fields the engine acts
@@ -183,17 +197,24 @@ type Item struct {
 	Count int    `json:"count"`
 }
 
-// Pointer is one quest stage pointer.
+// Pointer is one quest stage pointer (PointerData parity: type/x/y plus
+// the Entity/Relative legs — instance follows an entity, button anchors a
+// UI-relative pointer; Location uses x/y).
 type Pointer struct {
-	Type int `json:"type"`
-	X    int `json:"x"`
-	Y    int `json:"y"`
+	Type     int    `json:"type"`
+	X        int    `json:"x,omitempty"`
+	Y        int    `json:"y,omitempty"`
+	Instance string `json:"instance,omitempty"`
+	Button   string `json:"button,omitempty"`
 }
 
-// Popup is one quest stage popup.
+// Popup is one quest stage popup (PopupData parity: colour rides the data,
+// soundEffect stays server-side — the Notification frame carries
+// title/message/colour only).
 type Popup struct {
-	Title string `json:"title"`
-	Text  string `json:"text"`
+	Title  string `json:"title"`
+	Text   string `json:"text"`
+	Colour string `json:"colour,omitempty"`
 }
 
 // SkillReward is one quest stage skill-XP reward.
@@ -294,12 +315,15 @@ func achievementsPath() string {
 	if _, err := os.Stat(rel); err == nil {
 		return rel
 	}
-	if alt := filepath.Join("..", "..", "packages", "server", "data", "achievements.json"); true {
-		if _, err := os.Stat(alt); err == nil {
-			return alt
-		}
+	// VERIFY (achievementsPath always-true): the `; true` condition was a
+	// tautology — simplified to a plain stat check with identical behavior.
+	alt := filepath.Join("..", "..", "packages", "server", "data", "achievements.json")
+	if _, err := os.Stat(alt); err == nil {
+		return alt
 	}
-	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/achievements.json"
+	// Fall back to the canonical relative path (matches DataDir pattern).
+	// If the file doesn't exist, Load() will log and disable quests.
+	return filepath.Join("..", "packages", "server", "data", "achievements.json")
 }
 
 // Load reads the quest/achievement registries once (m11Load parity).
@@ -360,9 +384,9 @@ func Load() {
 				}
 			}
 			sort.Ints(quest.StageOrder)
-			if key == "tutorial" {
-				quest.NoPrompts = true // Tutorial.noPrompts override
-			}
+			// VERIFY (duplicate tutorial block): the NoPrompts override above
+			// already covers Tutorial.noPrompts — the second identical block
+			// was dead duplication, removed.
 			Quests[key] = quest
 		}
 		// Quest bases: authoring drafts, registry parity only.
@@ -441,10 +465,14 @@ func containsStr(list []string, v string) bool {
 // Per-player state.
 // ---------------------------------------------------------------------------
 
-// QuestState is one player's stage cursor for one quest.
+// QuestState is one player's stage cursor for one quest. Completed holds
+// the substage NPC keys already turned in for the current stage
+// (quest.ts completedSubStages parity: royalpet-style multi-NPC stages
+// complete only when every substage NPC is done; cleared on stage change).
 type QuestState struct {
-	Stage    int
-	SubStage int
+	Stage     int
+	SubStage  int
+	Completed []string
 }
 
 // PlayerState is one player's quest/achievement runtime: stage cursors,
@@ -467,9 +495,13 @@ var (
 	states = map[string]*PlayerState{}
 )
 
-// StateFor returns the per-player state (lazily created).
+// StateFor returns the per-player state (lazily created). The registry map
+// is guarded by mu — the unlocked read/write was a data race under
+// concurrent conn goroutines.
 func StateFor(username string) *PlayerState {
 	Load()
+	mu.Lock()
+	defer mu.Unlock()
 	st, found := states[username]
 	if !found {
 		st = &PlayerState{
@@ -500,6 +532,32 @@ func (st *PlayerState) Quest(key string) *QuestState {
 	return q
 }
 
+// HasCompleted reports whether npcKey is already turned in for the current
+// stage (completedSubStages.includes parity).
+func (q *QuestState) HasCompleted(npcKey string) bool {
+	for _, k := range q.Completed {
+		if k == npcKey {
+			return true
+		}
+	}
+	return false
+}
+
+// AddCompleted records a substage NPC turn-in (deduped like the TS push
+// guard `!completedSubStages.includes(npc)`).
+func (q *QuestState) AddCompleted(npcKey string) {
+	if npcKey == "" || q.HasCompleted(npcKey) {
+		return
+	}
+	q.Completed = append(q.Completed, npcKey)
+}
+
+// ClearCompleted drops the substage set on stage change (quest.ts setStage
+// `completedSubStages = []` on isProgress parity).
+func (q *QuestState) ClearCompleted() {
+	q.Completed = nil
+}
+
 // IsFinished reports stage >= stageCount (Node's `>=` allows overflow
 // stages to end the quest).
 func (st *PlayerState) IsFinished(key string) bool {
@@ -520,17 +578,20 @@ func (st *PlayerState) IsStarted(key string) bool {
 // ---------------------------------------------------------------------------
 
 // QuestData mirrors QuestData (impl/quest.ts): batch adds the definition
-// fields the client Task needs.
+// fields the client Task needs. CompletedSubStages rides every serialize
+// (quest.ts serialize always includes it) so reloads and the client agree on
+// multi-NPC progress.
 type QuestData struct {
-	Key               string         `json:"key"`
-	Stage             int            `json:"stage"`
-	SubStage          int            `json:"subStage"`
-	Name              *string        `json:"name,omitempty"`
-	Description       *string        `json:"description,omitempty"`
-	Rewards           []string       `json:"rewards,omitempty"`
-	SkillRequirements map[string]int `json:"skillRequirements,omitempty"`
-	QuestRequirements []string       `json:"questRequirements,omitempty"`
-	StageCount        *int           `json:"stageCount,omitempty"`
+	Key                string         `json:"key"`
+	Stage              int            `json:"stage"`
+	SubStage           int            `json:"subStage"`
+	CompletedSubStages []string       `json:"completedSubStages,omitempty"`
+	Name               *string        `json:"name,omitempty"`
+	Description        *string        `json:"description,omitempty"`
+	Rewards            []string       `json:"rewards,omitempty"`
+	SkillRequirements  map[string]int `json:"skillRequirements,omitempty"`
+	QuestRequirements  []string       `json:"questRequirements,omitempty"`
+	StageCount         *int           `json:"stageCount,omitempty"`
 }
 
 // AchievementData mirrors AchievementData.
@@ -554,16 +615,27 @@ func SendQuestProgress(c Conn, d Deps, key string, q *QuestState) {
 	}
 	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketQuest, QuestProgress, QuestData{
 		Key: key, Stage: q.Stage, SubStage: q.SubStage,
+		CompletedSubStages: append([]string(nil), q.Completed...),
 	}))
 }
 
 // SendAchievementProgress emits Achievement Progress1 (name/description
-// ride along for client Task creation — setAchievement contract).
+// ride along for client Task creation — setAchievement contract). Secret
+// achievements redact name/description until finished (LoginBatches parity:
+// the batch omits them behind the secret flag, so progress must too —
+// / otherwise the name leaks on discovery).
 func SendAchievementProgress(c Conn, d Deps, key string, stage int) {
 	if c == nil {
 		return
 	}
 	def := Achs[key]
+	if def != nil && def.Raw.Secret && stage < def.StageCount {
+		secret := true
+		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketAchievement, AchievementProgress, AchievementData{
+			Key: key, Stage: stage, Secret: &secret,
+		}))
+		return
+	}
 	name, desc := key, ""
 	if def != nil {
 		name, desc = def.Raw.Name, def.Raw.Description
@@ -573,18 +645,48 @@ func SendAchievementProgress(c Conn, d Deps, key string, stage int) {
 	}))
 }
 
-// SendPointer mirrors player.pointer: Remove first, then Location.
+// SendPointer mirrors player.pointer: Remove first, then the typed pointer.
+// TS forwards any valid Pointer opcode (Location/Entity/Relative) with its
+// payload — dropping Entity/Relative stranded entity-following pointers, so
+// forward all three (invalid types still stop after Remove, player.pointer
+// `info.type in Opcodes.Pointer` parity).
 func SendPointer(c Conn, d Deps, p *Pointer) {
 	if c == nil {
 		return
 	}
 	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketPointer, PointerRemove, map[string]any{}))
-	if p == nil || p.Type != PointerLocation {
+	if p == nil {
 		return
 	}
-	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketPointer, PointerLocation, map[string]any{
-		"type": p.Type, "x": p.X, "y": p.Y,
-	}))
+	switch p.Type {
+	case PointerLocation:
+		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketPointer, PointerLocation, map[string]any{
+			"type": p.Type, "x": p.X, "y": p.Y,
+		}))
+	case PointerEntity:
+		payload := map[string]any{"type": p.Type}
+		if p.Instance != "" {
+			payload["instance"] = p.Instance
+		}
+		if p.Button != "" {
+			payload["button"] = p.Button
+		}
+		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketPointer, PointerEntity, payload))
+	case PointerRelative:
+		payload := map[string]any{"type": p.Type}
+		if p.Instance != "" {
+			payload["instance"] = p.Instance
+		}
+		if p.Button != "" {
+			payload["button"] = p.Button
+		}
+		// Relative pointers may also carry an x/y offset.
+		payload["x"] = p.X
+		payload["y"] = p.Y
+		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketPointer, PointerRelative, payload))
+	default:
+		// Unknown type: Remove only (player.pointer parity).
+	}
 }
 
 // SendPopup mirrors player.popup: Notification Popup3 {title,message,colour}.
@@ -616,7 +718,8 @@ func LoginBatches(username string) [][]any {
 		q := st.Quest(key)
 		qs = append(qs, QuestData{
 			Key: key, Stage: q.Stage, SubStage: q.SubStage,
-			Name: strPtr(def.Raw.Name), Description: strPtr(def.Raw.Description),
+			CompletedSubStages: append([]string(nil), q.Completed...),
+			Name:               strPtr(def.Raw.Name), Description: strPtr(def.Raw.Description),
 			Rewards: def.Raw.Rewards, SkillRequirements: def.Raw.SkillRequirements,
 			QuestRequirements: def.Raw.QuestRequirements, StageCount: intPtr(def.StageCount),
 		})
@@ -647,6 +750,9 @@ func LoginBatches(username string) [][]any {
 // (Tutorial.loaded → setStage(0,0,false) → pointerCallback; for other quests
 // Node only re-points on stage changes, we mirror that by pointing only when
 // the tutorial is unfinished).
+// VERIFY (LoginPointer note): confirmed accurate — TS quests.ts only the
+// Tutorial.loaded() seeds a pointer on login; other quests re-point solely
+// via setStage progress callbacks. No change.
 func LoginPointer(c Conn, d Deps) {
 	Load()
 	if !ok || c == nil {

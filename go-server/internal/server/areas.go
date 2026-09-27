@@ -1,16 +1,16 @@
 // ---------------------------------------------------------------------------
-// M10 — the area system: thin root adapter.
+// Areas — the area system: thin root adapter.
 //
 // The system lives in internal/entity (areas.go); this file keeps
-// UNCHANGED public signatures so main.go, world_wire.go, m9.go and m13.go
-// call sites compile untouched. No m10 state stays here: the old
-// m10Area/m10Chest structs are entity.Area/entity.Chest aliases (no code
-// outside this file touched their fields), the registries + per-player
-// detection state live in entity, and packet shapes are frozen in the
-// shared gameWorld adapter (m9.go).
+// UNCHANGED public signatures so main.go, world_wire.go, mob_engine.go and
+// commands.go call sites compile untouched. No area state stays here: the
+// area/chest structs are entity.Area/entity.Chest aliases (no code outside
+// this file touched their fields), the registries + per-player detection
+// state live in entity, and packet shapes are frozen in the shared
+// gameWorld adapter (mob_engine.go).
 //
-// The m9<->m10 call cycle (m9SpawnMob->m10ChestAreaAt/m10AddChestMob;
-// m9KillMob->m10KillHooks) is gone: both engines live in ONE package
+// The mob<->area call cycle (spawnMob->chestAreaAt/addChestMob;
+// killMob->killHooks) is gone: both engines live in ONE package
 // (internal/entity) behind the GameWorld seam.
 //
 // Only the TESTMAP dispatchers keep logic here (frame parsing + test
@@ -28,16 +28,16 @@ import (
 	"rpg-world-server/internal/entity"
 )
 
-// m10Area/m10Chest are entity-owned now (aliases — opaque uses in main.go
+// area/chest are entity-owned now (aliases — opaque uses in main.go
 // keep compiling; no external code touches their fields).
 type (
-	m10Area  = entity.Area
-	m10Chest = entity.Chest
+	area  = entity.Area
+	chest = entity.Chest
 )
 
-// m10LoadAreas parses world.json `areas` groups at boot (Node world.ts
+// loadAreas parses world.json `areas` groups at boot (Node world.ts
 // constructor builds one Areas subclass per group from map.areas).
-func m10LoadAreas() {
+func loadAreas() {
 	loadWorld()
 	var raw []byte
 	if world != nil {
@@ -57,23 +57,23 @@ func m10LoadAreas() {
 	populateMarkers()
 }
 
-// m10ChestAreaAt ports Mob.addToChestArea (mob.ts: chestAreas.inArea).
-func m10ChestAreaAt(x, y int) *m10Area {
+// chestAreaAt ports Mob.addToChestArea (mob.ts: chestAreas.inArea).
+func chestAreaAt(x, y int) *area {
 	return entity.ChestAreaAt(x, y)
 }
 
-// m10AddChestMob ports Area.addEntity (mob.ts addToChestArea). Records the
+// addChestMob ports Area.addEntity (mob.ts addToChestArea). Records the
 // mob in the area and (first mob only) adopts its respawn delay as the
 // chest spawn guard; a live unlooted chest is removed (chest.ts onSpawn ->
 // removeChest).
-func m10AddChestMob(area *m10Area, instance string, respawnDelay time.Duration) {
+func addChestMob(area *area, instance string, respawnDelay time.Duration) {
 	entity.AddChestMob(area, instance, respawnDelay, gameWorld)
 }
 
-// m10KillHooks fires the M10 chest-area death path for a killed mob
+// killHooks fires the area chest-area death path for a killed mob
 // (handler.ts: mob.area?.removeEntity(mob, attacker) -> onEmpty chest spawn
 // + attacker achievement). killer is nil for killerless kills (no award).
-func m10KillHooks(m *m9Mob, killer *playerConn) {
+func killHooks(m *mob, killer *playerConn) {
 	killerInstance := ""
 	if killer != nil {
 		killerInstance = killer.Instance
@@ -81,58 +81,61 @@ func m10KillHooks(m *m9Mob, killer *playerConn) {
 	entity.KillHookForMob(m.x, m.y, m.instance, killerInstance, gameWorld)
 }
 
-// m10ChestFor finds a live chest entity by instance.
-func m10ChestFor(instance string) *m10Chest {
+// chestFor finds a live chest entity by instance.
+func chestFor(instance string) *chest {
 	return entity.ChestFor(instance)
 }
 
-// m10ChestItemsAt reports the chest occupying a tile (movement-block check).
-func m10ChestItemsAt(x, y int) bool {
+// chestItemsAt reports the chest occupying a tile (movement-block check).
+func chestItemsAt(x, y int) bool {
 	return entity.ChestAt(x, y)
 }
 
-// m10OpenChest ports entities.ts spawnChest onOpen in TS order: despawn
+// openChest ports entities.ts spawnChest onOpen in TS order: despawn
 // the chest, spawn the mimic mob when flagged and opened by a player
 // (non-respawnable, linked so its death re-spawns the chest), roll one
 // entry and spawn it at the chest tile as a persistent M5 loot entity,
 // then finish the chest's own achievement for the opener when set (static
 // chests). Area achievements still fire at CLEAR time (RemoveChestMob,
 // chest.ts onEmpty parity), never on open.
-func m10OpenChest(c *playerConn, chest *m10Chest) {
+func openChest(c *playerConn, chest *chest) {
+	if c == nil || c.Conn == nil || chest == nil {
+		return
+	}
 	entity.OpenChest(chest, c.Instance, c.Username, gameWorld)
 }
 
-// m10OnPositionUpdate is the M10 hook on the movement path (Node
+// areaPositionUpdate is the Area hook on the movement path (Node
 // handleMovement -> detectAreas). Change-detection is per player per group.
-func m10OnPositionUpdate(c *playerConn) {
+func areaPositionUpdate(c *playerConn) {
 	entity.OnPositionUpdate(c.Instance, c.Username, c.Sess.PlayerX, c.Sess.PlayerY, gameWorld)
 }
 
-// m10UpdatePVP ports player.updatePVP: notify + PVP packet on state flip.
-func m10UpdatePVP(c *playerConn, inPVP bool) {
+// updatePVP ports player.updatePVP: notify + PVP packet on state flip.
+func updatePVP(c *playerConn, inPVP bool) {
 	entity.UpdatePVP(c.Instance, c.Username, inPVP, gameWorld)
 }
 
-// m10SetFreezing applies/removes the Freezing status effect
+// setFreezing applies/removes the Freezing status effect
 // (Area.addPlayer/removePlayer -> player.status Effects.Freezing).
-func m10SetFreezing(c *playerConn, on bool) {
+func setFreezing(c *playerConn, on bool) {
 	entity.SetFreezing(c.Instance, on, gameWorld)
 }
 
-// m10PVPState reports the player's current pvp flag (Spawn PlayerData.pvp).
-func m10PVPState(instance string) bool {
+// pvpState reports the player's current pvp flag (Spawn PlayerData.pvp).
+func pvpState(instance string) bool {
 	return entity.PVPState(instance)
 }
 
-// m10ForgetPlayer drops per-player area state on disconnect.
-func m10ForgetPlayer(instance string) {
+// forgetAreaPlayer drops per-player area state on disconnect.
+func forgetAreaPlayer(instance string) {
 	entity.ForgetPlayer(instance, gameWorld)
 }
 
-// m10InjectTestAreas ensures the TESTMAP synthetic area bands (TESTMAP
+// injectTestAreas ensures the TESTMAP synthetic area bands (TESTMAP
 // mode only; the per-group "don't shadow the real world" rule lives in
 // entity.InjectTestAreas).
-func m10InjectTestAreas() {
+func injectTestAreas() {
 	if !testMode || cleanMode || combatMode {
 		return
 	}
@@ -140,12 +143,17 @@ func m10InjectTestAreas() {
 }
 
 // ---------------------------------------------------------------------------
-// M10TEST debug frame (TESTMAP-only): chest-mob adoption + area echo for the
+// AREA TEST debug frame (TESTMAP-only): chest-mob adoption + area echo for the
 // e2e. Shape: C->S [46, {"m10test":"..."}] (rides the Minigame dispatcher).
 // ---------------------------------------------------------------------------
 
-func m10HandleTest(c *playerConn, frame clientFrame) {
+func handleAreaTest(c *playerConn, frame clientFrame) {
 	if !testMode || cleanMode || combatMode || len(frame) < 2 {
+		return
+	}
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client warp/spawn hole).
+	if !isAdmin(c) {
 		return
 	}
 	var data struct {
@@ -159,7 +167,7 @@ func m10HandleTest(c *playerConn, frame clientFrame) {
 	if err := json.Unmarshal(frame[1], &data); err != nil {
 		return
 	}
-	// Default key preserved for the M9-era rat spawn; the M10 chest harness
+	// Default key preserved for the M9-era rat spawn; the area chest harness
 	// picks a passive low-HP mob (crab) so the kill lands inside the area
 	// before the engine's roam pass can move it out.
 	mobKey := data.Key
@@ -171,31 +179,33 @@ func m10HandleTest(c *playerConn, frame clientFrame) {
 		// Spawn a mob inside the chest area and adopt it (Mob.addToChestArea
 		// parity — the harness spawns at coordinates inside the area). The
 		// Respawn override rides the spawn call (no post-spawn mutation).
-		area := entity.FirstChestArea()
+		// Area membership is looked up at the spawn tile (not the first
+		// area): coords outside every chest area adopt nothing.
+		area := entity.ChestAreaAt(data.X, data.Y)
 		if area == nil {
 			return
 		}
-		over := m9Overrides{}
+		over := mobOverrides{}
 		if data.Delay > 0 {
 			over.Respawn = time.Duration(data.Delay) * time.Millisecond
 		}
-		if !m9SpawnMob(data.Instance, mobKey, data.X, data.Y, over) {
+		if !spawnMob(data.Instance, mobKey, data.X, data.Y, over) {
 			return
 		}
-		if m := m9MobFor(data.Instance); m != nil {
-			m10AddChestMob(area, data.Instance, m.respawnDelay())
-			m6Notify(c, fmt.Sprintf("m10:chestmob=%s", data.Instance))
+		if m := mobFor(data.Instance); m != nil {
+			addChestMob(area, data.Instance, m.respawnDelay())
+			notifyPlayer(c, fmt.Sprintf("m10:chestmob=%s", data.Instance))
 		}
 	case "mobhp":
 		// Echo mob state (mirrors m9's mobhp for the kill leg).
-		m := m9MobFor(data.Instance)
+		m := mobFor(data.Instance)
 		if m == nil || c == nil {
 			return
 		}
 		m.mu.Lock()
 		echo := fmt.Sprintf("m10:mob=%s hp=%d/%d", data.Instance, m.hp, m.maxHP)
 		m.mu.Unlock()
-		m6Notify(c, echo)
+		notifyPlayer(c, echo)
 	case "chest":
 		// Echo live chest state for the chest leg (introspection).
 		var echo string
@@ -207,6 +217,6 @@ func m10HandleTest(c *playerConn, frame clientFrame) {
 		if echo == "" {
 			echo = "m10:chest=none"
 		}
-		m6Notify(c, echo)
+		notifyPlayer(c, echo)
 	}
 }

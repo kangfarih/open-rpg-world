@@ -54,22 +54,20 @@ func DynamicAt(x, y int) *Area {
 
 // MappedTile ports area.ts getMappedTile: the tile relative to the area
 // re-based onto the mapped counterpart. ok=false when there is no mapping.
+// The mapped link + origins are snapshotted under areasMu so a concurrent
+// LoadAreas link cannot race the read.
 func MappedTile(area *Area, x, y int) (mx, my int, ok bool) {
 	if area == nil {
 		return 0, 0, false
 	}
-	mapped := area.MappedArea()
+	areasMu.Lock()
+	mapped, ax, ay := area.mappedArea, area.X, area.Y
+	areasMu.Unlock()
 	if mapped == nil {
 		return 0, 0, false
 	}
-	relX := area.X - x
-	if relX < 0 {
-		relX = -relX
-	}
-	relY := area.Y - y
-	if relY < 0 {
-		relY = -relY
-	}
+	relX := x - ax
+	relY := y - ay
 	return mapped.X + relX, mapped.Y + relY, true
 }
 
@@ -90,22 +88,19 @@ func DynamicRemap(x, y int, p Progression) (mx, my int, ok bool) {
 // ok=false when there is no animation mapping (the common case — no
 // world.json dynamic area currently sets one; the server tile overlay
 // omits the animation field then, client loadRegionTileData parity).
+// The mapped link + origins are snapshotted under areasMu like MappedTile.
 func MappedAnimTile(area *Area, x, y int) (ax, ay int, ok bool) {
 	if area == nil {
 		return 0, 0, false
 	}
-	mapped := area.MappedAnimation()
+	areasMu.Lock()
+	mapped, ox, oy := area.mappedAnimation, area.X, area.Y
+	areasMu.Unlock()
 	if mapped == nil {
 		return 0, 0, false
 	}
-	relX := area.X - x
-	if relX < 0 {
-		relX = -relX
-	}
-	relY := area.Y - y
-	if relY < 0 {
-		relY = -relY
-	}
+	relX := x - ox
+	relY := y - oy
 	return mapped.X + relX, mapped.Y + relY, true
 }
 

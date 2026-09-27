@@ -25,7 +25,7 @@
 // hunger/expiry predicates come from internal/pets (imported, not duplicated).
 //
 // Divergences from TS (inherited from the root wire, documented):
-//   - Teleport threshold is pets.TeleportDistance (> 12, TS uses > 10).
+//   - Teleport threshold is pets.TeleportDistance (> 10, TS handler.ts parity).
 //   - Follow stepping is a server-side one-tile FollowStep (TS pets move via
 //     client pathing on the Follow packet).
 //   - Teleport reuses the SAME pet instance (TS mints a fresh instance).
@@ -228,7 +228,9 @@ type World interface {
 // tick loop; empty registry = no World calls). Beyond
 // pets.ShouldTeleport the pet teleports to the owner; otherwise one
 // pets.FollowStep + move. Pets never block movement: no blocked() consult,
-// no resource registration (unchanged from the root wire).
+// no resource registration (unchanged from the root wire). Pets removed
+// concurrently are skipped (ghost re-validate under lock before each
+// mutation).
 func (r *Registry) Tick(w World) {
 	if r == nil || w == nil {
 		return
@@ -245,11 +247,21 @@ func (r *Registry) Tick(w World) {
 			continue // owner gone (disconnect cleanup removes the pet)
 		}
 		r.mu.Lock()
+		live, stillThere := r.byOwner[rec.Owner]
+		if !stillThere || live != rec {
+			r.mu.Unlock()
+			continue // removed concurrently: ghost, skip
+		}
 		px, py := rec.X, rec.Y
 		r.mu.Unlock()
 		switch {
 		case pets.ShouldTeleport(ox, oy, px, py):
 			r.mu.Lock()
+			live, stillThere := r.byOwner[rec.Owner]
+			if !stillThere || live != rec {
+				r.mu.Unlock()
+				continue
+			}
 			rec.X, rec.Y = ox, oy
 			updated := *rec
 			r.mu.Unlock()
@@ -260,6 +272,11 @@ func (r *Registry) Tick(w World) {
 				continue
 			}
 			r.mu.Lock()
+			live, stillThere := r.byOwner[rec.Owner]
+			if !stillThere || live != rec {
+				r.mu.Unlock()
+				continue
+			}
 			rec.X, rec.Y = nx, ny
 			updated := *rec
 			r.mu.Unlock()
@@ -271,7 +288,9 @@ func (r *Registry) Tick(w World) {
 // Mirror ports the attack-mirror (new-in-Go; TS pets never attack): after an
 // owner swing at a killable target the pet issues a same-target swing
 // through the combat pipeline, credited to the owner so retaliate/loot/quest
-// flow is unchanged. Unknown targets are a silent no-op.
+// flow is unchanged. Unknown targets are a silent no-op. The pet is
+// re-validated after the target gate so a concurrently removed pet never
+// swings (ghost).
 func (r *Registry) Mirror(w World, owner, target string) {
 	if r == nil || w == nil || owner == "" || target == "" {
 		return
@@ -286,11 +305,24 @@ func (r *Registry) Mirror(w World, owner, target string) {
 	if petInstance == "" {
 		return
 	}
-	if w.IsMob(target) {
+	isMob := w.IsMob(target)
+	isDummy := false
+	if !isMob {
+		isDummy = target == w.DummyTarget()
+		if !isDummy {
+			return
+		}
+	}
+	r.mu.Lock()
+	live := r.byOwner[owner]
+	if live == nil || live.Instance != petInstance {
+		r.mu.Unlock()
+		return // removed concurrently: ghost, skip
+	}
+	r.mu.Unlock()
+	if isMob {
 		w.HitMob(petInstance, owner, target, MirrorDamage)
 		return
 	}
-	if target == w.DummyTarget() {
-		w.HitDummy(petInstance, owner, MirrorDamage)
-	}
+	w.HitDummy(petInstance, owner, MirrorDamage)
 }

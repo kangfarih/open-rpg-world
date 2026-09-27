@@ -24,6 +24,8 @@ package app
 
 import (
 	"bufio"
+	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -31,9 +33,12 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"rpg-world-server/internal/api"
 	"rpg-world-server/internal/console"
+	"rpg-world-server/internal/data"
+	"rpg-world-server/internal/leaderboard"
 	"rpg-world-server/internal/social"
 	"rpg-world-server/internal/version"
 )
@@ -95,6 +100,11 @@ type OpsDeps struct {
 	UnbanIP func(ip string)
 	// SaveWorld flushes dirty player rows (console Save parity).
 	SaveWorld func()
+	// GetDB returns the persist *sql.DB handle for leaderboard queries.
+	// nil means no database is available (leaderboards return empty).
+	GetDB func() *sql.DB
+	// StartTime returns the server boot time for uptime display.
+	StartTime func() time.Time
 }
 
 var opsDeps OpsDeps
@@ -105,13 +115,36 @@ func ConfigureOps(d OpsDeps) { opsDeps = d }
 
 // StartAPI starts the read-only REST surface when API_PORT is set
 // (default off). A busy port logs and the game boots without the API.
+// Sentry is initialized when SENTRY_DSN is set (TS config.sentryDsn parity).
+// Leaderboards are wired when the persist DB is available (GetDB != nil).
 func StartAPI() {
 	addr, ok := api.AddrFromEnv()
 	if !ok {
 		return
 	}
+	// Sentry init (TS api.ts lines 51-61 parity): opt-in via SENTRY_DSN env.
+	// Empty DSN = disabled (tests, dev environments). InitSentry returns the
+	// DSN on success; we pass it to the Server so the handler wraps with
+	// Sentry middleware.
+	dsn := api.InitSentry(os.Getenv("SENTRY_DSN"))
 	srv := api.NewServer(opsPlayers{}, opsGuilds{}, opsStatus{})
 	srv.Health = opsHealth{lc: Default}
+	srv.SentryDSN = dsn
+
+	// Leaderboards (TS hub GET /leaderboards parity): wire when DB available.
+	if opsDeps.GetDB != nil {
+		if db := opsDeps.GetDB(); db != nil {
+			mobs := loadMobNames()
+			skills := &leaderboard.DBSkillSource{DB: db}
+			stats := &leaderboard.DBStatsSource{DB: db}
+			srv.Leaderboards = opsLeaderboards{cache: leaderboard.New(skills, stats, mobs)}
+			log.Printf("ops: leaderboards enabled (%d mobs)", len(mobs))
+		}
+	}
+
+	// Uptime (admin dashboard).
+	srv.Uptime = opsUptime{}
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		log.Printf("ops: api listen %s failed (%v), continuing without API", addr, err)
@@ -200,6 +233,97 @@ func (h opsHealth) Health() api.Health {
 	s := lc.Health()
 	s.Load = load
 	return api.Health{State: s.State, Load: s.Load, BuildID: s.BuildID, GVer: s.GVer}
+}
+
+// opsLeaderboards adapts the leaderboard.Cache to the api.LeaderboardProvider
+// interface (TS hub GET /leaderboards parity).
+type opsLeaderboards struct{ cache *leaderboard.Cache }
+
+func (o opsLeaderboards) TotalExperience() ([]api.LeaderboardEntry, error) {
+	data, err := o.cache.GetTotalExperience()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.LeaderboardEntry, len(data))
+	for i, d := range data {
+		out[i] = api.LeaderboardEntry{Username: d.Username, TotalXP: d.TotalExperience}
+	}
+	return out, nil
+}
+
+func (o opsLeaderboards) SkillExperience(id int) ([]api.LeaderboardEntry, error) {
+	data, err := o.cache.GetSkillExperience(id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.LeaderboardEntry, len(data))
+	for i, d := range data {
+		out[i] = api.LeaderboardEntry{Username: d.Username, XP: d.Experience}
+	}
+	return out, nil
+}
+
+func (o opsLeaderboards) MobKills(key string) ([]api.LeaderboardEntry, error) {
+	data, err := o.cache.GetMobKills(key)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.LeaderboardEntry, len(data))
+	for i, d := range data {
+		out[i] = api.LeaderboardEntry{Username: d.Username, Kills: d.Kills}
+	}
+	return out, nil
+}
+
+func (o opsLeaderboards) PvPKills() ([]api.LeaderboardEntry, error) {
+	data, err := o.cache.GetPvPData()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]api.LeaderboardEntry, len(data))
+	for i, d := range data {
+		out[i] = api.LeaderboardEntry{Username: d.Username, PvPKills: d.PvPKills}
+	}
+	return out, nil
+}
+
+func (o opsLeaderboards) AvailableMobs() map[string]string {
+	return o.cache.AvailableMobs()
+}
+
+func (o opsLeaderboards) ValidSkill(id int) bool {
+	return id >= 0 && id <= 18 // SkillLumberjacking(0)..SkillAlchemy(18)
+}
+
+// opsUptime adapts the boot time to the api.UptimeProvider interface.
+type opsUptime struct{}
+
+func (opsUptime) StartTime() time.Time {
+	if opsDeps.StartTime != nil {
+		return opsDeps.StartTime()
+	}
+	return time.Now()
+}
+
+// loadMobNames loads the mob key -> display name dictionary from mobs.json
+// (embedded or filesystem via the data package). Returns an empty map on
+// error (leaderboards still work, just without mob name validation).
+func loadMobNames() map[string]string {
+	raw, err := data.ReadFile("mobs.json")
+	if err != nil {
+		log.Printf("ops: leaderboards: load mobs.json: %v", err)
+		return map[string]string{}
+	}
+	var mobs map[string]struct{ Name string `json:"name"` }
+	if err := json.Unmarshal(raw, &mobs); err != nil {
+		log.Printf("ops: leaderboards: parse mobs.json: %v", err)
+		return map[string]string{}
+	}
+	out := make(map[string]string, len(mobs))
+	for k, v := range mobs {
+		out[k] = v.Name
+	}
+	return out
 }
 
 // StartConsole starts the stdin console loop unless CONSOLE=0 or stdin is

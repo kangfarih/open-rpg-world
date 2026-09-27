@@ -219,7 +219,7 @@ func login(name string) *client {
 	c.drain(1200 * time.Millisecond) // Connected
 	c.send(`[1,{"gVer":"0.5.5-beta"}]`)
 	c.drain(1200 * time.Millisecond) // Handshake
-	c.send(fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, name))
+	c.send(fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedRank":2}]`, name))
 	frames := c.drain(2500 * time.Millisecond) // Welcome bulk
 	for _, f := range frames {
 		if frameID(f) == pktWelcome {

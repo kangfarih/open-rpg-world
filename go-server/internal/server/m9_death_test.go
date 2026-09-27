@@ -13,7 +13,7 @@ import (
 )
 
 // openDeathDB installs a real sqlite persist store in a temp dir (the exact
-// m5SaveSync production path, no stub) and restores the globals afterwards.
+// savePlayerSync production path, no stub) and restores the globals afterwards.
 func openDeathDB(t *testing.T) {
 	t.Helper()
 	st, err := persist.Open(filepath.Join(t.TempDir(), "death.db"))
@@ -81,15 +81,15 @@ func frameInstance(f []any) (id int, instance string, ok bool) {
 // HeroDied runs the full player handleDeath path: pet despawned (disconnect
 // removePet parity, same Despawn frame), Death unicast to the victim only
 // (TS sends Death to self), Despawn broadcast to regions, and a synchronous
-// persist flush of the victim's row (disconnect m5SaveSync path, reused).
+// persist flush of the victim's row (disconnect savePlayerSync path, reused).
 func TestHeroDiedRoutesAndPersists(t *testing.T) {
 	openDeathDB(t)
 	petConfigure() // production companion wiring (disconnect parity)
 
 	user, victimInst := "death-hero", "death-victim-inst"
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Skills[SkillDefense] = &m5Skill{Level: 5, XP: 1234}
+	st.Skills[SkillDefense] = &skillDef{Level: 5, XP: 1234}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -167,7 +167,7 @@ func TestHeroDiedRoutesAndPersists(t *testing.T) {
 func TestHeroDiedIdempotent(t *testing.T) {
 	openDeathDB(t)
 	victim, _ := deathConn(t, "idempotent-victim-inst", "idempotent-victim-user")
-	t.Cleanup(func() { m9DeathFired.Delete(victim.Conn.Instance) })
+	t.Cleanup(func() { deathFired.Delete(victim.Conn.Instance) })
 	drainOutbox(victim)
 
 	gameWorld.HeroDied(victim.Conn.Instance, victim.Username, "m9test")
@@ -190,8 +190,8 @@ func TestHeroDiedIdempotent(t *testing.T) {
 	}
 
 	// Disconnect clears the flag: the next life dies loudly again.
-	m9PlayerLeave(victim)
-	t.Cleanup(func() { m9DeathFired.Delete(victim.Conn.Instance) })
+	mobPlayerLeave(victim)
+	t.Cleanup(func() { deathFired.Delete(victim.Conn.Instance) })
 	gameWorld.HeroDied(victim.Conn.Instance, victim.Username, "m9test")
 	frames = drainOutbox(victim)
 	deaths = 0
@@ -211,19 +211,19 @@ func TestHeroDiedIdempotent(t *testing.T) {
 func TestPlayersExcludesCorpses(t *testing.T) {
 	victim, _ := deathConn(t, "corpse-inst", "corpse-user")
 	t.Cleanup(func() {
-		m9PlayerHPs.Delete(victim.Conn.Instance)
+		playerHPs.Delete(victim.Conn.Instance)
 		pstateMu.Lock()
 		delete(pstates, victim.Username)
 		pstateMu.Unlock()
 	})
 
-	m9PlayerHPs.Store(victim.Conn.Instance, 0)
+	playerHPs.Store(victim.Conn.Instance, heroHPEntry{hp: 0, maxHP: 69})
 	for _, v := range gameWorld.Players() {
 		if v.Instance == victim.Conn.Instance {
 			t.Fatal("corpse (HP 0) present in aggro-scan player set")
 		}
 	}
-	m9PlayerHPs.Store(victim.Conn.Instance, 50)
+	playerHPs.Store(victim.Conn.Instance, heroHPEntry{hp: 50, maxHP: 69})
 	found := false
 	for _, v := range gameWorld.Players() {
 		if v.Instance == victim.Conn.Instance {
@@ -236,18 +236,18 @@ func TestPlayersExcludesCorpses(t *testing.T) {
 }
 
 // HeroDied never blocks under the engine tick's locks: the strike path
-// calls it holding m9Mu (m9Tick) and the killer's m.mu, so taking either
+// calls it holding mobMu (mobTick) and the killer's m.mu, so taking either
 // self-deadlocks the tick and freezes the whole mob engine.
 func TestHeroDiedTickLockContext(t *testing.T) {
 	openDeathDB(t)
 	victim, _ := deathConn(t, "tickctx-victim-inst", "tickctx-victim-user")
-	t.Cleanup(func() { m9DeathFired.Delete(victim.Conn.Instance) })
-	m := &m9Mob{instance: "tickctx-mob"}
+	t.Cleanup(func() { deathFired.Delete(victim.Conn.Instance) })
+	m := &mob{instance: "tickctx-mob"}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		m9Mu.Lock()
-		defer m9Mu.Unlock()
+		mobMu.Lock()
+		defer mobMu.Unlock()
 		m.mu.Lock()
 		defer m.mu.Unlock()
 		gameWorld.HeroDied(victim.Conn.Instance, victim.Username, m.instance)
@@ -255,7 +255,7 @@ func TestHeroDiedTickLockContext(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatal("HeroDied blocked holding m9Mu + killer lock (tick self-deadlock)")
+		t.Fatal("HeroDied blocked holding mobMu + killer lock (tick self-deadlock)")
 	}
 }
 

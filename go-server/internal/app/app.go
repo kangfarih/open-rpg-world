@@ -14,6 +14,7 @@ package app
 import (
 	"log"
 	"strconv"
+	"strings"
 	"time"
 
 	"rpg-world-server/internal/world"
@@ -50,12 +51,25 @@ type Config struct {
 }
 
 // ListenAddr resolves the listen address: PORT env or the client-server
-// default 9001 (main.go addr verbatim).
+// default 9001 (main.go addr verbatim). The result is always loopback-bound
+// (127.0.0.1:<port>); invalid ports (non-numeric, out of 1-65535 range,
+// or already containing a colon/host) fall back to DefaultAddr so boot
+// never listens on an unintended interface or fails on a typo.
 func ListenAddr(port string) string {
-	if port != "" {
-		return "127.0.0.1:" + port
+	port = strings.TrimSpace(port)
+	if port == "" {
+		return DefaultAddr
 	}
-	return DefaultAddr
+	// Explicit addrs (already host:port) are rejected here: PORT is a bare
+	// port knob only; use HUB_LISTEN/API_PORT for explicit binds.
+	if strings.Contains(port, ":") {
+		return DefaultAddr
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return DefaultAddr
+	}
+	return "127.0.0.1:" + strconv.Itoa(n)
 }
 
 // ParseDummyHP parses DUMMY_HP (BossDummy HP override; default 5000).

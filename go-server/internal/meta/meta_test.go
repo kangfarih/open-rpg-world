@@ -110,14 +110,14 @@ func TestAccuracySanity(t *testing.T) {
 			t.Fatalf("%s weight = %v, want >= 1", name, w)
 		}
 	}
-	warA := Accuracy(MaxAccuracy, MaxLevel, 6, 20, warW, false)
+	warA := Accuracy(MaxAccuracy, MaxLevel, 6, 20, 1, warW, false)
 	if warA < MinAccuracy || warA > ClampAccuracy {
 		t.Fatalf("war accuracy = %v, want within [%v,%v]", warA, MinAccuracy, ClampAccuracy)
 	}
 	// Crit costs 0.15 accuracy before clamping. War-bot stats clamp at 2.0
 	// (both plain and crit), so probe the delta with unclamped inputs.
-	plain := Accuracy(MaxAccuracy, MaxLevel, 70, 120, warW, false)
-	crit := Accuracy(MaxAccuracy, MaxLevel, 70, 120, warW, true)
+	plain := Accuracy(MaxAccuracy, MaxLevel, 70, 120, 1, warW, false)
+	crit := Accuracy(MaxAccuracy, MaxLevel, 70, 120, 1, warW, true)
 	if plain-crit < 0.149 || plain-crit > 0.151 {
 		t.Fatalf("crit delta = %v, want 0.15 (plain %v crit %v)", plain-crit, plain, crit)
 	}
@@ -136,5 +136,74 @@ func TestRollDamageBounds(t *testing.T) {
 	}
 	if !RollCrit(0.049) || RollCrit(0.051) {
 		t.Fatalf("RollCrit boundary failed")
+	}
+}
+
+func TestAccuracyModifierTriangle(t *testing.T) {
+	// Archer/mage: own-school weight, always >= 1.
+	archerW := AccuracyModifier(true, false, 0, 0, 0, 0, 12, 0, 0, 0, 0, 0)
+	if archerW < 1 {
+		t.Fatalf("archer weight = %v, want >= 1", archerW)
+	}
+	mageW := AccuracyModifier(false, true, 0, 0, 0, 36, 0, 0, 0, 0, 0, 0)
+	if mageW < 1 {
+		t.Fatalf("mage weight = %v, want >= 1", mageW)
+	}
+
+	// Triangle advantage: crush attack vs slash defense → bonus (higher weight
+	// = better accuracy via -(sqrt(w)/22.36)+1 producing a lower value).
+	advW := AccuracyModifier(false, false, 10, 3, 3, 0, 0, 3, 10, 3, 0, 0)
+	// Triangle disadvantage: slash attack vs crush defense → penalty (lower
+	// weight = worse accuracy).
+	disW := AccuracyModifier(false, false, 3, 10, 3, 0, 0, 10, 3, 3, 0, 0)
+	if advW <= disW {
+		t.Fatalf("advantage weight (%v) should exceed disadvantage weight (%v) — higher weight = better accuracy", advW, disW)
+	}
+
+	// Equal primary styles (crush atk vs crush def): no triangle step.
+	// Use high enough attack stats that the no-triangle weight exceeds the
+	// floor (1). With atk (20,3,3) vs def (10,3,3): crush diff = 3.33,
+	// no triangle → weight = 3.33.
+	eqW := AccuracyModifier(false, false, 20, 3, 3, 0, 0, 10, 3, 3, 0, 0)
+	// Verify it's below the advantage case (same atk, matching def gives no bonus).
+	if eqW >= advW {
+		t.Fatalf("equal-primary weight %v should be below advantage %v", eqW, advW)
+	}
+
+	// Stab > crush advantage.
+	stabAdv := AccuracyModifier(false, false, 3, 3, 10, 0, 0, 10, 3, 3, 0, 0)
+	stabDis := AccuracyModifier(false, false, 3, 3, 10, 0, 0, 3, 10, 3, 0, 0)
+	if stabAdv <= stabDis {
+		t.Fatalf("stab>crush advantage weight (%v) should exceed disadvantage (%v)", stabAdv, stabDis)
+	}
+
+	// Slash > stab advantage.
+	slashAdv := AccuracyModifier(false, false, 3, 10, 3, 0, 0, 3, 3, 10, 0, 0)
+	slashDis := AccuracyModifier(false, false, 3, 10, 3, 0, 0, 3, 10, 3, 0, 0)
+	if slashAdv <= slashDis {
+		t.Fatalf("slash>stab advantage weight (%v) should exceed disadvantage (%v)", slashAdv, slashDis)
+	}
+
+	// All defense stats zero: minimum weight is 1 (floor).
+	zeroDef := AccuracyModifier(false, false, 6, 10, 7, 0, 0, 0, 0, 0, 0, 0)
+	if zeroDef < 1 {
+		t.Fatalf("zero-defense weight = %v, want >= 1", zeroDef)
+	}
+}
+
+func TestAccuracyWithDefenseLevel(t *testing.T) {
+	// Higher defense level → higher accuracy value (worse for attacker).
+	// Use inputs that don't clamp so the delta is visible.
+	low := Accuracy(MaxAccuracy, MaxLevel, 70, 120, 1, 5.0, false)
+	high := Accuracy(MaxAccuracy, MaxLevel, 70, 120, 30, 5.0, false)
+	if high <= low {
+		t.Fatalf("defenseLevel 30 (%v) should produce higher accuracy value (worse) than level 1 (%v)", high, low)
+	}
+	// Both must stay within clamp bounds.
+	if low < MinAccuracy || low > ClampAccuracy {
+		t.Fatalf("low-def accuracy %v out of [%v, %v]", low, MinAccuracy, ClampAccuracy)
+	}
+	if high < MinAccuracy || high > ClampAccuracy {
+		t.Fatalf("high-def accuracy %v out of [%v, %v]", high, MinAccuracy, ClampAccuracy)
 	}
 }

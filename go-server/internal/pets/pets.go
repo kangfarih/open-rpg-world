@@ -37,7 +37,7 @@ package pets
 // TeleportDistance is the Manhattan tile distance beyond which the caller
 // should teleport (despawn + respawn at the owner, TS handler.ts parity)
 // instead of stepping the pet. See divergences below: TS uses > 10.
-const TeleportDistance = 12
+const TeleportDistance = 10
 
 // FollowDistance is the Manhattan tile distance beyond which the caller
 // should order the pet to follow the owner (TS handler.ts: distance > 2).
@@ -191,7 +191,5 @@ func IsExpired(nowMs, bornMs, lifespanMs int64) bool {
 //   - IsHungry/IsExpired are entirely new: TS pets have no hunger or
 //     lifespan. Thresholds (HungerAfterMs, caller-supplied lifespanMs) are
 //     invented; expiry/hunger effects (stat loss, despawn) are caller-side.
-//   - EntityType.Pet (7) has no Go constant: internal/protocol defines
-//     PacketPet (58) but no EntityPet; callers should use the literal 7
-//     with a comment until protocol gains the constant (out of scope:
-//     no packet changes allowed here).
+//   - EntityType.Pet (7) is internal/protocol EntityPet (PacketPet is 58);
+//     use the constant, not the literal 7.

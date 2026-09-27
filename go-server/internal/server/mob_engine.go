@@ -1,24 +1,25 @@
 // ---------------------------------------------------------------------------
-// M9 — generic mob AI engine (worlds setup slice 1): thin root adapter.
+// Mob engine — generic mob AI engine (worlds setup slice 1): thin root adapter.
 //
 // The engine lives in internal/entity (mob.go); this file keeps the live
 // state + the world wiring with UNCHANGED public signatures so main.go,
-// m5.go, m11.go, m13.go, pets_wire.go, ops_wire.go and abilities_wire.go
-// compile untouched.
+// player_state.go, quests_wire.go, commands.go, pets_wire.go, ops_wire.go
+// and abilities_wire.go compile untouched.
 //
-// STAYED here (m13.go/m5.go/abilities_wire.go touch these directly):
-//   - m9Mob struct (all fields), m9Mu/m9Mobs registry, m9Prof/m9Spawn
-//     tables, m9PlayerHPs hero HP store.
+// STAYED here (commands.go/player_state.go/abilities_wire.go touch these
+// directly):
+//   - mob struct (all fields), mobMu/mobs registry, mobProf/mobSpawn
+//     tables, playerHPs hero HP store.
 //   - The shared entity.World implementation (gameWorld): broadcast/send,
-//     entities/players maps, setEntityPos, blocked, m5 loot/XP, m11 kill,
-//     combatMu-adjacent lookups — packet shapes frozen here.
-//   - m9Engine/m9AdoptExisting (mode globals), m9TestHandler (TESTMAP
-//     debug frames), m9RatEntity/m.data (EntityData payload shape).
+//     entities/players maps, setEntityPos, blocked, player-state loot/XP,
+//     quest kill, combatMu-adjacent lookups — packet shapes frozen here.
+//   - mobEngine/adoptExistingMobs (mode globals), handleMobTest (TESTMAP
+//     debug frames), ratEntity/m.data (EntityData payload shape).
 //
 // MOVED to entity: profiles/load/merge/defaults, distances, damage roll,
 // roam pick, chase step, aggro/leash/attack tick, retaliate, kill credit,
-// respawn timers, hero HP/death hooks. The old m9<->m10 call cycle
-// (m9SpawnMob->m10ChestAreaAt/m10AddChestMob; m10KillHooks->m9 state) is
+// respawn timers, hero HP/death hooks. The old mob<->area call cycle
+// (spawnMob->chestAreaAt/addChestMob; killHooks->m9 state) is
 // gone: both engines live in ONE package (internal/entity) behind the
 // GameWorld seam.
 // ---------------------------------------------------------------------------
@@ -34,24 +35,27 @@ import (
 	"sync/atomic"
 	"time"
 
+	"rpg-world-server/internal/abilities"
 	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
+	"rpg-world-server/internal/sim"
 	worldcore "rpg-world-server/internal/world"
 )
 
-// m9MobProfile/m9SpawnOverride/m9Overrides are entity-owned now (same
+// mobProfile/spawnMobOverride/mobOverrides are entity-owned now (same
 // JSON/shape, type aliases — all existing references keep compiling).
 type (
-	m9MobProfile    = entity.MobProfile
-	m9SpawnOverride = entity.SpawnOverride
-	m9Overrides     = entity.MobOverrides
+	mobProfile    = entity.MobProfile
+	spawnMobOverride = entity.SpawnOverride
+	mobOverrides     = entity.MobOverrides
 )
 
-// m9Mob is one live AI mob instance (Node Mob + handler state).
-type m9Mob struct {
+// mob is one live AI mob instance (Node Mob + handler state).
+type mob struct {
 	instance string
 	key      string
-	prof     m9MobProfile // mobs.json merged with spawns.json overrides
+	prof     mobProfile // mobs.json merged with spawns.json overrides
 
 	spawnX, spawnY int
 	x, y           int
@@ -76,15 +80,15 @@ type m9Mob struct {
 	// zero-value ready — struct literals need no init.
 	dmg entity.DamageTable
 
-	over m9Overrides
+	over mobOverrides
 }
 
-// Engine registry. Lock order: m9Mu -> m.mu (never reversed).
+// Engine registry. Lock order: mobMu -> m.mu (never reversed).
 var (
-	m9Mu    sync.Mutex
-	m9Mobs  = map[string]*m9Mob{}
-	m9Prof  = map[string]*m9MobProfile{}
-	m9Spawn = map[string]*m9SpawnOverride{}
+	mobMu    sync.Mutex
+	mobs  = map[string]*mob{}
+	mobProf  = map[string]*mobProfile{}
+	mobSpawn = map[string]*spawnMobOverride{}
 )
 
 // ---------------------------------------------------------------------------
@@ -92,53 +96,53 @@ var (
 // exactly where the old code held it).
 // ---------------------------------------------------------------------------
 
-func (m *m9Mob) Lock()   { m.mu.Lock() }
-func (m *m9Mob) Unlock() { m.mu.Unlock() }
+func (m *mob) Lock()   { m.mu.Lock() }
+func (m *mob) Unlock() { m.mu.Unlock() }
 
-func (m *m9Mob) Instance() string               { return m.instance }
-func (m *m9Mob) MobKey() string                 { return m.key }
-func (m *m9Mob) Profile() entity.MobProfile     { return m.prof }
-func (m *m9Mob) Overrides() entity.MobOverrides { return m.over }
+func (m *mob) Instance() string               { return m.instance }
+func (m *mob) MobKey() string                 { return m.key }
+func (m *mob) Profile() entity.MobProfile     { return m.prof }
+func (m *mob) Overrides() entity.MobOverrides { return m.over }
 
-func (m *m9Mob) SpawnPos() (int, int) { return m.spawnX, m.spawnY }
-func (m *m9Mob) Pos() (int, int)      { return m.x, m.y }
-func (m *m9Mob) SetPos(x, y int)      { m.x, m.y = x, y }
+func (m *mob) SpawnPos() (int, int) { return m.spawnX, m.spawnY }
+func (m *mob) Pos() (int, int)      { return m.x, m.y }
+func (m *mob) SetPos(x, y int)      { m.x, m.y = x, y }
 
-func (m *m9Mob) HP() int           { return m.hp }
-func (m *m9Mob) MaxHP() int        { return m.maxHP }
-func (m *m9Mob) SetHP(hp int)      { m.hp = hp }
-func (m *m9Mob) Dead() bool        { return m.dead }
-func (m *m9Mob) SetDead(dead bool) { m.dead = dead }
+func (m *mob) HP() int           { return m.hp }
+func (m *mob) MaxHP() int        { return m.maxHP }
+func (m *mob) SetHP(hp int)      { m.hp = hp }
+func (m *mob) Dead() bool        { return m.dead }
+func (m *mob) SetDead(dead bool) { m.dead = dead }
 
-func (m *m9Mob) Target() string     { return m.target }
-func (m *m9Mob) SetTarget(t string) { m.target = t }
+func (m *mob) Target() string     { return m.target }
+func (m *mob) SetTarget(t string) { m.target = t }
 
 // Plateau reports the bound spawn plateau level (mob.ts:148 parity; the
 // caller must hold m.mu like every other accessor).
-func (m *m9Mob) Plateau() int { return m.plateau }
+func (m *mob) Plateau() int { return m.plateau }
 
-func (m *m9Mob) LastAtk() time.Time      { return m.lastAtk }
-func (m *m9Mob) SetLastAtk(t time.Time)  { m.lastAtk = t }
-func (m *m9Mob) LastMove() time.Time     { return m.lastMove }
-func (m *m9Mob) SetLastMove(t time.Time) { m.lastMove = t }
-func (m *m9Mob) LastRoam() time.Time     { return m.lastRoam }
-func (m *m9Mob) SetLastRoam(t time.Time) { m.lastRoam = t }
-func (m *m9Mob) LastTgt() time.Time      { return m.lastTgt }
-func (m *m9Mob) SetLastTgt(t time.Time)  { m.lastTgt = t }
+func (m *mob) LastAtk() time.Time      { return m.lastAtk }
+func (m *mob) SetLastAtk(t time.Time)  { m.lastAtk = t }
+func (m *mob) LastMove() time.Time     { return m.lastMove }
+func (m *mob) SetLastMove(t time.Time) { m.lastMove = t }
+func (m *mob) LastRoam() time.Time     { return m.lastRoam }
+func (m *mob) SetLastRoam(t time.Time) { m.lastRoam = t }
+func (m *mob) LastTgt() time.Time      { return m.lastTgt }
+func (m *mob) SetLastTgt(t time.Time)  { m.lastTgt = t }
 
-func (m *m9Mob) TouchAttacker(inst string, now time.Time) { m.attackers[inst] = now }
-func (m *m9Mob) DropAttacker(inst string)                 { delete(m.attackers, inst) }
+func (m *mob) TouchAttacker(inst string, now time.Time) { m.attackers[inst] = now }
+func (m *mob) DropAttacker(inst string)                 { delete(m.attackers, inst) }
 
 // AddDamage/DamageRank/ClearDamage delegate to the embedded damage table
 // (pruning DropAttacker deliberately does NOT drop damage — TS
 // removeAttacker touches only the attackers list).
-func (m *m9Mob) AddDamage(inst string, dmg int, username string) {
+func (m *mob) AddDamage(inst string, dmg int, username string) {
 	m.dmg.Add(inst, dmg, username)
 }
-func (m *m9Mob) DamageRank() []entity.DamageEntry { return m.dmg.Rank() }
-func (m *m9Mob) ClearDamage()                     { m.dmg.Clear() }
+func (m *mob) DamageRank() []entity.DamageEntry { return m.dmg.Rank() }
+func (m *mob) ClearDamage()                     { m.dmg.Clear() }
 
-func (m *m9Mob) Attackers() map[string]time.Time {
+func (m *mob) Attackers() map[string]time.Time {
 	out := make(map[string]time.Time, len(m.attackers))
 	for k, v := range m.attackers {
 		out[k] = v
@@ -146,7 +150,7 @@ func (m *m9Mob) Attackers() map[string]time.Time {
 	return out
 }
 
-func (m *m9Mob) ClearAttackers() { m.attackers = map[string]time.Time{} }
+func (m *mob) ClearAttackers() { m.attackers = map[string]time.Time{} }
 
 // ---------------------------------------------------------------------------
 // Shared entity.GameWorld implementation (M9+M10 world seam).
@@ -171,18 +175,20 @@ func (gameWorldAdapter) Players() []entity.PlayerView {
 			continue
 		}
 		lvl, def := 0, 0
-		if st := m5StateFor(c.Username); st != nil {
+		if st := playerStateFor(c.Username); st != nil {
 			lvl = st.Level
 			if sk := st.Skills[SkillDefense]; sk != nil {
 				def = sk.Level
 			}
 		}
-		out = append(out, entity.PlayerView{
+		pv := entity.PlayerView{
 			Instance: c.Instance, Username: c.Username,
 			X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 			Level: lvl, Defense: def,
 			Plateau: plateauGet(c.Instance),
-		})
+		}
+		populatePlayerCombatStats(&pv, c.Username, c.Instance)
+		out = append(out, pv)
 	}
 	return out
 }
@@ -270,36 +276,15 @@ func (gameWorldAdapter) StrikeMob(attacker, target string, dmg int) {
 	}))
 }
 
-func (gameWorldAdapter) GetHeroHP(instance string) int {
-	if v, ok := m9PlayerHPs.Load(instance); ok {
-		return v.(int)
-	}
-	return entity.HeroMaxHP
-}
-
-func (gameWorldAdapter) SetHeroHP(instance string, hp int) {
-	m9PlayerHPs.Store(instance, hp)
-}
-
-func (gameWorldAdapter) ForgetHeroHP(instance string) {
-	m9PlayerHPs.Delete(instance)
-}
-
-func (gameWorldAdapter) HeroPoints(instance string, hp, maxHP int) {
-	worldcore.Broadcast(pkt(PacketPoints, pointsData{
-		Instance: instance, HitPoints: intp(hp), MaxHitPoints: intp(maxHP),
-	}))
-}
-
-// m9DeathFired marks instances whose HeroDied funnel already ran, so the
+// deathFired marks instances whose HeroDied funnel already ran, so the
 // funnel is exactly-once per life (TS character.hit dead-guard parity:
 // hits on a corpse are silent — no Points-0 rebroadcasts, no duplicate
 // Death/Despawn/save). Lock-free sync.Map: HeroDied runs on the engine
-// tick (holding m9Mu + the killer's m.mu), the StatusTick loop and admin
+// tick (holding mobMu + the killer's m.mu), the StatusTick loop and admin
 // intake, so it can take no subsystem mutexes of its own. Cleared on
-// respawn (m9HandleRespawn) and disconnect (m9PlayerLeave) so the next
+// respawn (handleMobRespawn) and disconnect (mobPlayerLeave) so the next
 // life dies loudly again.
-var m9DeathFired sync.Map // instance -> true
+var deathFired sync.Map // instance -> true
 
 func (gameWorldAdapter) HeroDied(playerInstance, username, mobInstance string) {
 	// Player handleDeath parity (player/handler.ts handleDeath): status
@@ -314,12 +299,12 @@ func (gameWorldAdapter) HeroDied(playerInstance, username, mobInstance string) {
 	// gathering is per-swing with no continuous action to stop) and stay
 	// omitted.
 	//
-	// LOCK DISCIPLINE: the strike path calls this holding m9Mu (m9Tick)
+	// LOCK DISCIPLINE: the strike path calls this holding mobMu (mobTick)
 	// and the killer's m.mu — take neither here (self-deadlock). Every
 	// seam below is lock-free or leaf-ordered (tracker/registry/pstateMu
-	// follow the pre-existing m9Mu-outer order; m5 paths never take m9Mu).
+	// follow the pre-existing mobMu-outer order; m5 paths never take mobMu).
 	_ = mobInstance
-	if _, dup := m9DeathFired.LoadOrStore(playerInstance, true); dup {
+	if _, dup := deathFired.LoadOrStore(playerInstance, true); dup {
 		return
 	}
 	abClearStatus(playerInstance) // status.clear() + setPoison() cure; unlocks kept
@@ -328,7 +313,7 @@ func (gameWorldAdapter) HeroDied(playerInstance, username, mobInstance string) {
 	if c != nil {
 		petForgetPlayer(c) // disconnect removePet parity; no-op without a pet
 	}
-	m5SaveSync(username) // disconnect persist path reused, not duplicated
+	savePlayerSync(username) // disconnect persist path reused, not duplicated
 	if c != nil {
 		// Death goes to the victim only (TS sends Death to self);
 		// observers learn of the death via the Despawn above.
@@ -359,15 +344,15 @@ func (gameWorldAdapter) ApplyPoison(instance string) {
 }
 
 func (gameWorldAdapter) SpawnLoot(mobKey string, x, y int, owner string) {
-	m5SpawnLoot(mobKey, x, y, owner)
+	spawnLoot(mobKey, x, y, owner)
 }
 
 func (gameWorldAdapter) NearWalkable(x, y int) (int, int) {
-	return m5NearWalkable(x, y)
+	return nearWalkable(x, y)
 }
 
 func (gameWorldAdapter) RegisterLoot(inst, key string, count, x, y int, owner string) {
-	m5RegisterLoot(inst, key, count, x, y, owner)
+	registerLoot(inst, key, count, x, y, owner)
 }
 
 func (gameWorldAdapter) SpawnLootItem(i entity.LootItem) {
@@ -379,7 +364,7 @@ func (gameWorldAdapter) SpawnLootItem(i entity.LootItem) {
 
 func (gameWorldAdapter) QuestKill(killerInstance, mobKey string) {
 	killer, _ := worldcore.Find[*playerConn](killerInstance)
-	m11Kill(killer, mobKey) // nil-safe (m11Kill guards nil)
+	questKill(killer, mobKey) // nil-safe (questKill guards nil)
 	// Statistics kill counter rides the same death signal (handler.ts:765
 	// addMobKill parity — counter only, no achievement).
 	statsRecordKill(killer, mobKey) // nil-safe
@@ -387,7 +372,7 @@ func (gameWorldAdapter) QuestKill(killerInstance, mobKey string) {
 
 func (gameWorldAdapter) Notify(instance, msg string) {
 	if c, _ := worldcore.Find[*playerConn](instance); c != nil {
-		m6Notify(c, msg)
+		notifyPlayer(c, msg)
 	}
 }
 
@@ -451,29 +436,44 @@ func (gameWorldAdapter) SpawnChestFrame(c entity.ChestSpawn) {
 
 func (gameWorldAdapter) FinishAchievement(instance, key string) {
 	c, _ := worldcore.Find[*playerConn](instance)
-	m11FinishAchievement(c, key) // nil-safe (unknown instance/achievement ignored)
+	finishAchievement(c, key) // nil-safe (unknown instance/achievement ignored)
 }
 
-// playerViewFor builds one PlayerView for a live conn (m9OnPlayerMoved).
+// playerViewFor builds one PlayerView for a live conn (mobOnPlayerMoved).
 func playerViewFor(c *playerConn) entity.PlayerView {
 	lvl, def := 0, 0
-	if st := m5StateFor(c.Username); st != nil {
+	if st := playerStateFor(c.Username); st != nil {
 		lvl = st.Level
 		if sk := st.Skills[SkillDefense]; sk != nil {
 			def = sk.Level
 		}
 	}
-	return entity.PlayerView{
+	pv := entity.PlayerView{
 		Instance: c.Instance, Username: c.Username,
 		X: c.Sess.PlayerX, Y: c.Sess.PlayerY,
 		Level: lvl, Defense: def,
 		Plateau: plateauGet(c.Instance),
 	}
+	populatePlayerCombatStats(&pv, c.Username, c.Instance)
+	return pv
+}
+
+// populatePlayerCombatStats fills the equipment defense stats and damage
+// reduction fields on a PlayerView (server-layer data that the entity
+// layer needs for triangle advantage and damage reduction).
+func populatePlayerCombatStats(pv *entity.PlayerView, username, instance string) {
+	ds := heroTotalDefenseStats(username)
+	pv.DefCrush = ds.Crush
+	pv.DefSlash = ds.Slash
+	pv.DefStab = ds.Stab
+	pv.DefMagic = ds.Magic
+	pv.DefArchery = ds.Archery
+	pv.DamageReduction = heroDamageReduction(username, instance)
 }
 
 // mobAlive reports whether m is still the registered mob (respawn guard).
-func mobAlive(m *m9Mob) bool {
-	return m9MobFor(m.instance) == m
+func mobAlive(m *mob) bool {
+	return mobFor(m.instance) == m
 }
 
 // killerView maps a killer conn to a PlayerView (nil-safe).
@@ -489,13 +489,13 @@ func killerView(killer *playerConn) *entity.PlayerView {
 // Tables / spawn / registry.
 // ---------------------------------------------------------------------------
 
-func m9LoadTables() {
-	m9Mu.Lock()
-	defer m9Mu.Unlock()
-	if len(m9Prof) > 0 {
+func loadMobTables() {
+	mobMu.Lock()
+	defer mobMu.Unlock()
+	if len(mobProf) > 0 {
 		return
 	}
-	for name, dst := range map[string]any{"mobs": &m9Prof, "spawns": &m9Spawn} {
+	for name, dst := range map[string]any{"mobs": &mobProf, "spawns": &mobSpawn} {
 		raw, err := os.ReadFile(resourceDataPath(name))
 		if err != nil {
 			log.Printf("m9: read %s.json: %v (engine disabled)", name, err)
@@ -506,35 +506,35 @@ func m9LoadTables() {
 			return
 		}
 	}
-	log.Printf("m9: mobs.json=%d profiles, spawns.json=%d overrides", len(m9Prof), len(m9Spawn))
+	log.Printf("m9: mobs.json=%d profiles, spawns.json=%d overrides", len(mobProf), len(mobSpawn))
 }
 
-// m9SpawnMob registers + broadcasts a mob (entities.ts spawnMob shape).
+// spawnMob registers + broadcasts a mob (entities.ts spawnMob shape).
 // World boot adoption and the m9test dispatcher both land here.
-func m9SpawnMob(instance, key string, x, y int, over m9Overrides) bool {
-	return m9SpawnMobInner(instance, key, x, y, over, true)
+func spawnMob(instance, key string, x, y int, over mobOverrides) bool {
+	return spawnMobInner(instance, key, x, y, over, true)
 }
 
-// m9SpawnMobQuiet registers a mob identically to m9SpawnMob but skips the
+// spawnMobQuiet registers a mob identically to spawnMob but skips the
 // Spawn broadcast: boot-time seeding only (zero subscribers at boot; late
 // joiners discover the mob through the region-scoped List + Who, the TS
 // updateEntityList path). Chest-area adoption, plateau bind and spawns.json
 // overrides are identical.
-func m9SpawnMobQuiet(instance, key string, x, y int, over m9Overrides) bool {
-	return m9SpawnMobInner(instance, key, x, y, over, false)
+func spawnMobQuiet(instance, key string, x, y int, over mobOverrides) bool {
+	return spawnMobInner(instance, key, x, y, over, false)
 }
 
-func m9SpawnMobInner(instance, key string, x, y int, over m9Overrides, broadcast bool) bool {
-	m9LoadTables()
-	m9Mu.Lock()
-	prof := entity.ProfileFor(m9Prof, m9Spawn, key, x, y)
+func spawnMobInner(instance, key string, x, y int, over mobOverrides, broadcast bool) bool {
+	loadMobTables()
+	mobMu.Lock()
+	prof := entity.ProfileFor(mobProf, mobSpawn, key, x, y)
 	if prof == nil {
-		m9Mu.Unlock()
+		mobMu.Unlock()
 		log.Printf("m9: unknown mob key %s (spawn skipped)", key)
 		return false
 	}
 	entity.ApplyDefaults(prof)
-	m := &m9Mob{
+	m := &mob{
 		instance: instance, key: key, prof: *prof,
 		spawnX: x, spawnY: y, x: x, y: y,
 		maxHP: prof.HitPoints, hp: prof.HitPoints,
@@ -550,9 +550,9 @@ func m9SpawnMobInner(instance, key string, x, y int, over m9Overrides, broadcast
 	if over.Leash > 0 {
 		m.prof.RoamDistance = over.Leash
 	}
-	m9Mobs[instance] = m
+	mobs[instance] = m
 	payload := m.data()
-	m9Mu.Unlock()
+	mobMu.Unlock()
 
 	worldcore.SetEntityPos(instance, x, y)
 	if broadcast {
@@ -560,28 +560,28 @@ func m9SpawnMobInner(instance, key string, x, y int, over m9Overrides, broadcast
 	}
 	// M10: Mob.addToChestArea parity — a mob spawning inside a chest area
 	// registers with it (addEntity; removes any unlooted reward chest).
-	if area := m10ChestAreaAt(x, y); area != nil {
-		m10AddChestMob(area, instance, m.respawnDelay())
+	if area := chestAreaAt(x, y); area != nil {
+		addChestMob(area, instance, m.respawnDelay())
 	}
 	return true
 }
 
-// m9Remove drops a mob from the registry (no despawn frame; callers that
+// removeMob drops a mob from the registry (no despawn frame; callers that
 // need one broadcast it themselves — Node despawn/destroy split).
-func m9Remove(instance string) {
-	m9Mu.Lock()
-	delete(m9Mobs, instance)
-	m9Mu.Unlock()
+func removeMob(instance string) {
+	mobMu.Lock()
+	delete(mobs, instance)
+	mobMu.Unlock()
 }
 
-func m9MobFor(instance string) *m9Mob {
-	m9Mu.Lock()
-	defer m9Mu.Unlock()
-	return m9Mobs[instance]
+func mobFor(instance string) *mob {
+	mobMu.Lock()
+	defer mobMu.Unlock()
+	return mobs[instance]
 }
 
 // data mirrors Mob.serialize: hitPoints/maxHitPoints/attackRange/level.
-func (m *m9Mob) data() EntityData {
+func (m *mob) data() EntityData {
 	return EntityData{
 		Instance: m.instance, Type: EntityMob, Key: m.key,
 		Name: m.prof.Name, X: m.x, Y: m.y,
@@ -594,7 +594,7 @@ func (m *m9Mob) data() EntityData {
 }
 
 // respawnDelay mirrors Mob.respawn: override > profile > MobDefaults.
-func (m *m9Mob) respawnDelay() time.Duration {
+func (m *mob) respawnDelay() time.Duration {
 	return entity.RespawnDelayFor(m.over, m.prof)
 }
 
@@ -602,47 +602,47 @@ func (m *m9Mob) respawnDelay() time.Duration {
 // Engine tick / hit intake (orchestration lives in entity).
 // ---------------------------------------------------------------------------
 
-// m9Tick is the 500ms AI pass over every live mob.
-func m9Tick() {
-	m9Mu.Lock()
+// mobTick is the 500ms AI pass over every live mob.
+func mobTick() {
+	mobMu.Lock()
 	now := time.Now()
-	var plugMobs []*m9Mob
-	for _, m := range m9Mobs {
+	var plugMobs []*mob
+	for _, m := range mobs {
 		if m.dead {
 			continue
 		}
 		entity.StepMob(m, gameWorld, now)
 		// Tick-plugin mobs are collected for a second pass AFTER the
 		// registry lock is released: PluginTick uses the full PluginHost
-		// (spawn/remove/lookup take m9Mu), so it must never run under it.
+		// (spawn/remove/lookup take mobMu), so it must never run under it.
 		if entity.HasMobPluginTick(m.key) {
 			plugMobs = append(plugMobs, m)
 		}
 	}
-	m9Mu.Unlock()
+	mobMu.Unlock()
 	for _, m := range plugMobs {
 		entity.PluginTick(m, gameWorld, time.Now())
 	}
 }
 
-// m9PlayerHit applies hero damage to a mob: Points, retaliate, death.
-func m9PlayerHit(m *m9Mob, attacker *playerConn, dmg int) {
+// mobPlayerHit applies hero damage to a mob: Points, retaliate, death.
+func mobPlayerHit(m *mob, attacker *playerConn, dmg int) {
 	entity.HitMob(m, killerView(attacker), dmg, gameWorld, time.Now(), func() bool {
 		return mobAlive(m)
 	})
 }
 
-// m9KillMob ports handler.handleDeath: despawn + kill credit (M5 loot) +
+// killMob ports handler.handleDeath: despawn + kill credit (M5 loot) +
 // destroy (respawn timer restores full HP at spawn).
-func m9KillMob(m *m9Mob, killer *playerConn) {
+func killMob(m *mob, killer *playerConn) {
 	entity.KillMob(m, killerView(killer), gameWorld, func() bool {
 		return mobAlive(m)
 	})
 }
 
-// m9Respawn ports handler.handleRespawn: full HP, back at spawn, Spawn frame.
-func m9Respawn(m *m9Mob) {
-	if m9MobFor(m.instance) != m {
+// respawnMob ports handler.handleRespawn: full HP, back at spawn, Spawn frame.
+func respawnMob(m *mob) {
+	if mobFor(m.instance) != m {
 		return // removed while dead
 	}
 	entity.RespawnMob(m, gameWorld)
@@ -652,7 +652,7 @@ func m9Respawn(m *m9Mob) {
 // ---------------------------------------------------------------------------
 // Mob-plugin host (entity.PluginHost over the live registry).
 //
-// Minions spawn through the existing m9SpawnMob path (Spawn broadcast +
+// Minions spawn through the existing spawnMob path (Spawn broadcast +
 // chest-area registration + plateau bind) with the TS Default.spawn
 // post-conditions layered on: non-respawning, boss aggro range, forced
 // aggression. Cleanup runs the full killerless KillMob pipeline (Despawn
@@ -661,21 +661,21 @@ func m9Respawn(m *m9Mob) {
 // bubble frame (TS talkCallback surface). No new packet shapes.
 // ---------------------------------------------------------------------------
 
-// m9MinionSeq disambiguates minion instances per boss.
-var m9MinionSeq atomic.Int64
+// minionSeq disambiguates minion instances per boss.
+var minionSeq atomic.Int64
 
-// m9MimicSeq disambiguates mimic instances per opened chest.
-var m9MimicSeq atomic.Int64
+// mimicSeq disambiguates mimic instances per opened chest.
+var mimicSeq atomic.Int64
 
 // SpawnMimic spawns a 'mimic' mob at (x, y) for a mimic-chest open
-// (entities.ts onOpen spawnMob('mimic')): the full m9SpawnMob path (Spawn
+// (entities.ts onOpen spawnMob('mimic')): the full spawnMob path (Spawn
 // broadcast + chest-area adoption + plateau bind) with the TS
 // post-conditions layered on (non-respawning via the NoRespawn override;
 // the chest link itself lives in entity, set by OpenChest on success).
 // Reports ok=false when the profile is unknown (TS `if (mimic)` parity).
 func (gameWorldAdapter) SpawnMimic(x, y int) (string, bool) {
-	inst := fmt.Sprintf("mimic-%d", m9MimicSeq.Add(1))
-	if !m9SpawnMob(inst, "mimic", x, y, m9Overrides{NoRespawn: true}) {
+	inst := fmt.Sprintf("mimic-%d", mimicSeq.Add(1))
+	if !spawnMob(inst, "mimic", x, y, mobOverrides{NoRespawn: true}) {
 		return "", false
 	}
 	return inst, true
@@ -684,16 +684,16 @@ func (gameWorldAdapter) SpawnMimic(x, y int) (string, bool) {
 // RemoveMob drops a dead non-respawning mob from the registry (TS destroy
 // for the mimic; no despawn frame — entity.KillMob already sent it).
 func (gameWorldAdapter) RemoveMob(instance string) {
-	m9Remove(instance)
+	removeMob(instance)
 }
 
 func (gameWorldAdapter) SpawnMinion(bossInstance, key string, x, y int, opts entity.MinionOpts) string {
-	inst := fmt.Sprintf("%s-minion-%d", bossInstance, m9MinionSeq.Add(1))
-	over := m9Overrides{Aggro: opts.AggroRange, Leash: opts.RoamDistance, NoRespawn: true}
-	if !m9SpawnMob(inst, key, x, y, over) {
+	inst := fmt.Sprintf("%s-minion-%d", bossInstance, minionSeq.Add(1))
+	over := mobOverrides{Aggro: opts.AggroRange, Leash: opts.RoamDistance, NoRespawn: true}
+	if !spawnMob(inst, key, x, y, over) {
 		return ""
 	}
-	if m := m9MobFor(inst); m != nil {
+	if m := mobFor(inst); m != nil {
 		m.mu.Lock()
 		if opts.AlwaysAggressive {
 			m.prof.AlwaysAggro = true
@@ -711,21 +711,21 @@ func (gameWorldAdapter) SpawnMinion(bossInstance, key string, x, y int, opts ent
 }
 
 func (gameWorldAdapter) KillMinion(instance string) {
-	m := m9MobFor(instance)
+	m := mobFor(instance)
 	if m == nil {
 		return
 	}
 	entity.KillMob(m, nil, gameWorld, func() bool { return mobAlive(m) })
-	m9Remove(instance) // TS destroy: no registry entry, no respawn
+	removeMob(instance) // TS destroy: no registry entry, no respawn
 }
 
 func (gameWorldAdapter) MinionDied(bossInstance, minionInstance string) {
 	_ = bossInstance
-	m9Remove(minionInstance)
+	removeMob(minionInstance)
 }
 
 func (gameWorldAdapter) SetMobTarget(mobInstance, playerInstance string) {
-	m := m9MobFor(mobInstance)
+	m := mobFor(mobInstance)
 	if m == nil {
 		return
 	}
@@ -739,7 +739,7 @@ func (gameWorldAdapter) SetMobTarget(mobInstance, playerInstance string) {
 }
 
 func (gameWorldAdapter) TeleportMob(mobInstance string, x, y int) {
-	m := m9MobFor(mobInstance)
+	m := mobFor(mobInstance)
 	if m == nil {
 		return
 	}
@@ -750,7 +750,7 @@ func (gameWorldAdapter) TeleportMob(mobInstance string, x, y int) {
 }
 
 func (gameWorldAdapter) ClearMobCombat(mobInstance string) {
-	m := m9MobFor(mobInstance)
+	m := mobFor(mobInstance)
 	if m == nil {
 		return
 	}
@@ -761,7 +761,7 @@ func (gameWorldAdapter) ClearMobCombat(mobInstance string) {
 }
 
 func (gameWorldAdapter) MobPos(instance string) (int, int, bool) {
-	m := m9MobFor(instance)
+	m := mobFor(instance)
 	if m == nil {
 		return 0, 0, false
 	}
@@ -775,7 +775,7 @@ func (gameWorldAdapter) MobTalk(mobInstance, message string) {
 }
 
 func (gameWorldAdapter) HealMob(instance string, amount int) {
-	m := m9MobFor(instance)
+	m := mobFor(instance)
 	if m == nil {
 		return
 	}
@@ -795,7 +795,7 @@ func (gameWorldAdapter) HealMob(instance string, amount int) {
 }
 
 func (gameWorldAdapter) FollowStep(mobInstance string, tx, ty int) {
-	m := m9MobFor(mobInstance)
+	m := mobFor(mobInstance)
 	if m == nil {
 		return
 	}
@@ -815,28 +815,139 @@ func (gameWorldAdapter) FollowStep(mobInstance string, tx, ty int) {
 }
 
 // ---------------------------------------------------------------------------
+// Mob projectile spawning (visual-only; damage already applied by strikeMob).
+// ---------------------------------------------------------------------------
+
+// Mob projectile registry for in-flight mob shots (Who/List resolution
+// between Spawn and impact Despawn). Separate from the player combat
+// projPayloads registry to avoid key collisions.
+var (
+	mobProjMu       sync.Mutex
+	mobProjSeq      int
+	mobProjPayloads = map[string]EntityData{}
+)
+
+func (gameWorldAdapter) SpawnProjectile(projectileName, ownerInst, targetInst string, x, y, tx, ty int) {
+	if projectileName == "" {
+		return
+	}
+	mobProjSeq++
+	inst := fmt.Sprintf("mpr-%d", mobProjSeq)
+	// Flight time follows the projectile.ts rule (distance*90ms, internal/sim).
+	travel := sim.TravelBetween(x, y, tx, ty)
+	p := EntityData{
+		Instance: inst, Type: EntityProjectile, Key: projectileName, Name: projectileName,
+		X: x, Y: y, OwnerInstance: ownerInst, TargetInstance: targetInst,
+	}
+	mobProjMu.Lock()
+	mobProjPayloads[inst] = p
+	mobProjMu.Unlock()
+	worldcore.SetEntityPos(inst, x, y)
+	worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: ownerInst, Action: ActionAttack}))
+	worldcore.Broadcast(pkt(PacketSpawn, p))
+	log.Printf("m9: %s launched %s (%s) travel=%v", ownerInst, inst, projectileName, travel)
+	time.AfterFunc(travel, func() {
+		mobProjMu.Lock()
+		delete(mobProjPayloads, inst)
+		mobProjMu.Unlock()
+		worldcore.RemoveEntity(inst)
+		worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: inst}))
+	})
+}
+
+// ---------------------------------------------------------------------------
 // Player HP / death / respawn (character.hitPoints + player.respawn).
 // ---------------------------------------------------------------------------
 
-var m9PlayerHPs sync.Map // instance -> remaining HP
+// heroHPEntry stores both current and max HP for a hero instance.
+// Max HP is level-scaled (formulas.ts getMaxHitPoints: 39 + level * 30).
+type heroHPEntry struct {
+	hp, maxHP int
+}
 
-func m9PlayerMaxHP() int { return entity.HeroMaxHP } // stub hero max (divergence note)
+var playerHPs sync.Map // instance -> heroHPEntry
 
-func m9PlayerHP(c *playerConn) int {
+// heroMaxHPFor looks up the level-scaled max HP for a username.
+// Falls back to level-1 (69) when the player state is unavailable.
+func heroMaxHPFor(username string) int {
+	st := playerStateFor(username)
+	pstateMu.Lock()
+	level := st.Level
+	pstateMu.Unlock()
+	return meta.HeroMaxHPForLevel(level)
+}
+
+func (gameWorldAdapter) GetHeroHP(instance string) int {
+	if v, ok := playerHPs.Load(instance); ok {
+		return v.(heroHPEntry).hp
+	}
+	// Default: look up the player's level-scaled max HP.
+	// Instance -> username resolution via worldcore.Find.
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil {
+		return heroMaxHPFor(c.Username)
+	}
+	return meta.HeroMaxHPForLevel(1) // fallback: level 1
+}
+
+func (gameWorldAdapter) SetHeroHP(instance string, hp int) {
+	if v, ok := playerHPs.Load(instance); ok {
+		entry := v.(heroHPEntry)
+		entry.hp = hp
+		playerHPs.Store(instance, entry)
+		return
+	}
+	// First store: initialize with level-scaled max HP.
+	maxHP := meta.HeroMaxHPForLevel(1)
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil {
+		maxHP = heroMaxHPFor(c.Username)
+	}
+	playerHPs.Store(instance, heroHPEntry{hp: hp, maxHP: maxHP})
+}
+
+func (gameWorldAdapter) ForgetHeroHP(instance string) {
+	playerHPs.Delete(instance)
+}
+
+// HeroMaxHP returns the level-scaled max HP for a hero instance
+// (formulas.ts getMaxHitPoints parity: 39 + level * 30).
+func (gameWorldAdapter) HeroMaxHP(instance string) int {
+	if v, ok := playerHPs.Load(instance); ok {
+		return v.(heroHPEntry).maxHP
+	}
+	// Default: look up the player's level-scaled max HP.
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil {
+		return heroMaxHPFor(c.Username)
+	}
+	return meta.HeroMaxHPForLevel(1) // fallback: level 1
+}
+
+func (gameWorldAdapter) HeroPoints(instance string, hp, maxHP int) {
+	worldcore.Broadcast(pkt(PacketPoints, pointsData{
+		Instance: instance, HitPoints: intp(hp), MaxHitPoints: intp(maxHP),
+	}))
+}
+
+func playerHP(c *playerConn) int {
 	return gameWorld.GetHeroHP(c.Instance)
 }
 
-// m9DamagePlayer applies mob damage: Points frame, Death on empty.
-func m9DamagePlayer(c *playerConn, dmg int, from *m9Mob) {
-	m9DamagePlayerThorns(c, dmg, from, false)
+// mobDamagePlayer applies mob damage: Points frame, Death on empty.
+func mobDamagePlayer(c *playerConn, dmg int, from *mob) {
+	mobDamagePlayerThorns(c, dmg, from, false)
 }
 
-// m9DamagePlayerThorns ports player/handler.ts handleHit thorns block with
+// mobDamagePlayerThorns ports player/handler.ts handleHit thorns block with
 // the TS shape mirrored exactly: the dead/no-attacker guard and the
 // isThorns loop guard live on RECEIPT, and the reflect call itself passes
 // no thorns flag (mob receipt never reflects, so no loop is possible).
-func m9DamagePlayerThorns(c *playerConn, dmg int, from *m9Mob, isThorns bool) {
+func mobDamagePlayerThorns(c *playerConn, dmg int, from *mob, isThorns bool) {
 	if c == nil {
+		return
+	}
+	// Invincible parity (TS character.hit: early return when
+	// status.has(Modules.Effects.Invincible)). Blocks ALL incoming damage
+	// including mob hits, DoT ticks, and admin damage commands.
+	if abilities.HasStatusEffect(c.Instance, fxInvincible) {
 		return
 	}
 	var f entity.Mob
@@ -857,7 +968,7 @@ func m9DamagePlayerThorns(c *playerConn, dmg int, from *m9Mob, isThorns bool) {
 		return
 	}
 	// 40% chance to activate thorns.
-	if !thornsRoll(combatRand) {
+	if !lockedThornsRoll() {
 		return
 	}
 	// Thorns damage is 10% per level of thorns enchantment, reflected via
@@ -871,39 +982,45 @@ func m9DamagePlayerThorns(c *playerConn, dmg int, from *m9Mob, isThorns bool) {
 		})
 }
 
-// m9HandleRespawn ports incoming.handleRespawn -> player.respawn: only when
+// handleMobRespawn ports incoming.handleRespawn -> player.respawn: only when
 // dead; teleport to spawn + Spawn broadcast + Respawn{x,y} + Points sync.
-// The respawn tile is tracked via m5TrackPos (persist parity: a disconnect
+// The respawn tile is tracked via trackPos (persist parity: a disconnect
 // right after respawn must relogin at spawn, not at the death tile).
-func m9HandleRespawn(c *playerConn) {
-	if m9PlayerHP(c) > 0 {
+func handleMobRespawn(c *playerConn) {
+	if playerHP(c) > 0 {
 		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
-	x, y := entity.HeroSpawnX, entity.HeroSpawnY
+	// Home-point respawn: use the player's bound home when set, otherwise
+	// fall back to the fixed spawn (entity.HeroSpawnX/Y).
+	st := playerStateFor(c.Username)
+	x, y := st.HomeX, st.HomeY
+	if x == 0 && y == 0 {
+		x, y = entity.HeroSpawnX, entity.HeroSpawnY
+	}
 	c.Sess.PlayerX, c.Sess.PlayerY = x, y
-	if !entity.RespawnHero(gameWorld, c.Instance) {
+	if !entity.RespawnHero(gameWorld, c.Instance, x, y) {
 		log.Printf("m9: invalid respawn request from %s", c.Username)
 		return
 	}
-	m9DeathFired.Delete(c.Instance) // next life dies loudly again
-	m5TrackPos(c)                   // tracks the respawn tile (plateauTrack rides along)
+	deathFired.Delete(c.Instance) // next life dies loudly again
+	trackPos(c)                   // tracks the respawn tile (plateauTrack rides along)
 	plateauTrack(c)
-	m8OnPositionUpdate(c)  // respawn position can cross an area boundary
-	m10OnPositionUpdate(c) // M10: area callbacks on the respawn tile too
+	minigamePositionUpdate(c)  // respawn position can cross an area boundary
+	areaPositionUpdate(c) // M10: area callbacks on the respawn tile too
 	log.Printf("m9: %s respawned at %d,%d", c.Username, x, y)
 }
 
-// m9MobTargeting reports whether any live engine mob currently targets the
+// mobTargeting reports whether any live engine mob currently targets the
 // instance (character.getAttackerCount/inCombat parity for the item-use
-// combat gate). Lock order m9Mu -> m.mu, leaf use only.
-func m9MobTargeting(instance string) bool {
+// combat gate). Lock order mobMu -> m.mu, leaf use only.
+func mobTargeting(instance string) bool {
 	if instance == "" {
 		return false
 	}
-	m9Mu.Lock()
-	defer m9Mu.Unlock()
-	for _, m := range m9Mobs {
+	mobMu.Lock()
+	defer mobMu.Unlock()
+	for _, m := range mobs {
 		m.mu.Lock()
 		target, dead := m.target, m.dead
 		m.mu.Unlock()
@@ -914,12 +1031,12 @@ func m9MobTargeting(instance string) bool {
 	return false
 }
 
-// m9PlayerLeave drops per-player state on disconnect.
-func m9PlayerLeave(c *playerConn) {
-	m9PlayerHPs.Delete(c.Instance)
-	m9DeathFired.Delete(c.Instance)
-	m9Mu.Lock()
-	for _, m := range m9Mobs {
+// mobPlayerLeave drops per-player state on disconnect.
+func mobPlayerLeave(c *playerConn) {
+	playerHPs.Delete(c.Instance)
+	deathFired.Delete(c.Instance)
+	mobMu.Lock()
+	for _, m := range mobs {
 		m.mu.Lock()
 		if m.target == c.Instance {
 			m.target = ""
@@ -927,41 +1044,41 @@ func m9PlayerLeave(c *playerConn) {
 		delete(m.attackers, c.Instance)
 		m.mu.Unlock()
 	}
-	m9Mu.Unlock()
+	mobMu.Unlock()
 }
 
-// m9Engine boots the AI loop + adopts the demo mobs (main()).
-func m9Engine() {
-	m9LoadTables()
-	m9AdoptExisting()
+// mobEngine boots the AI loop + adopts the demo mobs (main()).
+func mobEngine() {
+	loadMobTables()
+	adoptExistingMobs()
 	go func() {
 		t := time.NewTicker(entity.RoamTick)
 		defer t.Stop()
 		for range t.C {
-			m9Tick()
+			mobTick()
 		}
 	}()
 }
 
-// m9AdoptExisting re-registers the demo mobs under the engine. m-rat-1 keeps
+// adoptExistingMobs re-registers the demo mobs under the engine. m-rat-1 keeps
 // its M3 slice-1 demo semantics (forced chase, no strikes, aggro 6, leash
 // 10, respawn 10s). m1 (plain-mode rat) runs the full profile.
-func m9AdoptExisting() {
+func adoptExistingMobs() {
 	switch {
 	case combatMode:
-		m9SpawnMob(combatRatInstance, "rat", combatRatX, combatRatY, m9Overrides{
+		spawnMob(combatRatInstance, "rat", combatRatX, combatRatY, mobOverrides{
 			NoAttack: true, Chase: true, Aggro: combatRatAggro, Leash: combatRatLeash,
 			Respawn: combatRatRespawnDelay,
 		})
 	case !testMode && !cleanMode:
-		m9SpawnMob("m1", "rat", 104, 104, m9Overrides{})
+		spawnMob("m1", "rat", 104, 104, mobOverrides{})
 	}
 }
 
-// m9RatEntity returns the combat leash-demo rat's Spawn payload, or nil
+// ratEntity returns the combat leash-demo rat's Spawn payload, or nil
 // when it is dead/absent (combatSpawns() parity with the old ratData gate).
-func m9RatEntity() *EntityData {
-	m := m9MobFor(combatRatInstance)
+func ratEntity() *EntityData {
+	m := mobFor(combatRatInstance)
 	if m == nil {
 		return nil
 	}
@@ -974,14 +1091,14 @@ func m9RatEntity() *EntityData {
 	return &d
 }
 
-// m9OnPlayerMoved is the position-update hook from the movement handler:
+// mobOnPlayerMoved is the position-update hook from the movement handler:
 // Node runs detectAggro on every position change; the engine scans on the
 // next tick, so this only fast-forwards the aggro scan for responsiveness.
-func m9OnPlayerMoved(c *playerConn) {
+func mobOnPlayerMoved(c *playerConn) {
 	v := playerViewFor(c)
-	m9Mu.Lock()
-	defer m9Mu.Unlock()
-	for _, m := range m9Mobs {
+	mobMu.Lock()
+	defer mobMu.Unlock()
+	for _, m := range mobs {
 		if m.dead {
 			continue
 		}
@@ -994,10 +1111,15 @@ func m9OnPlayerMoved(c *playerConn) {
 	}
 }
 
-// m9TestHandler is the TESTMAP-only debug dispatcher (m8test precedent):
+// handleMobTest is the TESTMAP-only debug dispatcher (m8test precedent):
 // spawn/remove engine mobs and reposition the hero for deterministic e2e.
-func m9TestHandler(c *playerConn, data []byte) {
+func handleMobTest(c *playerConn, data []byte) {
 	if !testMode {
+		return
+	}
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client warp/spawn hole).
+	if !isAdmin(c) {
 		return
 	}
 	var d struct {
@@ -1014,37 +1136,37 @@ func m9TestHandler(c *playerConn, data []byte) {
 	}
 	switch d.M9Test {
 	case "spawn":
-		m9SpawnMob(d.Instance, d.Key, d.X, d.Y, m9Overrides{Aggro: d.Aggro, Leash: d.Leash})
+		spawnMob(d.Instance, d.Key, d.X, d.Y, mobOverrides{Aggro: d.Aggro, Leash: d.Leash})
 	case "remove":
-		if m := m9MobFor(d.Instance); m != nil {
+		if m := mobFor(d.Instance); m != nil {
 			worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: d.Instance}))
-			m9Remove(d.Instance)
+			removeMob(d.Instance)
 		}
 	case "tp": // reposition the hero server-side (seedPos precedent)
 		if c != nil {
 			c.Sess.PlayerX, c.Sess.PlayerY = d.X, d.Y
 			worldcore.SetEntityPos(c.Instance, d.X, d.Y)
-			// Every other server-side teleport (m7Teleport/m8Teleport,
+			// Every other server-side teleport (teleport/minigameTeleport,
 			// worldApplyTeleport, walked movement) recomputes the
 			// client's 9-region interest set — without it a debug tp
 			// across regions leaves the client blind to region-scoped
 			// frames (Spawn/Combat) at the landing tile.
 			worldcore.UpdateRegion(c, d.X, d.Y)
 			worldcore.Broadcast(pkt(PacketTeleport, teleportData{Instance: c.Instance, X: d.X, Y: d.Y}))
-			m5TrackPos(c) // persist parity: the test tile must survive a save
+			trackPos(c) // persist parity: the test tile must survive a save
 			plateauTrack(c)
-			m8OnPositionUpdate(c)
-			m9OnPlayerMoved(c)     // position updates run the aggro scan
-			m10OnPositionUpdate(c) // M10: camera/music/pvp/overlay area callbacks
+			minigamePositionUpdate(c)
+			mobOnPlayerMoved(c)     // position updates run the aggro scan
+			areaPositionUpdate(c) // M10: camera/music/pvp/overlay area callbacks
 		}
 	case "mobhp": // debug echo: m9:mob=... hp=.../... x=... y=... tgt=...
-		m := m9MobFor(d.Instance)
+		m := mobFor(d.Instance)
 		if m == nil || c == nil {
 			return
 		}
 		m.mu.Lock()
 		echo := fmt.Sprintf("m9:mob=%s hp=%d/%d x=%d y=%d tgt=%s", d.Instance, m.hp, m.maxHP, m.x, m.y, m.target)
 		m.mu.Unlock()
-		m6Notify(c, echo)
+		notifyPlayer(c, echo)
 	}
 }

@@ -24,16 +24,10 @@
 //   - packages/server/data/map/world.json (areas.lights / areas.signs shape)
 //
 // Divergence notes vs TS:
-//   - Simplified structs: Light keeps only X, Y, Radius (= ProcessedArea
-//     distance), Colour. The TS Light also carries id, diffuse, flickerSpeed,
-//     flickerIntensity, and serialize() emits a SerializedLight for the
-//     OverlayPacket Lamp frame (overlay.ts). Transport/serialization lives
-//     outside this package; see handler.ts handleLights.
 //   - Defaults preserved: missing colour falls back to
-//     'rgba(0, 0, 0, 0.2)' and missing distance to 100, per the Light
-//     constructor defaults in impl/light.ts (diffuse 0.2, flickerSpeed 300,
-//     flickerIntensity 1 are dropped, not defaulted, since the fields do
-//     not exist here).
+//     'rgba(0, 0, 0, 0.2)', missing distance to 100, diffuse to 0.2,
+//     flickerSpeed to 300, and flickerIntensity to 1, matching the Light
+//     constructor defaults in impl/light.ts.
 //   - Sign keeps the raw text string. TS splits text on ',' into pages and
 //     advances them via player.talkIndex, sending BubblePacket Position
 //     frames (impl/sign.ts talk(), player.ts interaction). No talk
@@ -72,13 +66,29 @@ const DefaultLightColour = "rgba(0, 0, 0, 0.2)"
 // in packages/server/src/game/globals/impl/light.ts.
 const DefaultLightRadius = 100
 
+// DefaultLightDiffuse mirrors the Light constructor default diffuse (0.2).
+const DefaultLightDiffuse = 0.2
+
+// DefaultLightFlickerSpeed mirrors the Light constructor default flickerSpeed
+// (300). Use -1 to disable flickering.
+const DefaultLightFlickerSpeed = 300
+
+// DefaultLightFlickerIntensity mirrors the Light constructor default
+// flickerIntensity (1).
+const DefaultLightFlickerIntensity = 1
+
 // Light is a transport-free light: grid position plus reach (Radius, from
-// ProcessedArea distance) and emanated colour.
+// ProcessedArea distance), emanated colour, and animation properties
+// (Diffuse, FlickerSpeed, FlickerIntensity) matching impl/light.ts.
 type Light struct {
-	X      int
-	Y      int
-	Radius int
-	Colour string
+	ID               int
+	X                int
+	Y                int
+	Radius           int
+	Colour           string
+	Diffuse          float64
+	FlickerSpeed     int
+	FlickerIntensity int
 }
 
 // Sign is a transport-free sign: grid position plus raw display text.
@@ -105,6 +115,7 @@ type Globals struct {
 // (packages/common/types/map.d.ts:65-71). Pointers distinguish "absent"
 // (apply TS constructor default) from explicit zero values.
 type lightArea struct {
+	ID               int      `json:"id"`
 	X                int      `json:"x"`
 	Y                int      `json:"y"`
 	Colour           *string  `json:"colour"`
@@ -164,11 +175,27 @@ func Load(path string) (*Globals, error) {
 		if l.Distance != nil {
 			radius = *l.Distance
 		}
+		diffuse := DefaultLightDiffuse
+		if l.Diffuse != nil {
+			diffuse = *l.Diffuse
+		}
+		flickerSpeed := DefaultLightFlickerSpeed
+		if l.FlickerSpeed != nil {
+			flickerSpeed = *l.FlickerSpeed
+		}
+		flickerIntensity := DefaultLightFlickerIntensity
+		if l.FlickerIntensity != nil {
+			flickerIntensity = *l.FlickerIntensity
+		}
 		g.Lights = append(g.Lights, Light{
-			X:      l.X,
-			Y:      l.Y,
-			Radius: radius,
-			Colour: colour,
+			ID:               l.ID,
+			X:                l.X,
+			Y:                l.Y,
+			Radius:           radius,
+			Colour:           colour,
+			Diffuse:          diffuse,
+			FlickerSpeed:     flickerSpeed,
+			FlickerIntensity: flickerIntensity,
 		})
 	}
 	for _, s := range w.Areas.Signs {

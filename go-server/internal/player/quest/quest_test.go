@@ -314,8 +314,8 @@ func TestGiveRewardsSpace(t *testing.T) {
 	if GiveRewards(c, d, st, []Item{{Key: "sword", Count: 1}}) {
 		t.Fatal("full inventory must refuse rewards")
 	}
-	if n := len(bus.notices["i4"]); n != 1 || bus.notices["i4"][0] != "misc:NO_SPACE" {
-		t.Fatalf("notices = %v, want one NO_SPACE", bus.notices["i4"])
+	if n := len(bus.notices["i4"]); n != 1 || bus.notices["i4"][0] != "misc:PLEASE_MAKE_ROOM_REWARD" {
+		t.Fatalf("notices = %v, want one PLEASE_MAKE_ROOM_REWARD", bus.notices["i4"])
 	}
 
 	store.slots = nil

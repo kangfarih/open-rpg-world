@@ -22,7 +22,7 @@ import (
 // `if (!entity) return` / not-mob-or-item) vs ok=true with desc="" (notify
 // misc:NO_IDEA).
 func examineResolve(instance string) (key, desc string, ok bool) {
-	if m := m9MobFor(instance); m != nil {
+	if m := mobFor(instance); m != nil {
 		key = m.key
 		if d, has := entity.Profile(key); has && d != nil {
 			if text, pick := d.Description.Pick(); pick {
@@ -39,7 +39,7 @@ func examineResolve(instance string) (key, desc string, ok bool) {
 			return "", "", false
 		}
 		key = l.Items[0].Key
-		if info := m6ItemInfoFor(key); info != nil && info.Description != "" {
+		if info := itemInfoFor(key); info != nil && info.Description != "" {
 			return key, info.Description, true
 		}
 		return key, "", true
@@ -68,9 +68,9 @@ func handleExamineReq(c *playerConn, frame clientFrame) {
 	// entity has no description).
 	statsAddMobExamine(c, key)
 	if desc == "" {
-		m6Notify(c, "misc:NO_IDEA")
+		notifyPlayer(c, "misc:NO_IDEA")
 		return
 	}
-	m6Notify(c, desc)
+	notifyPlayer(c, desc)
 	log.Printf("examine: %s examined %s (%s)", c.Instance, instance, key)
 }

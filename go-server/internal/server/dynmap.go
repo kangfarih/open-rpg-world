@@ -390,3 +390,108 @@ func dynMapForget(instance string) {
 	delete(dynSent, instance)
 	dynMu.Unlock()
 }
+
+// ---------------------------------------------------------------------------
+// Full-world region streaming (TS regions.ts handle/sendRegion parity).
+// ---------------------------------------------------------------------------
+
+// streamNewRegions sends tile data for any surrounding regions the player
+// hasn't received yet (TS regions.ts sendRegion: on region change, compute
+// new 9-region interest set, send regions not in player.regionsLoaded).
+// Returns true if any new regions were sent. The caller must have updated
+// c.Sess.PlayerX/PlayerY before calling.
+func streamNewRegions(c *playerConn) bool {
+	if c == nil || c.Conn == nil {
+		return false
+	}
+	loadWorld()
+	px, py := c.Sess.PlayerX, c.Sess.PlayerY
+	region := (py/mapDivisionSize)*sideLen + (px / mapDivisionSize)
+	surrounding := surroundingRegions(region)
+
+	// Find regions the player hasn't loaded yet.
+	var newRegions []int
+	for _, rid := range surrounding {
+		if !c.regionsLoaded[rid] {
+			newRegions = append(newRegions, rid)
+		}
+	}
+	if len(newRegions) == 0 {
+		return false
+	}
+
+	// Build region data for the new regions only.
+	data := make(map[int][]RegionTile)
+	for _, rid := range newRegions {
+		x0 := (rid % sideLen) * mapDivisionSize
+		y0 := (rid / sideLen) * mapDivisionSize
+		var tiles []RegionTile
+		for y := y0; y < y0+mapDivisionSize; y++ {
+			for x := x0; x < x0+mapDivisionSize; x++ {
+				if t, ok := buildTile(x, y); ok {
+					tiles = append(tiles, t)
+				}
+			}
+		}
+		if len(tiles) > 0 {
+			data[rid] = tiles
+		}
+	}
+	if len(data) == 0 {
+		// Mark as loaded even if empty (no tiles to send).
+		for _, rid := range newRegions {
+			c.regionsLoaded[rid] = true
+		}
+		return false
+	}
+
+	// Apply dynamic overlay for this player's progression (same as the
+	// boot frame path). The overlay only substitutes tiles within the
+	// served scope; for streaming, the scope is the new regions.
+	overlay, _ := dynamicOverlayTiles(
+		entityDynAreas(),
+		questProg{username: c.Username},
+		func(mx, my int) (RegionTile, bool) { return buildTile(mx, my) },
+		func(x, y int) bool {
+			rid := (y/mapDivisionSize)*sideLen + (x / mapDivisionSize)
+			for _, r := range newRegions {
+				if r == rid {
+					return true
+				}
+			}
+			return false
+		},
+	)
+	if len(overlay) > 0 {
+		data = applyDynamicTiles(
+			data,
+			overlay,
+			func(x, y int) int { return (y/mapDivisionSize)*sideLen + (x / mapDivisionSize) },
+		)
+	}
+
+	frame := encodeMapFrame(data)
+	_ = gnet.Send(c.Conn, frame)
+
+	// Mark new regions as loaded.
+	for _, rid := range newRegions {
+		c.regionsLoaded[rid] = true
+	}
+	log.Printf("dynmap: streamed %d new regions to %s (region %d)", len(data), c.Username, region)
+	return true
+}
+
+// resetRegionsLoaded clears the loaded-region set and re-seeds with the
+// current position's surrounding regions (called on teleport).
+func resetRegionsLoaded(c *playerConn) {
+	if c == nil {
+		return
+	}
+	c.regionsLoaded = make(map[int]bool)
+	loadWorld()
+	px, py := c.Sess.PlayerX, c.Sess.PlayerY
+	region := (py/mapDivisionSize)*sideLen + (px / mapDivisionSize)
+	for _, rid := range surroundingRegions(region) {
+		c.regionsLoaded[rid] = true
+	}
+}

@@ -554,8 +554,10 @@ func tradeAdd(d Deps, c Conn, index, count int) {
 		return
 	}
 	offer, existed := t.offers[index]
-	if !existed || offer == nil {
-		// New offer: clamp to the slot count.
+	if !existed || offer == nil || offer.Key != slot.Key {
+		// New offer (or the slot changed keys under a stale offer: the
+		// old key's counts no longer describe this slot, so re-offer
+		// fresh instead of stacking onto a foreign key).
 		offerCount := ClampNewOffer(count, slot.Count)
 		t.offers[index] = &OfferedItem{
 			InventoryIndex: index, MaxCount: slot.Count, Key: slot.Key,
@@ -614,35 +616,47 @@ func tradeRemove(d Deps, c Conn, index int) {
 }
 
 // tradeAccept ports trade.accept: single accept relays ACCEPTED_TRADE to
-// both; double accept runs the space check + exchange.
+// both; double accept runs the space check + exchange. The done
+// check-and-set is atomic under stateMu so two concurrent accepts cannot
+// both enter the exchange (TS inProgress parity — single-flighted here
+// because the Go slice serves accepts from multiple goroutines).
 func tradeAccept(d Deps, c Conn) {
 	t, peer := pair(c, d)
-	if t == nil || peer == nil || t.done {
+	if t == nil || peer == nil {
 		return
 	}
-	pt := stateFor(peer.PlayerName())
 	stateMu.Lock()
+	if t.done {
+		stateMu.Unlock()
+		return
+	}
 	var other *Trade
-	for _, tr := range pt.Trades {
-		if tr != nil {
-			other = tr
+	if pt, ok := states[peer.PlayerName()]; ok && pt != nil {
+		for _, tr := range pt.Trades {
+			if tr != nil {
+				other = tr
+				break
+			}
 		}
 	}
-	stateMu.Unlock() // pt fetched before the lock (non-reentrant mutex)
-	if other == nil {
+	if other == nil || other.done {
+		stateMu.Unlock()
 		return
 	}
-	if other.accept {
-		// Both accepted: exchange (inProgress guard).
-		if t.done {
-			return
-		}
-		tradeExchange(d, c, t, peer, other)
+	if !other.accept {
+		t.accept = true
+		stateMu.Unlock()
+		signalAccept(d, c, peer, "misc:ACCEPTED_TRADE")
+		signalAccept(d, peer, c, "misc:ACCEPTED_TRADE_OTHER")
 		return
 	}
-	t.accept = true
-	signalAccept(d, c, peer, "misc:ACCEPTED_TRADE")
-	signalAccept(d, peer, c, "misc:ACCEPTED_TRADE_OTHER")
+	// Both accepted: claim the exchange under the lock, then run it
+	// unlocked (exchange does Bus/Store I/O and closes the session,
+	// which re-locks stateMu).
+	t.done = true
+	other.done = true
+	stateMu.Unlock()
+	tradeExchange(d, c, t, peer, other)
 }
 
 // emptySlots counts free inventory slots (inventory.getEmptySlots).
@@ -650,31 +664,41 @@ func emptySlots(d Deps, key string) int {
 	return protocol.ModulesInventorySize - d.Store.InventoryLen(key)
 }
 
-// removeItemsBefore removes both sides' offered items from their
-// inventories; returns flagged (inventory.hasItem failed mid-way).
+// removeItemsBefore validates both sides' offered items first and only
+// then removes them; it returns flagged (an offer the inventory no longer
+// covers). Two-phase so a mid-exchange shortfall never destroys the items
+// already taken (TS removes incrementally and can lose them on the flagged
+// path — the validated-then-removed end state is identical on success).
 func removeItemsBefore(d Deps, me, peer Conn, t, other *Trade) bool {
-	flagged := false
 	for _, o := range t.offers {
-		if o == nil || flagged {
+		if o == nil {
 			continue
 		}
 		if d.Store.CountItem(me.PlayerName(), o.Key) < o.Count {
-			flagged = true
-			break
+			return true
+		}
+	}
+	for _, o := range other.offers {
+		if o == nil {
+			continue
+		}
+		if d.Store.CountItem(peer.PlayerName(), o.Key) < o.Count {
+			return true
+		}
+	}
+	for _, o := range t.offers {
+		if o == nil {
+			continue
 		}
 		d.Store.RemoveItem(me.PlayerName(), o.Key, o.Count)
 	}
 	for _, o := range other.offers {
-		if o == nil || flagged {
+		if o == nil {
 			continue
-		}
-		if d.Store.CountItem(peer.PlayerName(), o.Key) < o.Count {
-			flagged = true
-			break
 		}
 		d.Store.RemoveItem(peer.PlayerName(), o.Key, o.Count)
 	}
-	return flagged
+	return false
 }
 
 // ExchangeBlocked mirrors the trade.exchange space-check branch
@@ -695,11 +719,10 @@ func ExchangeBlocked(mySlots, peerSlots, myCount, peerCount int) (blocked bool, 
 }
 
 // tradeExchange ports trade.exchange: remove-before-add, space checks,
-// empty-trade notify, then close.
+// empty-trade notify, then close. The done flags are claimed by tradeAccept
+// under stateMu before this runs (single-flight); they are NOT set here so
+// the check-and-set stays under one lock.
 func tradeExchange(d Deps, me Conn, t *Trade, peer Conn, other *Trade) {
-	t.done = true
-	other.done = true
-
 	// Space check (accept() diff logic): positive diff = we offer more.
 	mySlots := emptySlots(d, me.PlayerName())
 	peerSlots := emptySlots(d, peer.PlayerName())
@@ -805,13 +828,16 @@ func ClampStackedOffer(current, add, max int) int {
 }
 
 // ClampCraftCount ports the crafting actualCount clamp: requested count
-// reduced per requirement to what the inventory covers. Later requirements
-// overwrite earlier ones (crafting.ts order parity, not a min).
+// reduced per requirement to what the inventory covers, taking the minimum
+// across requirements (a later requirement with looser supply must not
+// overwrite an earlier tighter one back up past what it covers).
 func ClampCraftCount(count int, reqs []CraftRequirement, have func(key string) int) int {
 	actual := count
 	for _, r := range reqs {
 		if r.Count*count > have(r.Key) {
-			actual = have(r.Key) / r.Count
+			if v := have(r.Key) / r.Count; v < actual {
+				actual = v
+			}
 		}
 	}
 	return actual
@@ -1059,13 +1085,26 @@ func enchantConfirm(d Deps, c Conn, index, shardIndex int) {
 	}
 	tier := 1
 	fmt.Sscanf(shardKey, "shardt%d", &tier)
+	if tier < 1 {
+		tier = 1 // packet-built shards (shardt0/bare shardt) must not reach Intn(0)
+	}
 	chance := EnchantChance(tier)
 
-	// Remove one shard (inventory.remove(shardIndex, 1)).
+	// Remove one shard (inventory.remove(shardIndex, 1)). Same-index
+	// use is safe: index==shardIndex always exits through the NO_SHARD
+	// / NO_ITEM_SELECTED / unknown-type returns above, so the removal
+	// below never eats the item being enchanted.
 	RemoveItemAt(c, c.PlayerName(), shardIndex, 1, d)
+	// The dense inventory compacts on removal: an item after the shard
+	// shifts down one, so re-target it (TS slots are fixed, no shift).
+	if shardIndex < index {
+		index--
+	}
 
 	if !chance {
 		notifyTrade(d, c, "enchant:FAILED_ENCHANT")
+		d.Store.MarkDirty(c.PlayerName())
+		return
 	}
 	// Random enchantment + level 1..tier (Utils.randomInt(1, tier)).
 	enchantment := enchantments[rand.Intn(len(enchantments))]

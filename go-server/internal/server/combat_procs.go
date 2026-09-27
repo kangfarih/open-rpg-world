@@ -27,10 +27,13 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"sync"
 	"time"
 
 	"rpg-world-server/internal/abilities"
+	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/meta"
 	worldcore "rpg-world-server/internal/world"
 )
 
@@ -47,10 +50,29 @@ const (
 
 // Effects IDs (modules.ts Effects enum) for the regen gates + stun apply.
 const (
-	fxTerror   = 2
-	fxStun     = 4
-	fxBurning  = 16
-	fxFreezing = 17
+	fxTerror       = 2
+	fxTerrorStatus = 3
+	fxStun         = 4
+	fxRunning      = 10
+	fxHotSauce     = 11
+	fxDualistsMark = 12
+	fxThickSkin    = 13 // abilities EffectThickSkin (abilities.go EffectKind)
+	fxSnowPotion   = 14
+	fxFirePotion   = 15
+	fxBurning      = 16
+	fxFreezing     = 17
+	fxInvincible   = 18
+)
+
+// Buff/debuff effect IDs (modules.ts Effects enum) for combat formula
+// multipliers (formulas.ts getMaxDamage / getDamage accuracy adjustments).
+const (
+	fxAccuracyBuff     = controller.EffectAccuracyBuff     // 19
+	fxStrengthBuff     = controller.EffectStrengthBuff     // 20
+	fxDefenseBuff      = controller.EffectDefenseBuff      // 21
+	fxAccuracySuperBuf = controller.EffectAccuracySuperBuf // 24
+	fxStrengthSuperBuf = controller.EffectStrengthSuperBuf // 25
+	fxDefenseSuperBuf  = controller.EffectDefenseSuperBuf  // 26
 )
 
 const (
@@ -65,7 +87,36 @@ const (
 // combatRand is the proc-roll source (TS Utils.randomInt parity: inclusive
 // bounds — randomInt(min,max) = min+floor(rand*(max-min+1))). Tests pass
 // seeded sources; live rolls use this one.
-var combatRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+//
+// Shared across conn goroutines and combat tick goroutines: math/rand.Rand
+// is not safe for concurrent use, so every live roll goes through
+// combatRandMu (see lockedHeroDamageType/lockedBloodsuckRoll/lockedThornsRoll
+// below). Pure helpers keep their *rand.Rand param for deterministic tests.
+var (
+	combatRand   = rand.New(rand.NewSource(time.Now().UnixNano()))
+	combatRandMu sync.Mutex
+)
+
+// lockedHeroDamageType rolls the hero damage type under the shared-rand lock.
+func lockedHeroDamageType(username string) (hitType, aoe int) {
+	combatRandMu.Lock()
+	defer combatRandMu.Unlock()
+	return heroDamageType(username, combatRand)
+}
+
+// lockedBloodsuckRoll rolls the bloodsucking proc under the shared-rand lock.
+func lockedBloodsuckRoll() bool {
+	combatRandMu.Lock()
+	defer combatRandMu.Unlock()
+	return bloodsuckRoll(combatRand)
+}
+
+// lockedThornsRoll rolls the thorns proc under the shared-rand lock.
+func lockedThornsRoll() bool {
+	combatRandMu.Lock()
+	defer combatRandMu.Unlock()
+	return thornsRoll(combatRand)
+}
 
 // effectChance ports Formulas.getEffectChance (formulas.ts:397):
 // randomInt(0,100)<5, i.e. a 5% roll.
@@ -94,13 +145,13 @@ func enchLevel(ench Enchantments, id int) int {
 }
 
 // heroEquipSlot snapshots one equipment slot (lock-brief; returns zero on
-// missing/short rows — m5StateFor normalizes the 12-slot array).
-func heroEquipSlot(username string, slot int) m5Slot {
-	st := m5StateFor(username)
+// missing/short rows — playerStateFor normalizes the 12-slot array).
+func heroEquipSlot(username string, slot int) slotDef {
+	st := playerStateFor(username)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	if slot < 0 || slot >= len(st.Equip) {
-		return m5Slot{}
+		return slotDef{}
 	}
 	return st.Equip[slot]
 }
@@ -113,7 +164,7 @@ func heroIsArcher(username string) bool {
 	if w.Key == "" {
 		return false
 	}
-	it := m6ItemInfoFor(w.Key)
+	it := itemInfoFor(w.Key)
 	return it != nil && it.Type == "weaponarcher"
 }
 
@@ -124,7 +175,7 @@ func heroIsMagic(username string) bool {
 	if w.Key == "" {
 		return false
 	}
-	it := m6ItemInfoFor(w.Key)
+	it := itemInfoFor(w.Key)
 	return it != nil && it.Type == "weaponmagic"
 }
 
@@ -144,7 +195,7 @@ func heroManaCost(username string) int {
 	if w.Key == "" {
 		return 0
 	}
-	if it := m6ItemInfoFor(w.Key); it != nil {
+	if it := itemInfoFor(w.Key); it != nil {
 		return it.ManaCost
 	}
 	return 0
@@ -185,7 +236,7 @@ func heroDamageType(username string, r *rand.Rand) (hitType, aoe int) {
 	if heroIsArcher(username) {
 		arrows := heroEquipSlot(username, EquipmentArrows)
 		if arrows.Key != "" {
-			if it := m6ItemInfoFor(arrows.Key); it != nil {
+			if it := itemInfoFor(arrows.Key); it != nil {
 				if it.Freezing && effectChance(r) {
 					return HitsFreezing, 0
 				}
@@ -245,7 +296,7 @@ func heroMagicGate(c *playerConn) bool {
 	cost := heroManaCost(c.Username)
 	if abilities.ManaFor(c.Instance) < cost {
 		if !abilities.ManaWarningShown(c.Instance) {
-			m6Notify(c, "misc:LOW_MANA")
+			notifyPlayer(c, "misc:LOW_MANA")
 			abilities.SetManaWarning(c.Instance, true)
 		}
 		log.Printf("m5: %s staff swing refused (low mana)", c.Instance)
@@ -256,12 +307,312 @@ func heroMagicGate(c *playerConn) bool {
 	return true
 }
 
+// heroTotalBonuses sums the equipment bonuses across all 12 equipped slots
+// (TS equipments.ts calculateStats totalBonuses aggregation parity).
+func heroTotalBonuses(username string) controller.ItemBonuses {
+	var b controller.ItemBonuses
+	for slot := 0; slot < ModulesEquipmentCount; slot++ {
+		eq := heroEquipSlot(username, slot)
+		if eq.Key == "" {
+			continue
+		}
+		if it := itemInfoFor(eq.Key); it != nil {
+			b.Accuracy += it.Bonuses.Accuracy
+			b.Strength += it.Bonuses.Strength
+			b.Archery += it.Bonuses.Archery
+			b.Magic += it.Bonuses.Magic
+		}
+	}
+	return b
+}
+
+// heroDamageBonus ports player.ts getDamageBonus: returns the equipment bonus
+// matching the hero's attack type (magic→magic bonus, archer→archery bonus,
+// melee→strength bonus).
+func heroDamageBonus(username string) int {
+	b := heroTotalBonuses(username)
+	if heroIsMagic(username) {
+		return b.Magic
+	}
+	if heroIsArcher(username) {
+		return b.Archery
+	}
+	return b.Strength
+}
+
+// heroSkillDamageLevel ports player.ts getSkillDamageLevel: returns the
+// hero's skill level for the matching attack school.
+func heroSkillDamageLevel(username string) int {
+	st := playerStateFor(username)
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	var skillID int
+	switch {
+	case heroIsMagicU(username, st):
+		skillID = SkillMagic
+	case heroIsArcherU(username, st):
+		skillID = SkillArchery
+	default:
+		skillID = SkillStrength
+	}
+	if s, ok := st.Skills[skillID]; ok {
+		return s.Level
+	}
+	return 1
+}
+
+// heroIsArcherU / heroIsMagicU are unlocked variants that take a pre-loaded
+// playerState to avoid double-locking when the caller already holds pstateMu.
+func heroIsArcherU(username string, st *playerState) bool {
+	if len(st.Equip) <= EquipmentWeapon {
+		return false
+	}
+	w := st.Equip[EquipmentWeapon]
+	if w.Key == "" {
+		return false
+	}
+	it := itemInfoFor(w.Key)
+	return it != nil && it.Type == "weaponarcher"
+}
+
+func heroIsMagicU(username string, st *playerState) bool {
+	if len(st.Equip) <= EquipmentWeapon {
+		return false
+	}
+	w := st.Equip[EquipmentWeapon]
+	if w.Key == "" {
+		return false
+	}
+	it := itemInfoFor(w.Key)
+	return it != nil && it.Type == "weaponmagic"
+}
+
+// heroStrengthBuffMult returns the strength buff damage multiplier
+// (formulas.ts:191-194): 1.1 for StrengthBuff, 1.15 for StrengthSuperBuff,
+// multiplicative when both are present.
+func heroStrengthBuffMult(instance string) float64 {
+	mult := 1.0
+	if abilities.HasStatusEffect(instance, fxStrengthBuff) {
+		mult *= 1.1
+	}
+	if abilities.HasStatusEffect(instance, fxStrengthSuperBuf) {
+		mult *= 1.15
+	}
+	return mult
+}
+
+// heroAccuracyBuffAdj returns the accuracy adjustment from active buffs and
+// debuffs (formulas.ts:124-135). Negative = better accuracy (skews damage
+// toward max), positive = worse.
+func heroAccuracyBuffAdj(attackerInst, targetInst string) float64 {
+	adj := 0.0
+	// Attacker buffs (lower accuracy weight = better).
+	if abilities.HasStatusEffect(attackerInst, fxAccuracyBuff) {
+		adj -= 0.07
+	}
+	if abilities.HasStatusEffect(attackerInst, fxAccuracySuperBuf) {
+		adj -= 0.12
+	}
+	// Attacker terror (worse accuracy).
+	if abilities.HasStatusEffect(attackerInst, fxTerror) {
+		adj += 1.0
+	}
+	// Target buffs/debuffs (higher accuracy weight = worse for attacker).
+	if targetInst != "" {
+		if abilities.HasStatusEffect(targetInst, fxDefenseBuff) {
+			adj += 0.08
+		}
+		if abilities.HasStatusEffect(targetInst, fxDefenseSuperBuf) {
+			adj += 0.12
+		}
+		if abilities.HasStatusEffect(targetInst, fxTerror) {
+			adj -= 0.4
+		}
+	}
+	return adj
+}
+
+// heroTotalAttackStats sums the per-item AttackStats across all 12 equipped
+// slots (formulas.ts getAccuracyWeight attacker stats aggregation via
+// character.ts equipment stats).
+func heroTotalAttackStats(username string) controller.ItemAttackStats {
+	var s controller.ItemAttackStats
+	for slot := 0; slot < ModulesEquipmentCount; slot++ {
+		eq := heroEquipSlot(username, slot)
+		if eq.Key == "" {
+			continue
+		}
+		if it := itemInfoFor(eq.Key); it != nil {
+			s.Crush += it.AttackStats.Crush
+			s.Slash += it.AttackStats.Slash
+			s.Stab += it.AttackStats.Stab
+			s.Archery += it.AttackStats.Archery
+			s.Magic += it.AttackStats.Magic
+		}
+	}
+	return s
+}
+
+// heroTotalDefenseStats sums the per-item DefenseStats across all 12 equipped
+// slots (formulas.ts getAccuracyWeight target defense stats).
+func heroTotalDefenseStats(username string) controller.ItemDefenseStats {
+	var s controller.ItemDefenseStats
+	for slot := 0; slot < ModulesEquipmentCount; slot++ {
+		eq := heroEquipSlot(username, slot)
+		if eq.Key == "" {
+			continue
+		}
+		if it := itemInfoFor(eq.Key); it != nil {
+			s.Crush += it.DefenseStats.Crush
+			s.Slash += it.DefenseStats.Slash
+			s.Stab += it.DefenseStats.Stab
+			s.Archery += it.DefenseStats.Archery
+			s.Magic += it.DefenseStats.Magic
+		}
+	}
+	return s
+}
+
+// heroDefenseSkillLevel returns the hero's defense skill level (0 → 1,
+// matching the Node default for unknown players).
+func heroDefenseSkillLevel(username string) int {
+	st := playerStateFor(username)
+	if st == nil {
+		return 1
+	}
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	if sk, ok := st.Skills[SkillDefense]; ok && sk.Level > 0 {
+		return sk.Level
+	}
+	return 1
+}
+
+// heroDamageReduction computes the multiplicative damage reduction factor
+// (formulas.ts getDamageReduction): ThickSkin ability × attack-style
+// reduction. Returns a multiplier in (0, 1]; lower = more protection.
+//   - ThickSkin: ×0.80 (ability Power -0.2)
+//   - Defensive style: ×0.90
+//   - Shared style: ×0.96
+func heroDamageReduction(username, instance string) float64 {
+	mult := 1.0
+	if abilities.HasStatusEffect(instance, fxThickSkin) {
+		mult *= 0.80
+	}
+	style := controller.AttackStyleFor(econDeps(), username)
+	switch style {
+	case controller.AttackStyleDefensive:
+		mult *= 0.90
+	case controller.AttackStyleShared:
+		mult *= 0.96
+	}
+	return mult
+}
+
+// heroCombatMaxDamage ports formulas.ts getMaxDamage for the hero:
+// (damageBonus + damageLevel) * 1.25, +5 player bonus, *attack-style mult,
+// *strength-buff mult, floored at 0.
+func heroCombatMaxDamage(username, instance string, critical bool) float64 {
+	bonus := heroDamageBonus(username)
+	level := heroSkillDamageLevel(username)
+	styleInt := controller.AttackStyleFor(econDeps(), username)
+	var styleName string
+	switch styleInt {
+	case controller.AttackStyleSlash:
+		styleName = "slash"
+	case controller.AttackStyleCrush:
+		styleName = "crush"
+	case controller.AttackStyleShared:
+		styleName = "shared"
+	}
+	dmg := meta.MaxDamageFloat(bonus, level, styleName, critical)
+	dmg *= heroStrengthBuffMult(instance)
+	if dmg < 0 {
+		dmg = 0
+	}
+	return dmg
+}
+
+// heroCombatAccuracy ports formulas.ts getDamage accuracy computation for
+// the hero: MAX_ACCURACY + equipment bonus term + skill level term +
+// target defense term + stat-weight term, +/- buff adjustments, crit adj,
+// clamped to [MinAccuracy, ClampAccuracy].
+// Note: hero→mob path uses zero defense stats for the target (mobs lack
+// per-style defense stats in the player sense); triangle advantage for
+// mob→hero attacks is applied in entity.RollMobDamage via PlayerView
+// defense stats.
+func heroCombatAccuracy(username, instance, targetInst string, critical bool) float64 {
+	bonuses := heroTotalBonuses(username)
+	level := heroSkillDamageLevel(username)
+	archer := heroIsArcher(username)
+	magic := heroIsMagic(username)
+	weight := meta.AccuracyWeight(archer, magic, 0, 0, 0, 0, 0)
+	acc := meta.Accuracy(meta.MaxAccuracy, meta.MaxLevel, bonuses.Accuracy, level, 1, weight, critical)
+	// Apply buff/debuff adjustments.
+	acc += heroAccuracyBuffAdj(instance, targetInst)
+	if acc < meta.MinAccuracy {
+		acc = meta.MinAccuracy
+	}
+	if acc > meta.ClampAccuracy {
+		acc = meta.ClampAccuracy
+	}
+	return acc
+}
+
+// heroDamageRoll computes the final hero damage using the TS-accurate formula:
+// accuracy-weighted random roll on [0, maxDamage]. Returns the damage value.
+func heroDamageRoll(username, instance, targetInst string, r *rand.Rand) int {
+	critRoll := r.Float64()
+	critical := meta.RollCrit(critRoll)
+	maxDmg := heroCombatMaxDamage(username, instance, critical)
+	acc := heroCombatAccuracy(username, instance, targetInst, critical)
+	roll := r.Float64()
+	return meta.RollDamage(maxDmg, acc, roll, -1) // -1 = skip HP clamp (caller handles)
+}
+
+// heroPoisonChance ports formulas.ts getPoisonChance + character.ts:279:
+// the target's poison resistance is randomInt(0, 235-level), compared against
+// the attacker's fixed POISON_CHANCE (15). Returns true if the target is
+// poisoned (target roll < attacker chance).
+func heroPoisonChance(targetLevel int) bool {
+	combatRandMu.Lock()
+	defer combatRandMu.Unlock()
+	resistance := combatRand.Intn(235 - targetLevel + 1) // randomInt(0, 235-level) inclusive
+	return resistance < 15                                // Modules.Defaults.POISON_CHANCE
+}
+
+// heroDecrementArrows ports equipments.ts decrementArrows: removes one arrow
+// from the equipped arrow slot, clearing the slot when count reaches 0.
+func heroDecrementArrows(username string) {
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	st, ok := pstates[username]
+	if !ok || len(st.Equip) <= EquipmentArrows {
+		return
+	}
+	a := &st.Equip[EquipmentArrows]
+	if a.Count <= 0 {
+		return
+	}
+	a.Count--
+	if a.Count < 1 {
+		a.Key = ""
+		a.Ench = nil
+	}
+}
+
 // applyHitStatus ports combat.ts:198 (sendAttack: hit, then
 // target.addStatusEffect(hit)) for status-carrying hero hit types — Stun,
 // Freezing, Burning via the existing status pipeline (Effect Add frame +
 // tracker entry). Normal/Critical/Explosive carry no status (character.ts
 // addStatusEffect returns early on Normal; Terror is mob-side only). Skips
 // dead victims (TS death clears status).
+//
+// Potion immunity (TS character.ts addStatusEffect): Freezing is blocked by
+// SnowPotion, Burning is blocked by FirePotion. The potion application
+// (useSnowPotion/useFirePotion in controller/items.go) already removes the
+// corresponding DoT; this guard prevents re-application while the potion
+// is active.
 func applyHitStatus(target string, hitType int) {
 	if target == "" {
 		return
@@ -272,8 +623,22 @@ func applyHitStatus(target string, hitType int) {
 	case HitsStun:
 		effect, duration = fxStun, stunDurationMs
 	case HitsFreezing:
+		// SnowPotion blocks Freezing (TS addStatusEffect immunity check).
+		if abilities.HasStatusEffect(target, fxSnowPotion) {
+			return
+		}
+		// Permanent (area) Freezing guard (TS hasPermanentFreezing):
+		// when the player is already standing in a freeze area, timed
+		// Freezing from combat is suppressed (the area DoT covers it).
+		if abilities.HasFreeze(target) {
+			return
+		}
 		effect, duration = fxFreezing, dotStatusDurationMs
 	case HitsBurning:
+		// FirePotion blocks Burning (TS addStatusEffect immunity check).
+		if abilities.HasStatusEffect(target, fxFirePotion) {
+			return
+		}
 		effect, duration = fxBurning, dotStatusDurationMs
 	default:
 		return
@@ -287,7 +652,7 @@ func applyHitStatus(target string, hitType int) {
 // through the full damage pipeline (Combat Hit frame + HitMob Points/death/
 // loot). The primary victim is excluded (already struck). PvP filtering has
 // no stub counterpart (hero swings never target heroes), so only mobs splash.
-func explosiveSplash(victim *m9Mob, attacker *playerConn, dmg int) {
+func explosiveSplash(victim *mob, attacker *playerConn, dmg int) {
 	if victim == nil || dmg < 1 {
 		return
 	}
@@ -298,13 +663,13 @@ func explosiveSplash(victim *m9Mob, attacker *playerConn, dmg int) {
 	if attacker != nil {
 		av = &entity.PlayerView{Instance: attacker.Instance, Username: attacker.Username}
 	}
-	m9Mu.Lock()
+	mobMu.Lock()
 	type splash struct {
-		m   *m9Mob
+		m   *mob
 		dmg int
 	}
 	var hits []splash
-	for _, m := range m9Mobs {
+	for _, m := range mobs {
 		if m == victim {
 			continue
 		}
@@ -324,7 +689,7 @@ func explosiveSplash(victim *m9Mob, attacker *playerConn, dmg int) {
 		}
 		hits = append(hits, splash{m: m, dmg: sec})
 	}
-	m9Mu.Unlock()
+	mobMu.Unlock()
 	attackerInst := ""
 	if attacker != nil {
 		attackerInst = attacker.Instance
@@ -365,11 +730,12 @@ func regenEligible(dead, poisoned, inCombat, full, freezing, burning, terror boo
 
 // heroRegenEligible evaluates the regen gates for one live hero instance.
 func heroRegenEligible(instance string, hp int) bool {
+	maxHP := gameWorld.HeroMaxHP(instance)
 	return regenEligible(
 		hp <= 0,
 		abilities.HasPoison(instance),
-		m6vitals{}.InCombat(instance),
-		hp >= entity.HeroMaxHP,
+		econVitals{}.InCombat(instance),
+		hp >= maxHP,
 		abilities.HasStatusEffect(instance, fxFreezing) || abilities.HasFreeze(instance),
 		abilities.HasStatusEffect(instance, fxBurning),
 		abilities.HasStatusEffect(instance, fxTerror),
@@ -379,7 +745,7 @@ func heroRegenEligible(instance string, hp int) bool {
 // runRegenSweep heals every eligible hero and engine mob by +1 HP
 // (character.ts:312 heal(amount=1) → hitPoints.increment(1)) reusing the
 // existing Points sync paths (hero HeroPoints seam, mob MobPoints path).
-// Lock order m9Mu -> m.mu (m9Tick parity); tracker/registry calls are leaf
+// Lock order mobMu -> m.mu (mobTick parity); tracker/registry calls are leaf
 // (their own mutexes, never reversed).
 func runRegenSweep() {
 	for _, c := range worldcore.AllOf[*playerConn]() {
@@ -388,11 +754,11 @@ func runRegenSweep() {
 			continue
 		}
 		gameWorld.SetHeroHP(c.Instance, hp+1)
-		gameWorld.HeroPoints(c.Instance, hp+1, entity.HeroMaxHP)
+		gameWorld.HeroPoints(c.Instance, hp+1, gameWorld.HeroMaxHP(c.Instance))
 	}
-	m9Mu.Lock()
-	defer m9Mu.Unlock()
-	for _, m := range m9Mobs {
+	mobMu.Lock()
+	defer mobMu.Unlock()
+	for _, m := range mobs {
 		m.mu.Lock()
 		if m.dead {
 			m.mu.Unlock()

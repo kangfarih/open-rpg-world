@@ -20,14 +20,14 @@ func loiterForget(t *testing.T, users ...string) {
 		}
 		pstateMu.Unlock()
 		for _, u := range users {
-			m11ForgetSession(u)
+			forgetQuestSession(u)
 		}
 	})
 }
 
 // loiterXP reads the hero's Loitering XP (0 when the skill row is absent).
 func loiterXP(user string) int {
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	if s := st.Skills[player.SkillLoitering]; s != nil {
@@ -43,11 +43,11 @@ func loiterXP(user string) int {
 // only reads def presence + stage, both covered here.
 func loiterEnsureTutorialDef(t *testing.T) {
 	t.Helper()
-	if _, ok := m11Q["tutorial"]; ok {
+	if _, ok := questDefs["tutorial"]; ok {
 		return
 	}
-	m11Q["tutorial"] = &quest.Quest{Key: "tutorial", StageCount: 3}
-	t.Cleanup(func() { delete(m11Q, "tutorial") })
+	questDefs["tutorial"] = &quest.Quest{Key: "tutorial", StageCount: 3}
+	t.Cleanup(func() { delete(questDefs, "tutorial") })
 }
 
 // loiterFinishTutorial marks the tutorial quest finished for user (the same
@@ -55,7 +55,7 @@ func loiterEnsureTutorialDef(t *testing.T) {
 func loiterFinishTutorial(t *testing.T, user string) {
 	t.Helper()
 	loiterEnsureTutorialDef(t)
-	m11StateFor(user).Quest("tutorial").Stage = m11Q["tutorial"].StageCount
+	questStateFor(user).Quest("tutorial").Stage = questDefs["tutorial"].StageCount
 	if !loiterTutorialFinished(user) {
 		t.Fatal("tutorial not finished after setting final stage")
 	}
@@ -185,7 +185,7 @@ func loiterSkillFrames(t *testing.T, c *playerConn) (expSkill, skillUpdate bool)
 }
 
 // TestLoiterAwardMathAndFrames: idle 90s+ post-tutorial -> the sweep awards
-// level*5 Loitering XP (player.ts:559) through m5AddXP, with the Experience
+// level*5 Loitering XP (player.ts:559) through addXP, with the Experience
 // Skill + Skill Update frames on skill 17 (the corrected const, not
 // alchemy's 18). Covers level 1 and a pre-seeded higher level.
 func TestLoiterAwardMathAndFrames(t *testing.T) {
@@ -210,7 +210,7 @@ func TestLoiterAwardMathAndFrames(t *testing.T) {
 	}
 
 	// Pre-seed a higher level: the next award is the NEW level * 5.
-	m5AddXP(nil, user, player.SkillLoitering, 1000)
+	addXP(nil, user, player.SkillLoitering, 1000)
 	drainOutbox(c)
 	level2 := loiterLevel(user)
 	if level2 <= 1 {

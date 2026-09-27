@@ -165,7 +165,30 @@ const (
 func Enabled() bool { return os.Getenv(EnvHubAddr) != "" }
 
 // SharedToken returns the HUB_TOKEN secret ("" allows all — dev default).
+//
+// Auth posture (fail-closed for multi-server roles, open for all-in-one):
+//   - all-in-one (default, no HUB_ADDR): the hub transport never runs and
+//     an empty token is the documented dev default (everything local).
+//   - router/shard roles: an empty HUB_TOKEN is a misconfiguration —
+//     see TokenRequiredForRole. The hub Server itself stays permissive
+//     when constructed with "" (so unit tests and the all-in-one path
+//     keep working); the app driver (ROLE=router) refuses to serve
+//     without a token, and shard operators must set one (documented;
+//     the shard dial carries it as bearer + handshake accessToken).
 func SharedToken() string { return os.Getenv(EnvHubToken) }
+
+// TokenRequiredForRole reports whether role must authenticate to the hub.
+// Router and shard roles are fail-closed (require HUB_TOKEN); every other
+// role — including the all-in-one dev default — stays open. Case-insensitive;
+// unknown/empty roles are treated as all-in-one (open).
+func TokenRequiredForRole(role string) bool {
+	switch strings.ToLower(strings.TrimSpace(role)) {
+	case "router", "shard":
+		return true
+	default:
+		return false
+	}
+}
 
 // ShardName returns the SHARD_NAME identity (default "shard").
 func ShardName() string {
@@ -455,31 +478,131 @@ type MailStore interface {
 
 // MemoryMail is the default in-memory MailStore (exact-match usernames,
 // like Router; the caller normalizes case at the boundary).
+//
+// Per-recipient cap + TTL (data-loss and unbounded-growth guard): each
+// recipient holds at most MaxMailPerRecipient entries (Store drops the
+// oldest when full) and entries older than MailTTL are expired on Take
+// (and opportunistically on Store). Both bounds are documented tunables;
+// use SetLimitsForTests to inject a clock/cap in unit tests.
 type MemoryMail struct {
 	mu  sync.Mutex
-	box map[string][]Message
+	box map[string][]mailEntry
+	// maxPerRecipient caps one recipient's queue (<=0 = DefaultMaxMailPerRecipient).
+	maxPerRecipient int
+	// ttl bounds entry age (<=0 = DefaultMailTTL).
+	ttl time.Duration
+	// now supplies the clock (nil = time.Now; tests inject a fake).
+	now func() time.Time
 }
 
-// NewMemoryMail returns an empty MemoryMail.
-func NewMemoryMail() *MemoryMail { return &MemoryMail{box: make(map[string][]Message)} }
+// Default bounds for MemoryMail.
+const (
+	// DefaultMaxMailPerRecipient caps one recipient's offline queue; the
+	// oldest entry is dropped when a Store would exceed it.
+	DefaultMaxMailPerRecipient = 50
+	// DefaultMailTTL bounds offline-mail age; Take expires older entries.
+	DefaultMailTTL = 24 * time.Hour
+)
 
-// Store queues m for m.To.
+// mailEntry is one queued message plus its arrival time (TTL basis).
+type mailEntry struct {
+	msg Message
+	at  time.Time
+}
+
+// NewMemoryMail returns an empty MemoryMail with default bounds.
+func NewMemoryMail() *MemoryMail {
+	return &MemoryMail{box: make(map[string][]mailEntry)}
+}
+
+// mailNow returns the clock (time.Now when unset).
+func (m *MemoryMail) mailNow() time.Time {
+	if m != nil && m.now != nil {
+		return m.now()
+	}
+	return time.Now()
+}
+
+// mailCap returns the effective per-recipient cap.
+func (m *MemoryMail) mailCap() int {
+	if m != nil && m.maxPerRecipient > 0 {
+		return m.maxPerRecipient
+	}
+	return DefaultMaxMailPerRecipient
+}
+
+// mailTTL returns the effective TTL.
+func (m *MemoryMail) mailTTL() time.Duration {
+	if m != nil && m.ttl > 0 {
+		return m.ttl
+	}
+	return DefaultMailTTL
+}
+
+// SetLimitsForTests injects cap/ttl/clock for unit tests (nil clock =
+// time.Now). Not for production use.
+func (m *MemoryMail) SetLimitsForTests(cap int, ttl time.Duration, now func() time.Time) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.maxPerRecipient = cap
+	m.ttl = ttl
+	m.now = now
+}
+
+// Store queues m for m.To, expiring TTL-old entries for the recipient
+// first, then dropping the oldest when the queue would exceed the
+// per-recipient cap.
 func (m *MemoryMail) Store(msg Message) error {
 	if msg.To == "" {
 		return ErrNoRecipient
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.box[msg.To] = append(m.box[msg.To], msg)
+	now := m.mailNow()
+	ttl := m.mailTTL()
+	cap := m.mailCap()
+	q := m.box[msg.To]
+	if ttl > 0 {
+		kept := q[:0]
+		for _, e := range q {
+			if now.Sub(e.at) < ttl {
+				kept = append(kept, e)
+			}
+		}
+		q = kept
+	}
+	q = append(q, mailEntry{msg: msg, at: now})
+	for len(q) > cap && cap > 0 {
+		q = q[len(q)-cap:]
+	}
+	m.box[msg.To] = q
 	return nil
 }
 
-// Take pops all queued mail for username (nil when empty).
+// Take pops all queued, non-expired mail for username (nil when empty).
 func (m *MemoryMail) Take(username string) ([]Message, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := m.box[username]
+	q := m.box[username]
 	delete(m.box, username)
+	if len(q) == 0 {
+		return nil, nil
+	}
+	ttl := m.mailTTL()
+	now := m.mailNow()
+	out := make([]Message, 0, len(q))
+	for _, e := range q {
+		if ttl > 0 && now.Sub(e.at) >= ttl {
+			continue
+		}
+		out = append(out, e.msg)
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
 	return out, nil
 }
 
@@ -496,8 +619,13 @@ const sqliteMailSchema = `CREATE TABLE IF NOT EXISTS hub_mail(
 CREATE INDEX IF NOT EXISTS idx_hub_mail_recipient ON hub_mail(recipient, id);`
 
 // SQLiteMail is a file-backed MailStore (same exact-match semantics as
-// MemoryMail). Open with OpenSQLiteMail; Close releases the handle.
+// MemoryMail). Open with OpenSQLiteMail; Close releases the handle. All
+// methods hold an internal mutex and Take runs in a single transaction so
+// concurrent Store/Take callers cannot interleave a SELECT with a DELETE
+// (the pre-fix Take raced: two takers could both SELECT the same rows
+// before either DELETEd them).
 type SQLiteMail struct {
+	mu sync.Mutex
 	db *sql.DB
 }
 
@@ -517,17 +645,29 @@ func OpenSQLiteMail(path string) (*SQLiteMail, error) {
 }
 
 // Close releases the database handle.
-func (s *SQLiteMail) Close() error { return s.db.Close() }
+func (s *SQLiteMail) Close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.db.Close()
+}
 
 // Store queues m for m.To with its payload JSON-encoded.
 func (s *SQLiteMail) Store(m Message) error {
 	if m.To == "" {
 		return ErrNoRecipient
 	}
+	if s == nil || s.db == nil {
+		return errors.New("hub: nil mail db")
+	}
 	raw, err := json.Marshal(m.Payload)
 	if err != nil {
 		return err
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	_, err = s.db.Exec(
 		`INSERT INTO hub_mail(recipient, sender, kind, payload, created_at) VALUES(?,?,?,?,?)`,
 		m.To, m.From, string(m.Kind), string(raw), time.Now().Unix(),
@@ -535,9 +675,26 @@ func (s *SQLiteMail) Store(m Message) error {
 	return err
 }
 
-// Take pops all queued mail for username in FIFO order.
+// Take pops all queued mail for username in FIFO order atomically: one
+// BEGIN IMMEDIATE transaction covers the SELECT and the DELETE, so two
+// concurrent Takers cannot both observe the same rows.
 func (s *SQLiteMail) Take(username string) ([]Message, error) {
-	rows, err := s.db.Query(
+	if s == nil || s.db == nil {
+		return nil, errors.New("hub: nil mail db")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	rows, err := tx.Query(
 		`SELECT id, sender, kind, payload FROM hub_mail WHERE recipient=? ORDER BY id`, username)
 	if err != nil {
 		return nil, err
@@ -564,10 +721,14 @@ func (s *SQLiteMail) Take(username string) ([]Message, error) {
 		return nil, err
 	}
 	for _, id := range ids {
-		if _, err := s.db.Exec(`DELETE FROM hub_mail WHERE id=?`, id); err != nil {
+		if _, err := tx.Exec(`DELETE FROM hub_mail WHERE id=?`, id); err != nil {
 			return nil, err
 		}
 	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	committed = true
 	return out, nil
 }
 
@@ -646,6 +807,9 @@ type ShardInfo struct {
 	Version string
 	// Regions is the shard's reported scope (nil = unscoped).
 	Regions []int
+	// FirstSeen is the registration order (build newness basis for
+	// newestRunningLocked and PreviousRunning tie-breaks).
+	FirstSeen time.Time
 }
 
 // effectiveState normalizes "" (pre-R1 shard) to RUNNING.
@@ -693,6 +857,20 @@ func NewServer(token string, mail *Mailer) *Server {
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
 	}
+}
+
+// SetNowForTests injects the clock used for firstSeen/lastBeat (tests
+// outside this package). A nil fn restores time.Now.
+func (s *Server) SetNowForTests(fn func() time.Time) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if fn == nil {
+		fn = time.Now
+	}
+	s.now = fn
 }
 
 // checkAuth verifies a registration: when the server token is set, either
@@ -751,9 +929,11 @@ func (s *Server) Register(hs HubHandshake) error {
 		}
 		s.shards[hs.Name] = e
 	} else if (hs.BuildID != "" && hs.BuildID != e.buildID) ||
+		(hs.GVer != "" && hs.GVer != e.gVer) ||
 		(hs.Version != "" && hs.Version != e.version) {
 		// Same-name redeploy of a new build: it is newer than everything
-		// registered before it.
+		// registered before it (buildID, wire GVer, or explicit version
+		// change all count as new).
 		e.firstSeen = now
 	}
 	e.players = make(map[string]struct{}, len(hs.Players))
@@ -1014,10 +1194,11 @@ func (s *Server) CheckHandoff(from, to string) error {
 	return nil
 }
 
-// ListShards snapshots every registered shard newest-first (same order as
-// NewestRunning), flagging the login target: every RUNNING shard of the
-// preferred version. Transport-free; backs the router GET /servers
-// server-list.
+// ListShards snapshots every registered shard grouped by version newness
+// (newest version first, same order as NewestRunning), flagging the login
+// target: every RUNNING shard of the preferred version. Within a version
+// shards sort newest-first by (firstSeen desc, name asc). Transport-free;
+// backs the router GET /servers server-list.
 func (s *Server) ListShards() []ShardInfo {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1027,22 +1208,43 @@ func (s *Server) ListShards() []ShardInfo {
 	if hasPref {
 		prefVer = best.version
 	}
+	// Version newness: latest firstSeen among each version's RUNNING
+	// shards (same basis as newestRunningLocked), so shards group by
+	// version even when an old-version shard registers last.
+	newness := map[string]time.Time{}
+	for _, e := range s.shards {
+		if effectiveState(e.state) != version.StateRunning {
+			continue
+		}
+		if t, ok := newness[e.version]; !ok || e.firstSeen.After(t) {
+			newness[e.version] = e.firstSeen
+		}
+	}
 	out := make([]ShardInfo, 0, len(s.shards))
 	for _, e := range s.shards {
 		out = append(out, s.infoLocked(e, hasPref &&
 			effectiveState(e.state) == version.StateRunning && e.version == prefVer))
 	}
-	// Newest-first by (firstSeen desc, name asc). firstSeen is not on the
-	// snapshot, so sort via the entries under the same lock.
 	sort.Slice(out, func(i, j int) bool {
-		ei, ej := s.shards[out[i].Name], s.shards[out[j].Name]
-		if ei == nil || ej == nil {
-			return out[i].Name < out[j].Name
+		ni, nj := newness[out[i].Version], newness[out[j].Version]
+		hasI, hasJ := true, true
+		if _, ok := newness[out[i].Version]; !ok {
+			hasI = false
 		}
-		if !ei.firstSeen.Equal(ej.firstSeen) {
-			return ei.firstSeen.After(ej.firstSeen)
+		if _, ok := newness[out[j].Version]; !ok {
+			hasJ = false
 		}
-		return ei.name < ej.name
+		// RUNNING versions (in newness) sort before non-RUNNING ones.
+		if hasI != hasJ {
+			return hasI
+		}
+		if hasI && hasJ && !ni.Equal(nj) {
+			return ni.After(nj)
+		}
+		if !out[i].FirstSeen.Equal(out[j].FirstSeen) {
+			return out[i].FirstSeen.After(out[j].FirstSeen)
+		}
+		return out[i].Name < out[j].Name
 	})
 	return out
 }
@@ -1053,6 +1255,7 @@ func (s *Server) infoLocked(e *shardEntry, newest bool) ShardInfo {
 		Name: e.name, Addr: e.addr, BuildID: e.buildID, GVer: e.gVer,
 		State: effectiveState(e.state), Load: e.load, Newest: newest,
 		Version: e.version, Regions: append([]int(nil), e.regions...),
+		FirstSeen: e.firstSeen,
 	}
 }
 
@@ -1130,9 +1333,10 @@ func (s *Server) rebuildLocked() {
 
 // Relay routes one [53, ...] envelope to the shard hosting its target
 // player, or stores central offline mail when the player is online nowhere
-// (or the owning socket is down). raw is forwarded verbatim (handleRelay
-// parity). Queued hub mail drains on the shard's next register/heartbeat
-// via deliverPending. Transport-free except the live-socket write.
+// (or the owning socket is down or the write fails). raw is forwarded
+// verbatim (handleRelay parity). Queued hub mail drains on the shard's next
+// register/heartbeat via deliverPending. Transport-free except the
+// live-socket write.
 func (s *Server) Relay(raw []byte) {
 	username, _, err := decodeRelay(raw)
 	if err != nil {
@@ -1152,16 +1356,18 @@ func (s *Server) Relay(raw []byte) {
 	}
 	target.wmu.Lock()
 	connDown := target.conn == nil
+	writeErr := false
 	if !connDown {
 		_ = target.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 		if err := target.conn.WriteMessage(websocket.TextMessage, raw); err != nil {
 			log.Printf("hub: relay to shard %q: %v", shardName, err)
+			writeErr = true
 		}
 	}
 	target.wmu.Unlock()
-	if connDown {
-		// Owning socket down (reconnect race): keep as offline mail
-		// instead of dropping; presence stays until eviction.
+	if connDown || writeErr {
+		// Owning socket down (reconnect race) or write failed: keep as
+		// offline mail instead of dropping; presence stays until eviction.
 		s.storeOffline(username, raw)
 	}
 }
@@ -1180,6 +1386,8 @@ func (s *Server) storeOffline(username string, raw []byte) {
 // deliverPending pushes queued hub mail for the shard's players as relay
 // envelopes. Called after attach and on every heartbeat so reconnects
 // drain the queue. Shards without a live socket keep their mail queued.
+// Mail is deleted only after a successful socket write: marshal/encode or
+// write failures re-queue the message so it is not lost.
 func (s *Server) deliverPending(name string) {
 	s.mu.Lock()
 	e := s.shards[name]
@@ -1197,18 +1405,28 @@ func (s *Server) deliverPending(name string) {
 			inner, err := json.Marshal(m.Payload)
 			if err != nil {
 				log.Printf("hub: mail marshal for %q: %v", p, err)
+				_ = s.mail.Store(m)
 				continue
 			}
 			raw, err := encodeRelay(p, inner)
 			if err != nil {
+				_ = s.mail.Store(m)
 				continue
 			}
 			e.wmu.Lock()
+			sent := false
 			if e.conn != nil {
 				_ = e.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-				_ = e.conn.WriteMessage(websocket.TextMessage, raw)
+				if werr := e.conn.WriteMessage(websocket.TextMessage, raw); werr != nil {
+					log.Printf("hub: mail deliver for %q: %v", p, werr)
+				} else {
+					sent = true
+				}
 			}
 			e.wmu.Unlock()
+			if !sent {
+				_ = s.mail.Store(m)
+			}
 		}
 	}
 }
@@ -1339,11 +1557,13 @@ func (s *Server) forwardAck(raw []byte) {
 	}
 }
 
-// ServeHTTP upgrades shard sockets: optional bearer-header check first
-// (401 on mismatch), then the first frame must be a [1, ...] handshake
-// (validated token on mismatch: log + close). Afterwards it serves the
-// heartbeat objects and relay frames until disconnect, pushing the roster
-// on every membership change.
+// ServeHTTP upgrades shard sockets: bearer-header check first (401 when a
+// header is present and mismatches; an absent header defers to the
+// handshake token below), then the first frame must be a [1, ...]
+// handshake whose accessToken (or the header) must match when the server
+// token is set (mismatch: log + return with the socket closed via defer).
+// Afterwards it serves the heartbeat objects and relay frames until
+// disconnect, pushing the roster on every membership change.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	headerToken := bearerToken(r)
 	if s.token != "" && headerToken != "" && headerToken != s.token {

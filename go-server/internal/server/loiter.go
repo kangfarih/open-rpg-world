@@ -13,7 +13,7 @@
 // sweep resets every live conn's cheatScore (TS forgiveness semantics: the
 // periodic reset keeps transient strikes from accumulating to the >15
 // disconnect across a long session) and awards Loitering XP to eligible
-// heroes via the existing m5AddXP path (Experience Skill + Skill Update
+// heroes via the existing addXP path (Experience Skill + Skill Update
 // frames, level-up Sync fanout, dirty marking — unchanged).
 //
 // Region tracking reuses the UpdateRegion hook (Boot's worldcore.Configure
@@ -74,10 +74,10 @@ func markLoiterRegion(c *playerConn, rid int) {
 // gate uses (world_wire.go): default true when the tutorial quest def is
 // absent, otherwise the m11 quest-stage lookup.
 func loiterTutorialFinished(username string) bool {
-	if m11Q["tutorial"] == nil {
+	if questDefs["tutorial"] == nil {
 		return true
 	}
-	return m11StateFor(username).isFinished("tutorial")
+	return questStateFor(username).isFinished("tutorial")
 }
 
 // loiterEligible ports the player.ts loiter() gate: tutorial finished AND
@@ -93,7 +93,7 @@ func loiterEligible(tutorialFinished bool, sinceMs, nowMs int64) bool {
 // loiterLevel reads the hero's current Loitering level (TS skills.get
 // always returns a level-1 skill, so a missing row reads as 1).
 func loiterLevel(username string) int {
-	st := m5StateFor(username)
+	st := playerStateFor(username)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	if s := st.Skills[player.SkillLoitering]; s != nil && s.Level > 0 {
@@ -119,7 +119,7 @@ func loiterTick() {
 // runLoiterSweep ports handler.ts:130-134 over every live conn: reset
 // cheatScore (TS forgiveness, unconditional — even when the award below is
 // gated off), then award level*5 Loitering XP to tutorial-finished heroes
-// past the same-region threshold via the existing m5AddXP path.
+// past the same-region threshold via the existing addXP path.
 func runLoiterSweep(nowMs int64) {
 	for _, c := range worldcore.AllOf[*playerConn]() {
 		if c == nil {
@@ -137,7 +137,7 @@ func runLoiterSweep(nowMs int64) {
 		}
 		level := loiterLevel(c.Username)
 		amount := level * 5 // player.ts:559 addExperience(loitering.level * 5).
-		m5AddXP(c, c.Username, player.SkillLoitering, amount)
+		addXP(c, c.Username, player.SkillLoitering, amount)
 		rid := region
 		if !init {
 			rid = -1 // never stamped (TS entity.region -1 parity).

@@ -8,8 +8,8 @@
 //
 //	send: the TESTMAP handofftest op (PacketMinigame [46,
 //	  {"handofftest":{"target":...}}], existing debug-op surface) flushes the
-//	  sender's persist rows (players/inventory via m5SaveSync, quests via
-//	  m11PersistQuests), packs the snapshot + quest rows + region/pos into a
+//	  sender's persist rows (players/inventory via savePlayerSync, quests via
+//	  persistQuests), packs the snapshot + quest rows + region/pos into a
 //	  hub HandoffRequest, and waits for the ack. The hub version-gates first
 //	  (mismatch => immediate reject ack; a cross-build move must go
 //	  disconnect+reconnect via login/hub with a client reload, never a bare
@@ -89,7 +89,7 @@ var (
 // the player conn untouched, queued on the outbox like steady-state
 // traffic). Unknown targets are dropped with a log (handleRelay parity).
 func deliverRelayToLocal(to string, inner json.RawMessage) {
-	t := m7PlayerByName(to)
+	t := playerByName(to)
 	if t == nil {
 		log.Printf("hub: relay for offline %q dropped", to)
 		return
@@ -181,7 +181,13 @@ func applyHandoffRequest(req hub.HandoffRequest) hub.HandoffAck {
 	if req.BuildID != version.BuildID || req.GVer != version.GVer {
 		return reject(fmt.Sprintf("build mismatch (need %s/%s)", version.BuildID, version.GVer))
 	}
-	if m7PlayerByName(req.Player) != nil {
+	// World-version gate (R2 display tag: explicit VERSION or buildID+gVer
+	// pair — a cross-version move must go disconnect+reconnect with a client
+	// reload, never a bare transfer across versions).
+	if req.Version != "" && req.Version != ownVersion() {
+		return reject(fmt.Sprintf("version mismatch (need %s)", ownVersion()))
+	}
+	if playerByName(req.Player) != nil {
 		return reject("player already online here")
 	}
 	var st persist.State
@@ -209,7 +215,7 @@ func applyHandoffRequest(req hub.HandoffRequest) hub.HandoffAck {
 		}
 	}
 	// Install: pstates (pstateMu) + player tables (dbMu, writePlayer
-	// parity) + quest rows, matching the m5Load + m11LoadQuests outcome so
+	// parity) + quest rows, matching the loadPlayerState + loadQuests outcome so
 	// the re-pointed login restores the transferred session.
 	pstateMu.Lock()
 	pstates[req.Player] = persistToM5(st)
@@ -240,6 +246,11 @@ func handoffTestHandler(c *playerConn, data []byte) {
 	if !testMode || c == nil || shardHubClient == nil || !shardHubClient.Connected() {
 		return
 	}
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client handoff hole).
+	if !isAdmin(c) {
+		return
+	}
 	var d struct {
 		HandoffTest *struct {
 			Target string `json:"target"`
@@ -255,7 +266,7 @@ func handoffTestHandler(c *playerConn, data []byte) {
 		region = *d.HandoffTest.Region
 	}
 	if target == "" {
-		m6Notify(c, "handoff: no target (pass {\"target\":...})")
+		notifyPlayer(c, "handoff: no target (pass {\"target\":...})")
 		return
 	}
 	go handoffSend(c, target, region)
@@ -274,29 +285,32 @@ func handoffSend(c *playerConn, target string, region int) {
 	// tile). Then flush sender rows (owner-to-owner RPC rule: the transfer
 	// carries the post-flush snapshot; the two shards never dual-write one
 	// file).
-	m5TrackPos(c)
-	m5SaveSync(username)
-	m11PersistQuests(username)
-	st := m5Snapshot(username)
+	trackPos(c)
+	savePlayerSync(username)
+	persistQuests(username)
+	st := playerSnapshot(username)
 	if st == nil {
-		m6Notify(c, "handoff: no player state")
+		notifyPlayer(c, "handoff: no player state")
 		return
 	}
 	// Statistics counters ride the transfer snapshot (writePlayer parity).
-	ps := m5ToPersist(st)
+	ps := toPersist(st)
 	snap := statsCopyOf(username)
 	ps.Stats = persist.StatsBlob{
 		MobKills: snap.MobKills, MobExamines: snap.MobExamines,
 		Resources: snap.Resources, Drops: snap.Drops,
+		PvPKills: snap.PvPKills, PvPDeaths: snap.PvPDeaths,
+		CreationTime: snap.CreationTime, TotalTimePlayed: snap.TotalTimePlayed,
+		LastLogin: snap.LastLogin, LoginCount: snap.LoginCount,
 	}
 	stateRaw, err := json.Marshal(ps)
 	if err != nil {
-		m6Notify(c, "handoff: snapshot failed")
+		notifyPlayer(c, "handoff: snapshot failed")
 		return
 	}
 	questsRaw, err := json.Marshal(handoffReadQuestRows(username))
 	if err != nil {
-		m6Notify(c, "handoff: quest snapshot failed")
+		notifyPlayer(c, "handoff: quest snapshot failed")
 		return
 	}
 	req := hub.HandoffRequest{
@@ -308,11 +322,11 @@ func handoffSend(c *playerConn, target string, region int) {
 	defer cancel()
 	ack, err := shardHubClient.RequestHandoff(ctx, target, req)
 	if err != nil {
-		m6Notify(c, "handoff: "+err.Error())
+		notifyPlayer(c, "handoff: "+err.Error())
 		return
 	}
 	if !ack.Ok {
-		m6Notify(c, "handoff rejected: "+ack.Reason)
+		notifyPlayer(c, "handoff rejected: "+ack.Reason)
 		log.Printf("handoff: %s -> %s rejected: %s", username, target, ack.Reason)
 		return
 	}

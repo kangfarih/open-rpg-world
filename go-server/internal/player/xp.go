@@ -32,9 +32,7 @@ func xpFloatp(v float64) *float64 { return &v }
 // Skill ids mirror Modules.Skills order (modules.ts:215-235 enum order:
 // Lumberjacking0 Accuracy1 Archery2 Health3 Magic4 Mining5 Strength6
 // Defense7 Fishing8 Cooking9 Smithing10 Crafting11 Chiseling12 Fletching13
-// Smelting14 Foraging15 Eating16 Loitering17 Alchemy18). Only the ids the
-// server awards are named; Chiseling(12)/Smelting(14) stay absent exactly
-// like the TS skills dict (see controller.SkillNameToID).
+// Smelting14 Foraging15 Eating16 Loitering17 Alchemy18).
 const (
 	SkillLumberjacking = 0
 	SkillAccuracy      = 1
@@ -45,6 +43,12 @@ const (
 	SkillStrength      = 6
 	SkillDefense       = 7
 	SkillFishing       = 8
+	SkillCooking       = 9
+	SkillSmithing      = 10
+	SkillCrafting      = 11
+	SkillChiseling     = 12
+	SkillFletching     = 13
+	SkillSmelting      = 14
 	SkillForaging      = 15
 	SkillEating        = 16
 	SkillLoitering     = 17
@@ -92,6 +96,18 @@ func SkillName(id int) string {
 		return "Defense"
 	case SkillFishing:
 		return "Fishing"
+	case SkillCooking:
+		return "Cooking"
+	case SkillSmithing:
+		return "Smithing"
+	case SkillCrafting:
+		return "Crafting"
+	case SkillChiseling:
+		return "Chiseling"
+	case SkillFletching:
+		return "Fletching"
+	case SkillSmelting:
+		return "Smelting"
 	case SkillForaging:
 		return "Foraging"
 	case SkillEating:
@@ -117,6 +133,10 @@ func CombatSkill(id int) bool {
 // CombatLevel computes the combat level from a skill snapshot
 // (m5CombatLevelLocked verbatim: 1 + sum of (level-1) over combat skills
 // above 1, floored at 1). levels maps skill id -> level.
+// VERIFY (level<1 dead code): the floor is unreachable in practice (level
+// starts at 1 and only grows) but kept as a defensive guard — TS
+// getCombatLevel has no floor only because skill levels can never drop below
+// 1 there either. No behavior change.
 func CombatLevel(levels map[int]int) int {
 	level := 1
 	for id, lv := range levels {
@@ -241,13 +261,21 @@ func AddXP(d Deps, c *Conn, key string, skill, amount int) int {
 		return 1
 	}
 	res := d.ApplyAward(key, skill, amount)
+	// Clamp foreign-seam negative XP for frame building (the prod ApplyAward
+	// floors stored XP at 0 per the Deps contract; a test/custom seam that
+	// returns negative XP would otherwise emit malformed SkillUpdate frames
+	// with negative experience/percentage/nextExperience).
+	frameXP := res.XP
+	if frameXP < 0 {
+		frameXP = 0
+	}
 	if c != nil && c.Send != nil {
 		c.Send(protocol.PktOp(protocol.PacketExperience, protocol.ExperienceSkill, protocol.ExperienceData{
 			Instance: c.Instance, Amount: xpIntp(amount), Skill: xpIntp(skill),
 		}))
 		c.Send(protocol.PktOp(protocol.PacketSkill, protocol.SkillUpdate, protocol.SkillData{
-			Type: skill, Experience: res.XP, Level: xpIntp(res.Level),
-			Percentage: xpFloatp(Percentage(res.XP)), NextExperience: xpIntp(NextExp(res.XP)),
+			Type: skill, Experience: frameXP, Level: xpIntp(res.Level),
+			Percentage: xpFloatp(Percentage(frameXP)), NextExperience: xpIntp(NextExp(frameXP)),
 			Combat: xpBoolp(CombatSkill(skill)),
 		}))
 	}
@@ -339,16 +367,21 @@ func AwardCombatXP(d Deps, c *Conn, key string, damage int, archer, mage bool) {
 }
 
 // GatherXP is the M4-hook successor: table experience on exhaust. Unknown
-// attackers are skipped (m5GatherXP verbatim).
+// attackers are skipped (m5GatherXP verbatim). Unknown skill names return
+// early instead of defaulting to Lumberjacking(0) — the old zero-value map
+// hit silently credited the wrong skill.
 func GatherXP(d Deps, attackerInstance, skill string, xp int) {
 	c, ok := d.Lookup(attackerInstance)
 	if !ok {
 		return
 	}
-	id := map[string]int{
+	id, found := map[string]int{
 		"lumberjacking": SkillLumberjacking, "mining": SkillMining,
 		"fishing": SkillFishing, "foraging": SkillForaging,
 	}[skill]
+	if !found {
+		return
+	}
 	cc := c
 	AddXP(d, &cc, c.Username, id, xp)
 }

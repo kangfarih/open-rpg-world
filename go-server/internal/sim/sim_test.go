@@ -43,8 +43,8 @@ func TestTravel(t *testing.T) {
 	if got := TravelTime(0); got != 90*time.Millisecond {
 		t.Fatalf("clamp = %v", got)
 	}
-	// Archer (100,98) -> dummy (106,96): hypot=~6.32 -> 7 tiles -> 630ms.
-	if got := TravelBetween(100, 98, 106, 96); got != 630*time.Millisecond {
+	// Archer (100,98) -> dummy (106,96): manhattan=|6|+|2|=8 tiles -> 720ms.
+	if got := TravelBetween(100, 98, 106, 96); got != 720*time.Millisecond {
 		t.Fatalf("archer travel = %v", got)
 	}
 }

@@ -322,6 +322,22 @@ func CanEquip(c EconomyConn, d EconomyDeps, key string) bool {
 	return true
 }
 
+// canStackUnequip reports whether the equipped stack merges into the
+// inventory without a free slot (container.find parity: same key, room
+// under MaxStack, neither side enchanted).
+func canStackUnequip(d EconomyDeps, username string, e Slot) bool {
+	if len(e.Ench) != 0 || MaxStack(e.Key) <= 1 {
+		return false
+	}
+	max := MaxStack(e.Key)
+	for _, s := range d.Store.InventorySlots(username) {
+		if s.Key == e.Key && len(s.Ench) == 0 && s.Count < max {
+			return true
+		}
+	}
+	return false
+}
+
 // UnequipType ports equipments.unequip(type).
 func UnequipType(c EconomyConn, d EconomyDeps, slotType int) {
 	if slotType < 0 || slotType >= protocol.ModulesEquipmentCount {
@@ -332,7 +348,16 @@ func UnequipType(c EconomyConn, d EconomyDeps, slotType int) {
 	if !ok || e.Key == "" {
 		return
 	}
-	invIdx := d.Store.AddItem(username, e.Key, e.Count)
+	// A full inventory keeps the equipment on (container.add returns
+	// <1 there, and unequip stops before clearing the slot — silently,
+	// no notify in TS either).
+	if protocol.ModulesInventorySize-d.Store.InventoryLen(username) < 1 && !canStackUnequip(d, username, e) {
+		return
+	}
+	invIdx := d.Store.AddItemEnch(username, e.Key, e.Count, e.Ench)
+	if invIdx < 0 {
+		return
+	}
 	count := e.Count
 	d.Store.SetEquip(username, slotType, Slot{})
 	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketEquipment, protocol.EquipmentUnequip, map[string]any{
@@ -340,7 +365,7 @@ func UnequipType(c EconomyConn, d EconomyDeps, slotType int) {
 	}))
 	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
 		Type: protocol.ContainerTypeInventory,
-		Slot: &protocol.SlotData{Index: invIdx, Key: e.Key, Count: e.Count, Enchantments: map[string]any{}},
+		Slot: &protocol.SlotData{Index: invIdx, Key: e.Key, Count: e.Count, Enchantments: protocol.EnchAny(e.Ench)},
 	}))
 	d.Bus.Broadcast(d.World.SyncFrame(c.InstanceID(), c.TileX(), c.TileY()))
 	d.Store.MarkDirty(username)
@@ -367,6 +392,31 @@ func EquipFromInventory(c EconomyConn, d EconomyDeps, fromIndex int) {
 	slotType := EquipmentType(it.Type)
 	if slotType < 0 || slotType >= protocol.ModulesEquipmentCount || d.Store.EquipLen(username) < protocol.ModulesEquipmentCount {
 		return
+	}
+
+	// Two-handed weapon auto-swap (equipments.ts:116-132 parity):
+	// Equipping a two-handed weapon with a shield equipped auto-unequips
+	// the shield; equipping a shield with a two-handed weapon auto-unequips
+	// the weapon. Both need inventory space for the displaced item.
+	if it.TwoHanded && slotType == protocol.EquipmentWeapon {
+		if shield, _ := d.Store.EquipSlot(username, protocol.EquipmentShield); shield.Key != "" {
+			if protocol.ModulesInventorySize-d.Store.InventoryLen(username) < 1 {
+				Notify(c, d, "misc:NO_SPACE")
+				return
+			}
+			UnequipType(c, d, protocol.EquipmentShield)
+		}
+	}
+	if slotType == protocol.EquipmentShield {
+		if weapon, _ := d.Store.EquipSlot(username, protocol.EquipmentWeapon); weapon.Key != "" {
+			if wit := ItemInfoFor(weapon.Key); wit != nil && wit.TwoHanded {
+				if protocol.ModulesInventorySize-d.Store.InventoryLen(username) < 1 {
+					Notify(c, d, "misc:NO_SPACE")
+					return
+				}
+				UnequipType(c, d, protocol.EquipmentWeapon)
+			}
+		}
 	}
 
 	InventoryRemoveAt(c, d, username, fromIndex, slot.Count)

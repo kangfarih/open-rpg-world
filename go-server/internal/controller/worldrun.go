@@ -174,7 +174,12 @@ func DoWarp(c WarpConn, w *WarpEntry) bool {
 	}
 	nowMs := time.Now().UnixMilli()
 	if deny := Warps.Authorize(c.Username, w, nowMs, warpStore{admin: c.Admin, instance: c.Instance}); deny != "" {
-		warpDeps.Notify(c.Instance, deny)
+		// Notify is a seam and may be unwired in non-server callers;
+		// never panic on the deny path (ApplyTeleport below is
+		// already nil-guarded the same way).
+		if warpDeps.Notify != nil {
+			warpDeps.Notify(c.Instance, deny)
+		}
 		return false
 	}
 	lx, ly, ok := Landing(w, rand.Intn)
@@ -189,7 +194,9 @@ func DoWarp(c WarpConn, w *WarpEntry) bool {
 	if warpDeps.FormatName != nil {
 		name = warpDeps.FormatName(w.Name)
 	}
-	warpDeps.Notify(c.Instance, "warps:WARPED_TO;name="+name)
+	if warpDeps.Notify != nil {
+		warpDeps.Notify(c.Instance, "warps:WARPED_TO;name="+name)
+	}
 	log.Printf("world: %s warped to %s (%d,%d)", c.Username, w.Name, lx, ly)
 	return true
 }

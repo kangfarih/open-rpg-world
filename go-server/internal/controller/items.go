@@ -192,9 +192,21 @@ func ItemPluginUse(c EconomyConn, d EconomyDeps, it *ItemInfo) bool {
 
 // useHealingItem ports healingitem.ts onUse (healAmount/manaAmount/
 // healPercent from the item data; full-HP/mana notifies + false = no
-// consume; eating XP only on the flat-heal branch).
+// consume; eating XP only on the flat-heal branch). The full-HP gate runs
+// before any mana is applied: otherwise a hurt-mana/full-HP use would heal
+// mana and then return false without consuming (free mana).
 func useHealingItem(c EconomyConn, d EconomyDeps, it *ItemInfo) bool {
 	inst := c.InstanceID()
+	hasHeal := it.HealAmount > 0 || it.HealPercent > 0
+	maxHP := 0
+	if hasHeal {
+		hp, max := d.Vitals.HeroHP(inst)
+		maxHP = max
+		if hp >= max {
+			Notify(c, d, "You are already at full health.")
+			return false
+		}
+	}
 	if it.ManaAmount > 0 {
 		mana, maxMana := d.Vitals.HeroMana(inst)
 		if mana >= maxMana {
@@ -203,12 +215,7 @@ func useHealingItem(c EconomyConn, d EconomyDeps, it *ItemInfo) bool {
 		}
 		d.Vitals.HealHero(inst, 0, it.ManaAmount)
 	}
-	if it.HealAmount > 0 || it.HealPercent > 0 {
-		hp, maxHP := d.Vitals.HeroHP(inst)
-		if hp >= maxHP {
-			Notify(c, d, "You are already at full health.")
-			return false
-		}
+	if hasHeal {
 		if it.HealPercent > 0 {
 			d.Vitals.HealHero(inst, int(float64(maxHP)*(it.HealPercent/100)), 0)
 			return true

@@ -22,6 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -33,6 +34,7 @@ import (
 	"rpg-world-server/internal/entity"
 	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
+	"rpg-world-server/internal/player"
 	"rpg-world-server/internal/sim"
 	"rpg-world-server/internal/version"
 	worldcore "rpg-world-server/internal/world"
@@ -204,7 +206,7 @@ func getTestRegionData() map[int][]RegionTile {
 	for _, p := range [][2]int{{98, 108}, {100, 108}} {
 		set(p[0], p[1], RegionTile{X: p[0], Y: p[1], Data: testGrassTile})
 	}
-	pondWater, grassOver := 0, 0
+	pondWater := 0
 	for y := pondCY - pondRY; y <= pondCY+pondRY; y++ {
 		for x := pondCX - pondRX; x <= pondCX+pondRX; x++ {
 			if isTestWater(x, y) {
@@ -213,7 +215,6 @@ func getTestRegionData() map[int][]RegionTile {
 			}
 		}
 	}
-	_ = grassOver
 	base := 0
 	for _, tiles := range data {
 		base += len(tiles)
@@ -376,6 +377,16 @@ func newPlayerInstance() string {
 // The instance is random per connection (M2 registry); scenario bots keep
 // their stable IDs.
 func welcomePlayer(instance string) PlayerData {
+	// Look up the player's level for HP/mana scaling (formulas.ts parity).
+	level := 1
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil {
+		st := playerStateFor(c.Username)
+		pstateMu.Lock()
+		level = st.Level
+		pstateMu.Unlock()
+	}
+	maxHP := meta.HeroMaxHPForLevel(level)
+	maxMana := meta.HeroMaxManaForLevel(level)
 	return PlayerData{
 		EntityData: EntityData{
 			Instance:      instance,
@@ -384,17 +395,17 @@ func welcomePlayer(instance string) PlayerData {
 			Name:          "hero",
 			X:             100,
 			Y:             96,
-			Level:         intp(1),
-			HitPoints:     intp(100),
-			MaxHitPoints:  intp(100),
+			Level:         intp(level),
+			HitPoints:     intp(maxHP),
+			MaxHitPoints:  intp(maxHP),
 			MovementSpeed: intp(220),
 			AttackRange:   intp(1),
 		},
 		Orientation: OrientationDown,
 		Rank:        0,
 		Pvp:         false,
-		Mana:        intp(50),
-		MaxMana:     intp(50),
+		Mana:        intp(maxMana),
+		MaxMana:     intp(maxMana),
 		Equipments:  []any{},
 	}
 }
@@ -420,10 +431,9 @@ type resourceInfo struct {
 }
 
 var (
-	resourcesOnce   sync.Once
-	resourceTables  = map[string]map[string]*resourceInfo{}
-	resourceCounts  = map[string]int{}
-	resourceTableOK = false
+	resourcesOnce  sync.Once
+	resourceTables = map[string]map[string]*resourceInfo{}
+	resourceCounts = map[string]int{}
 )
 
 func resourceDataPath(name string) string {
@@ -434,10 +444,9 @@ func resourceDataPath(name string) string {
 	if _, err := os.Stat(rel); err == nil {
 		return rel
 	}
-	if alt := filepath.Join("..", "..", "packages", "server", "data", name+".json"); true {
-		if _, err := os.Stat(alt); err == nil {
-			return alt
-		}
+	alt := filepath.Join("..", "..", "packages", "server", "data", name+".json")
+	if _, err := os.Stat(alt); err == nil {
+		return alt
 	}
 	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/" + name + ".json"
 }
@@ -456,7 +465,6 @@ func loadResources() {
 			resourceTables[name] = tbl
 			resourceCounts[name] = len(tbl)
 		}
-		resourceTableOK = true
 		log.Printf("resources loaded: trees=%d rocks=%d fishing=%d foraging=%d",
 			resourceCounts["trees"], resourceCounts["rocks"],
 			resourceCounts["fishing"], resourceCounts["foraging"])
@@ -631,16 +639,20 @@ func startShowcase() {
 // clear of pond/demo line). Weapon/helmet keys verified in server items.json
 // (ironsword/ironhelmet, goldsword/goldhelmet) and sprites PNGs.
 func demoPlayers() []PlayerData {
+	// Demo players are level 1.
+	level := 1
+	maxHP := meta.HeroMaxHPForLevel(level)
+	maxMana := meta.HeroMaxManaForLevel(level)
 	mk := func(inst, name string, x, y int, weapon, helmet string) PlayerData {
 		return PlayerData{
 			EntityData: EntityData{
 				Instance: inst, Type: EntityPlayer, Key: "base", Name: name,
 				X: x, Y: y, Orientation: intp(OrientationDown),
-				Level: intp(1), HitPoints: intp(100), MaxHitPoints: intp(100),
+				Level: intp(level), HitPoints: intp(maxHP), MaxHitPoints: intp(maxHP),
 				MovementSpeed: intp(220), AttackRange: intp(1),
 			},
 			Orientation: OrientationDown, Rank: 0, Pvp: false,
-			Mana: intp(50), MaxMana: intp(50),
+			Mana: intp(maxMana), MaxMana: intp(maxMana),
 			Equipments: []any{
 				map[string]any{"type": EquipmentWeapon, "key": weapon, "count": 1, "enchantments": map[string]any{}},
 				map[string]any{"type": EquipmentHelmet, "key": helmet, "count": 1, "enchantments": map[string]any{}},
@@ -679,15 +691,19 @@ func cleanAdventurerEquipments() []any {
 // entities.ts prefix rule; paperdoll layers come from Equipments (player.ts
 // load -> equip) plus the Batch below.
 func cleanAdventurer() PlayerData {
+	// Clean adventurer is level 1.
+	level := 1
+	maxHP := meta.HeroMaxHPForLevel(level)
+	maxMana := meta.HeroMaxManaForLevel(level)
 	return PlayerData{
 		EntityData: EntityData{
 			Instance: "p-adv-1", Type: EntityPlayer, Key: "base", Name: "adventurer",
 			X: 102, Y: 96, Orientation: intp(OrientationDown),
-			Level: intp(1), HitPoints: intp(100), MaxHitPoints: intp(100),
+			Level: intp(level), HitPoints: intp(maxHP), MaxHitPoints: intp(maxHP),
 			MovementSpeed: intp(220), AttackRange: intp(1),
 		},
 		Orientation: OrientationDown, Rank: 0, Pvp: false,
-		Mana: intp(50), MaxMana: intp(50),
+		Mana: intp(maxMana), MaxMana: intp(maxMana),
 		Equipments: cleanAdventurerEquipments(),
 	}
 }
@@ -885,7 +901,7 @@ func combatAccuracyWeight(bot string) float64 {
 
 func combatAccuracy(bot string, critical bool) float64 {
 	st := combatBotStats[bot]
-	return meta.Accuracy(ModulesMaxAccuracy, ModulesMaxLevel, st.accuracyBonus, st.accuracyLevel, combatAccuracyWeight(bot), critical)
+	return meta.Accuracy(ModulesMaxAccuracy, ModulesMaxLevel, st.accuracyBonus, st.accuracyLevel, 1, combatAccuracyWeight(bot), critical)
 }
 
 // combatRollLocked rolls one formula hit for bot (caller holds combatMu;
@@ -1076,7 +1092,7 @@ func combatSpawns() [][]any {
 		frames = append(frames, pkt(PacketSpawn, d))
 	}
 	// M9: the rat is an engine mob — spawn frame reflects its live state.
-	if rat := m9RatEntity(); rat != nil {
+	if rat := ratEntity(); rat != nil {
 		frames = append(frames, pkt(PacketSpawn, rat))
 	}
 	return frames
@@ -1178,7 +1194,7 @@ func applyBossHitLocked(attacker string, dmg, typ int, skills []string, ranged b
 		worldcore.Broadcast(pkt(PacketDespawn, despawnData{Instance: combatDummyInstance}))
 		log.Printf("combat: boss died -> despawned, respawn in %v", dummyRespawnDelay)
 		// M5: boss death rolls the golem drop tables (attacker owns the loot).
-		m5SpawnLoot("golem", combatDummyX, combatDummyY, attacker)
+		spawnLoot("golem", combatDummyX, combatDummyY, attacker)
 		time.AfterFunc(dummyRespawnDelay, combatRespawn)
 	}
 }
@@ -1468,8 +1484,8 @@ var combatRatRespawnDelay = 10 * time.Second
 // M9: the leash-demo rat's AI moved to the engine (m9.go). The legacy
 // per-instance rat state (ratMu/ratX/ratHP/ratTick/teleport/kill/respawn)
 // and the nearestPlayerTile helper are retired; combatSpawns() reads the
-// live engine mob instead (m9RatEntity), and the rat keeps its demo
-// semantics (forced chase, no strikes) via m9Overrides in m9AdoptExisting.
+// live engine mob instead (ratEntity), and the rat keeps its demo
+// semantics (forced chase, no strikes) via mobOverrides in adoptExistingMobs.
 
 func combatRespawn() {
 	combatMu.Lock()
@@ -1497,7 +1513,7 @@ func startCombat() {
 			combatBotHP[b] = combatBotMaxHP[b]
 		}
 		combatMu.Unlock()
-		// M9: the leash-demo rat lives in the engine now (m9AdoptExisting at
+		// M9: the leash-demo rat lives in the engine now (adoptExistingMobs at
 		// boot); no per-instance reset or 500ms AI ticker here.
 		go func() {
 			warAutoT := time.NewTicker(combatAutoRate(combatBotInstance))
@@ -1564,6 +1580,9 @@ func spawnFrames() [][]any {
 	if testMode {
 		gx, gy = 101, 96
 	}
+	// Guest player is level 1.
+	guestLevel := 1
+	guestMaxHP := meta.HeroMaxHPForLevel(guestLevel)
 	other := EntityData{
 		Instance:      "p2",
 		Type:          EntityPlayer,
@@ -1572,9 +1591,9 @@ func spawnFrames() [][]any {
 		X:             gx,
 		Y:             gy,
 		Orientation:   intp(OrientationDown),
-		Level:         intp(1),
-		HitPoints:     intp(100),
-		MaxHitPoints:  intp(100),
+		Level:         intp(guestLevel),
+		HitPoints:     intp(guestMaxHP),
+		MaxHitPoints:  intp(guestMaxHP),
 		MovementSpeed: intp(220),
 		AttackRange:   intp(1),
 	}
@@ -1717,7 +1736,7 @@ func resourceAt(x, y int) string {
 // blocked reports whether (x,y) rejects movement: static collision or a
 // resource-entity occupant (server map.isColliding:246-254).
 func blocked(x, y int) bool {
-	return tileBlocked(x, y) || resourceAt(x, y) != "" || m10ChestItemsAt(x, y)
+	return tileBlocked(x, y) || resourceAt(x, y) != "" || chestItemsAt(x, y)
 }
 
 // session tracks one connection's player grid pos (from Welcome spawn,
@@ -1760,7 +1779,21 @@ func targetsResource(x, y int, targets ...string) bool {
 // rejectLocked records one cheat/collision strike: teleport-back + Positions
 // reply; over 15 disconnects the conn (handler.ts cheatScore gate).
 // Returns true when the caller should drop the connection.
+//
+// Enhanced with TS parity (player.ts:662-671):
+//   - bypassAntiCheat flag: skip increment during teleports
+//   - combat bypass: skip increment during active combat
 func rejectLocked(c *playerConn, reason string) bool {
+	// Teleport bypass flag (player.ts:663).
+	if c.Sess.BypassAntiCheat {
+		return false
+	}
+
+	// Combat bypass (player.ts:664): skip cheat score during active combat.
+	if inCombat(c.Instance) {
+		return false
+	}
+
 	c.Sess.CheatScore++
 	n := c.Sess.CheatScore
 	stopPlayer(c)
@@ -1773,17 +1806,130 @@ func rejectLocked(c *playerConn, reason string) bool {
 	return false
 }
 
-// checkSpeed enforces max tiles/sec vs movementSpeed with a 2-tile grace
-// (player.ts verifyMovement margin + handleMovementRequest diff>2 noclip).
-// Returns true when the step is too fast (caller rejects).
-// Divergence note: truth uses a 1.5s region grace with latency subtracted
-// from the interval; here we keep the coarser 2-tile + 2s idle leniency.
-// The math lives in internal/world; this adapts the root session to it.
-func checkSpeed(s *gnet.Session, tiles int) bool {
+// checkSpeed enforces max tiles/sec vs movementSpeed with the main.go
+// semantics verbatim: 220ms/tile default, first step after idle (>2s)
+// always passes, 5% margin per tile (verifyMovement), sliding lastStep
+// window advanced even on reject. Returns true when the step is too fast
+// (caller rejects).
+//
+// Enhanced with TS parity (player.ts:726-746):
+//   - latency compensation: subtract client latency from step timing
+//   - region change exemption: 1.5s grace after region change
+//   - door exemption: skip speed check on door tiles
+//   - dynamic speed calculation: boots, running, hot sauce, freezing, cheater
+func checkSpeed(c *playerConn, tiles int) bool {
+	s := &c.Sess
+
+	// Calculate dynamic movement speed (TS getMovementSpeed parity).
+	mods := worldcore.SpeedModifiers{
+		Override:   -1, // use default unless admin override
+		IsCheater:  isCheater(c.Username),
+		HasRunning: abilities.HasStatusEffect(c.Instance, fxRunning),
+		HasHotSauce: abilities.HasStatusEffect(c.Instance, fxHotSauce),
+		HasFreezing: abilities.HasStatusEffect(c.Instance, fxFreezing),
+		HasSnowPotion: abilities.HasStatusEffect(c.Instance, fxSnowPotion),
+	}
+
+	// Admin /ms override.
+	if override := movementSpeedOverride(c.Username); override > 0 {
+		mods.Override = override
+	}
+
+	// Boots movement modifier from equipment.
+	if bootMods := bootsMovementModifier(c.Username); bootMods > 0 && bootMods != 1.0 {
+		mods.BootsModifier = bootMods
+	}
+
+	// Calculate and sync speed if changed.
+	newSpeed := worldcore.CalculateMovementSpeed(mods)
+	if s.MovementSpeed != newSpeed {
+		s.MovementSpeed = newSpeed
+		// Sync speed to other players in region (TS setMovementSpeed parity).
+		syncMovementSpeed(c, newSpeed)
+	}
+
+	// Region change grace (1.5s).
+	regionGrace := time.Duration(0)
+	if !s.LastRegionChange.IsZero() {
+		elapsed := time.Since(s.LastRegionChange)
+		if elapsed < 1500*time.Millisecond {
+			regionGrace = 1500*time.Millisecond - elapsed
+		}
+	}
+
+	// Door exemption.
+	isDoor := entity.IsDoor(s.PlayerX, s.PlayerY)
+
+	// Latency: client-reported from movement packet timestamps (TS
+	// player.ts:726-746 parity). Updated by handleMovement on each packet
+	// that carries a Timestamp field; defaults to 0 until the first
+	// timestamped packet arrives.
+	latencyMs := s.LatencyMs
+
 	st := worldcore.SpeedState{MovementSpeed: s.MovementSpeed, LastStep: s.LastStep}
-	violation := worldcore.CheckSpeed(&st, tiles, time.Now())
+	violation := worldcore.CheckSpeed(&st, tiles, time.Now(), latencyMs, regionGrace, isDoor)
 	s.MovementSpeed, s.LastStep = st.MovementSpeed, st.LastStep
 	return violation
+}
+
+// isCheater reports whether the player has the Cheater rank (TS isCheater parity).
+func isCheater(username string) bool {
+	st := playerStateFor(username)
+	return st != nil && st.Rank == 6 // Modules.Ranks.Cheater = 6
+}
+
+// inCombat reports whether the player is in active combat (TS combat.started parity).
+func inCombat(instance string) bool {
+	return econVitals{}.InCombat(instance)
+}
+
+// movementSpeedOverride returns the admin /ms override for a player (0 = none).
+func movementSpeedOverride(username string) int {
+	return cmdMovementSpeed(username)
+}
+
+// bootsMovementModifier returns the boots equipment movement modifier
+// (TS player.ts getMovementSpeed: boots.movementModifier). Reads the
+// equipped boots slot from the player state and looks up the item's
+// movementModifier in the items.json catalogue. Returns 1.0 (no modifier)
+// when no boots are equipped or the item has no modifier.
+func bootsMovementModifier(username string) float64 {
+	st := playerStateFor(username)
+	if st == nil || EquipmentBoots >= len(st.Equip) {
+		return 1.0
+	}
+	key := st.Equip[EquipmentBoots].Key
+	if key == "" {
+		return 1.0
+	}
+	info := controller.ItemInfoFor(key)
+	if info == nil || info.MovementModifier <= 0 || info.MovementModifier == 1.0 {
+		return 1.0
+	}
+	return info.MovementModifier
+}
+
+// syncMovementSpeed broadcasts the player's movement speed to nearby regions
+// (TS setMovementSpeed parity: MovementPacket with Speed opcode).
+func syncMovementSpeed(c *playerConn, speed int) {
+	// Movement opcode 2 = Speed (Opcodes.Movement.Speed).
+	_ = gnet.Send(c.Conn, pktOp(PacketMovement, 2, map[string]any{
+		"instance":      c.Instance,
+		"movementSpeed": speed,
+	}))
+}
+
+// markRegionChange records a region change for the 1.5s speed exemption.
+func markRegionChange(c *playerConn) {
+	c.Sess.LastRegionChange = time.Now()
+}
+
+// withTeleportBypass runs fn with the anti-cheat bypass flag armed (TS
+// bypassAntiCheat parity: teleport sets the flag, then clears it).
+func withTeleportBypass(c *playerConn, fn func()) {
+	c.Sess.BypassAntiCheat = true
+	defer func() { c.Sess.BypassAntiCheat = false }()
+	fn()
 }
 
 // movementBlocked mirrors the player.ts:1122 gate (isStunned() ||
@@ -1820,7 +1966,7 @@ func (c *playerConn) isTeleporting() bool {
 
 // markTeleported arms the teleporting flag, cleared 500ms later
 // (character.teleport setTimeout parity). Called by every server-side
-// teleport funnel (m7Teleport, m8Teleport, worldApplyTeleport). Respawn is
+// teleport funnel (teleport, minigameTeleport, worldApplyTeleport). Respawn is
 // excluded: it delivers a Respawn packet (not Teleport) that already resets
 // client pathing, matching TS player.respawn (player.teleport, no flag).
 func (c *playerConn) markTeleported() {
@@ -1869,6 +2015,19 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 	if mv.Opcode == nil {
 		return false
 	}
+
+	// Client-reported latency (TS player.ts:726-746 parity): the client
+	// includes performance.now() in each movement packet. We compute
+	// one-way latency as server_now_ms - client_timestamp. Since the
+	// client and server clocks may have different epochs, we sanity-check
+	// the result: values >10s are treated as clock-skew and ignored.
+	if mv.Timestamp != nil && *mv.Timestamp > 0 {
+		raw := int(time.Now().UnixMilli()) - *mv.Timestamp
+		if raw >= 0 && raw < 10000 {
+			s.LatencyMs = raw
+		}
+	}
+
 	if mv.TargetInstance != "" {
 		s.Target = mv.TargetInstance
 	}
@@ -1902,15 +2061,15 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 		}
 		dx := abs(*mv.RequestX - s.PlayerX)
 		dy := abs(*mv.RequestY - s.PlayerY)
-		if worldcore.JumpTooFar(dx, dy) && !m13NoclipAllowed(c.Username) {
+		if worldcore.JumpTooFar(dx, dy) && !noclipAllowed(c.Username) {
 			// Noclip jump (player.ts handleMovementRequest diff>2). m13:
 			// player.noclip bypasses the jump check (movement.ts noclip).
 			return rejectLocked(c, fmt.Sprintf("noclip request %d,%d->%d,%d", s.PlayerX, s.PlayerY, *mv.RequestX, *mv.RequestY))
 		}
-		if checkSpeed(s, dx+dy) && !m13NoclipAllowed(c.Username) {
+		if checkSpeed(c, dx+dy) && !noclipAllowed(c.Username) {
 			return rejectLocked(c, "speed request")
 		}
-		if blockedForPlayer(c, *mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !m13NoclipAllowed(c.Username) {
+		if blockedForPlayer(c, *mv.RequestX, *mv.RequestY) && !targetsResource(*mv.RequestX, *mv.RequestY, mv.TargetInstance) && !noclipAllowed(c.Username) {
 			stopPlayer(c)
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 		}
@@ -1927,13 +2086,13 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 			s.PlayerX, s.PlayerY = *mv.PlayerX, *mv.PlayerY
 			worldcore.SetEntityPos(c.Instance, s.PlayerX, s.PlayerY)
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
-			m5TrackPos(c)
+			trackPos(c)
 		}
 	case MovementStep:
 		if mv.NextGridX != nil && mv.NextGridY != nil {
 			dx := abs(*mv.NextGridX - s.PlayerX)
 			dy := abs(*mv.NextGridY - s.PlayerY)
-			if dx+dy > 0 && checkSpeed(s, dx+dy) {
+			if dx+dy > 0 && checkSpeed(c, dx+dy) {
 				return rejectLocked(c, "speed step")
 			}
 		}
@@ -1941,10 +2100,10 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 			s.PlayerX, s.PlayerY = *mv.PlayerX, *mv.PlayerY
 			worldcore.SetEntityPos(c.Instance, s.PlayerX, s.PlayerY)
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
-			m5TrackPos(c)
-			m8OnPositionUpdate(c)  // M8: lobby area enter/exit callbacks
-			m9OnPlayerMoved(c)     // M9: aggro scan on position update (Node detectAggro)
-			m10OnPositionUpdate(c) // M10: detectAreas parity (pvp/overlay/camera/music)
+			trackPos(c)
+			minigamePositionUpdate(c)  // M8: lobby area enter/exit callbacks
+			mobOnPlayerMoved(c)     // M9: aggro scan on position update (Node detectAggro)
+			areaPositionUpdate(c) // M10: detectAreas parity (pvp/overlay/camera/music)
 			handleDoorStep(c)      // doors fire on stopping on a door tile (player.ts:1280)
 		}
 		if mv.NextGridX != nil && mv.NextGridY != nil &&
@@ -1954,7 +2113,7 @@ func handleMovement(c *playerConn, mv clientMovement) bool {
 			worldcore.UpdateRegion(c, s.PlayerX, s.PlayerY)
 		} else if mv.NextGridX != nil && mv.NextGridY != nil {
 			// M5: stepping onto a loot tile picks it up.
-			m5PickupAtTile(c, *mv.NextGridX, *mv.NextGridY)
+			pickupAtTile(c, *mv.NextGridX, *mv.NextGridY)
 		}
 	case MovementFollow:
 		// Log-only: a Follow carrying a resource targetInstance is just the
@@ -1976,7 +2135,7 @@ func abs(v int) int { return worldcore.Abs(v) }
 // the resource (Request/Started/Step/Follow/Entity) is approach only and
 // never gathers. The 600ms per-instance debounce stays as a safety net.
 func handleTarget(c *playerConn, frame clientFrame) {
-	if len(frame) < 2 {
+	if c == nil || c.Conn == nil || len(frame) < 2 {
 		return
 	}
 	var msg []json.RawMessage
@@ -1993,29 +2152,35 @@ func handleTarget(c *playerConn, frame clientFrame) {
 	}
 	log.Printf("target opcode=%d instance=%s", opcode, instance)
 	// M5: Target on a loot entity picks it up (in addition to Step).
-	if m5IsLoot(instance) {
+	if isLoot(instance) {
 		// Bags additionally emit the Open frame (lootbag.open parity):
 		// the stock client never Targets bags (getTargetType -> None), so
 		// this only fires for scripted clients — take-all stays because
-		// the combat harness requires it.
+		// the combat harness requires it. A denied bag (someone else's)
+		// returns early with the notify and never reaches take-all.
 		if entity.IsBag(instance) {
-			if l, ok := entity.FindLoot(instance); ok && !lootBagOwnerDenied(c, l.Owner) {
-				sendLootBagOpen(c, instance)
+			l, ok := entity.FindLoot(instance)
+			if !ok {
+				return
 			}
+			if lootBagOwnerDenied(c, l.Owner) {
+				return
+			}
+			sendLootBagOpen(c, instance)
 		}
-		m5Pickup(c, instance)
+		pickup(c, instance)
 		return
 	}
 	// M6: Target Talk(0) on an NPC -> store open / bank / talk text.
 	if opcode == TargetTalk && isNPCInstance(instance) {
-		m6HandleNPCTarget(c, instance)
+		handleNPCTarget(c, instance)
 		return
 	}
 	// M10: Target Talk(0) on a chest entity -> openChest (player/incoming.ts
 	// handleTarget Talk branch: isChest() -> chest.openChest(player)).
 	if opcode == TargetTalk && !isNPCInstance(instance) {
-		if chest := m10ChestFor(instance); chest != nil {
-			m10OpenChest(c, chest)
+		if chest := chestFor(instance); chest != nil {
+			openChest(c, chest)
 			return
 		}
 		// World: Target Talk on a sign position -> Bubble text (sign.talk).
@@ -2031,7 +2196,7 @@ func handleTarget(c *playerConn, frame clientFrame) {
 // isNPCInstance reports whether the instance resolves to an npcs.json NPC
 // (showcase n-show-N keys map positionally onto showNPCs).
 func isNPCInstance(instance string) bool {
-	return m6ResolveNPCKey(nil, instance) != ""
+	return resolveNPCKey(nil, instance) != ""
 }
 
 // handleCombatReq routes one hero swing at a killable mob (M5); anything
@@ -2060,7 +2225,7 @@ func handleCombatReq(c *playerConn, frame clientFrame) {
 	log.Printf("combat instance=%s target=%s", cd.Instance, cd.Target)
 	// M9: any engine-registered mob is attackable; the legacy BossDummy
 	// path stays for the COMBAT party scene.
-	if m9MobFor(cd.Target) != nil || cd.Target == combatDummyInstance {
+	if mobFor(cd.Target) != nil || cd.Target == combatDummyInstance {
 		handlePlayerAttack(c, cd.Target)
 		petMirrorSwing(c, cd.Target) // pet same-target swing (no-op with no pet)
 	}
@@ -2133,13 +2298,16 @@ func isResourceInstance(id string) bool {
 	return ok
 }
 
-// stubSkillLevel is the M5-placeholder gathering level per skill
-// (resourceskill.ts `level`; real server gates resource.data.levelRequirement
-// > level with a notify). Env M4_SKILL_<NAME> overrides one skill, M4_SKILL
-// overrides all; default 1 (harvests the all-level-1 demo line, denies
-// high-level tables with a log).
-func stubSkillLevel(skill string) int {
-	if v := os.Getenv("M4_SKILL_" + skill); v != "" {
+// playerSkillLevel returns the attacker's real gathering skill level from
+// their playerState (resourceskill.ts `level`; gates resource.data.levelRequirement
+// > level with a notify). Falls back to 1 when the player is offline or the
+// skill is untrained (matching TS Skill default). Env M4_SKILL_<NAME> overrides
+// one skill, M4_SKILL overrides all (test/debug hook).
+func playerSkillLevel(attackerInstance, skill string) int {
+	// Env overrides for testing (preserve the M4 debug knobs).
+	// Skill name is uppercased for the env var: M4_SKILL_MINING, M4_SKILL_LUMBERJACKING, etc.
+	skillUpper := strings.ToUpper(skill)
+	if v := os.Getenv("M4_SKILL_" + skillUpper); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
@@ -2149,22 +2317,52 @@ func stubSkillLevel(skill string) int {
 			return n
 		}
 	}
-	return 1
+	// Look up the player's real skill level.
+	c, ok := worldcore.Find[*playerConn](attackerInstance)
+	if !ok || c == nil {
+		return 1
+	}
+	st := playerStateFor(c.Username)
+	pstateMu.Lock()
+	defer pstateMu.Unlock()
+	skillID, found := map[string]int{
+		"lumberjacking": player.SkillLumberjacking,
+		"mining":        player.SkillMining,
+		"fishing":       player.SkillFishing,
+		"foraging":      player.SkillForaging,
+	}[skill]
+	if !found {
+		return 1
+	}
+	if sd, ok := st.Skills[skillID]; ok && sd != nil {
+		return sd.Level
+	}
+	return 1 // untrained skill defaults to level 1
 }
 
-// stubToolLevel is the M5-placeholder equipped-tool tier per skill
-// (weapon.lumberjacking/mining/fishing from items.json; foraging needs no
-// tool — harvest() passes none). Defaults match the basic tier-1 tools:
-// bronzeaxe/ironaxe lumberjacking 1, bronzepickaxe mining 1, fishingpole
-// fishing 1. Env M4_TOOL_<SKILL>=0 simulates the wrong/missing tool (deny +
-// log, like the INVALID_WEAPON notify in lumberjacking/mining/fishing impl).
-func stubToolLevel(skill string) int {
-	if v := os.Getenv("M4_TOOL_" + skill); v != "" {
+// playerToolLevel returns the tier of the attacker's equipped tool for the
+// given gathering skill (weapon.lumberjacking/mining/fishing from items.json).
+// Returns 0 when no tool is equipped or the weapon is not a tool for that
+// skill (triggers the INVALID_WEAPON deny in hitResource). Env M4_TOOL_<SKILL>
+// overrides (test/debug hook).
+func playerToolLevel(attackerInstance, skill string) int {
+	// Env override for testing (skill name uppercased: M4_TOOL_MINING, etc.).
+	skillUpper := strings.ToUpper(skill)
+	if v := os.Getenv("M4_TOOL_" + skillUpper); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			return n
 		}
 	}
-	return 1
+	// Look up the player's equipped weapon and its tool tier.
+	c, ok := worldcore.Find[*playerConn](attackerInstance)
+	if !ok || c == nil {
+		return 1 // fallback: assume basic tool when offline
+	}
+	w := heroEquipSlot(c.Username, EquipmentWeapon)
+	if w.Key == "" {
+		return 0 // no weapon equipped
+	}
+	return toolTier(w.Key, skill)
 }
 
 // resourceRespawnDelay resolves the respawn timer for one table entry:
@@ -2210,7 +2408,7 @@ type playerConn struct {
 	// sessMu guards the M6 store/bank/NPC-talk session fields below. The
 	// conn goroutine writes them (controller ClearAccess/OpenStore path,
 	// bank/talk updates, movement clear) while the 20s store ticker reads
-	// storeOpen off-goroutine (m6peers.WithStoreOpen); every access —
+	// storeOpen off-goroutine (econPeers.WithStoreOpen); every access —
 	// including the EconomyConn seam in m6.go — goes through sessMu so
 	// -race stays clean under e2e/m6 load.
 	sessMu sync.RWMutex
@@ -2237,15 +2435,29 @@ type playerConn struct {
 	loiterRegion int
 	loiterSince  int64
 
+	// Region streaming (TS regions.ts handle/sendRegion parity): tracks
+	// which region IDs this connection has already received static tile
+	// data for. On every region change, newly visible surrounding regions
+	// not in this set are built and sent as a Map packet, then added.
+	// Seeded with the 9 spawn regions at login; reset on teleport.
+	regionsLoaded map[int]bool
+
 	// M7 chat session state (player.chat parity).
 	rank int        // Modules.Ranks value (seeded for e2e only)
 	chat *chatState // rate limiter + global cooldown + rank cache
 
 	// M8 minigame session state (player.minigame/team/coursing* parity).
-	m8Game   string // "coursing"|"teamwar" when playing (player.minigame)
-	m8Team   int    // Team enum value for the active game
-	m8Score  int    // coursingScore mirror (score packets + persistence)
-	m8Target string // coursingTarget (pointer entity)
+	mgGame   string // "coursing"|"teamwar" when playing (player.minigame)
+	mgTeam   int    // Team enum value for the active game
+	mgScore  int    // coursingScore mirror (score packets + persistence)
+	mgTarget string // coursingTarget (pointer entity)
+
+	// Connection lifecycle gates (conn goroutine only — no lock needed):
+	// handshakeDone tracks a successful C Handshake so Login without a
+	// prior Handshake is rejected; loggedIn rejects a second Login
+	// identity switch on the same socket.
+	handshakeDone bool
+	loggedIn      bool
 }
 
 // Entity is the central registry record (M2) alias: canonical owner is the
@@ -2311,7 +2523,7 @@ func registerDisconnectHooks() {
 			return
 		}
 		// M8: leave the minigame (disconnect() kicks to lobby position).
-		m8OnDisconnect(c)
+		minigameDisconnect(c)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)
@@ -2319,7 +2531,7 @@ func registerDisconnectHooks() {
 			return
 		}
 		// M9: drop HP state + release any mob targeting this player.
-		m9PlayerLeave(c)
+		mobPlayerLeave(c)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)
@@ -2327,7 +2539,7 @@ func registerDisconnectHooks() {
 			return
 		}
 		// M10: drop per-player area state (pvp/overlay/camera/song/freezing).
-		m10ForgetPlayer(c.Instance)
+		forgetAreaPlayer(c.Instance)
 		// Plateau: drop the tracked plateauLevel.
 		plateauForget(c.Instance)
 		// Dynmap: drop the last-pushed map signature.
@@ -2380,7 +2592,15 @@ func registerDisconnectHooks() {
 		}
 		// Trade: notify the open peer with Trade Close + clear both sides
 		// (player.ts disconnect trade.close() parity; no-op without a session).
-		m12DisconnectClose(c)
+		disconnectTrade(c)
+	})
+	worldcore.OnDisconnect(func(v any) {
+		c, ok := v.(*playerConn)
+		if !ok || c == nil {
+			return
+		}
+		// Statistics: accumulate session time before the persist flush.
+		statsRecordDisconnect(c.Username)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)
@@ -2388,7 +2608,7 @@ func registerDisconnectHooks() {
 			return
 		}
 		// M5: synchronous persist on disconnect (plus the 10s dirty flush).
-		m5SaveSync(c.Username)
+		savePlayerSync(c.Username)
 	})
 	worldcore.OnDisconnect(func(v any) {
 		c, ok := v.(*playerConn)
@@ -2396,7 +2616,7 @@ func registerDisconnectHooks() {
 			return
 		}
 		// M11: quest/achievement rows persist on disconnect (same path).
-		m11PersistQuests(c.Username)
+		persistQuests(c.Username)
 	})
 }
 
@@ -2437,7 +2657,7 @@ func hitResource(attacker, instance string) {
 		log.Printf("resource %s (%s) has no table entry, swing ignored", instance, desc.Key)
 		return
 	}
-	skillLevel := stubSkillLevel(skill)
+	skillLevel := playerSkillLevel(attacker, skill)
 	if info.LevelRequirement > skillLevel {
 		log.Printf("resource %s denied: %s level %d < required %d (key %s)",
 			instance, skill, skillLevel, info.LevelRequirement, desc.Key)
@@ -2445,7 +2665,7 @@ func hitResource(attacker, instance string) {
 	}
 	toolLevel := 0
 	if skill != "foraging" {
-		toolLevel = stubToolLevel(skill)
+		toolLevel = playerToolLevel(attacker, skill)
 		if toolLevel <= 0 {
 			log.Printf("resource %s denied: missing %s tool for %s (key %s)",
 				instance, skill, desc.Key, desc.Key)
@@ -2489,7 +2709,7 @@ func hitResource(attacker, instance string) {
 		if worldHarvestDouble(skill) {
 			yield = 2 // world: lumberjacking/mining double-yield events
 		}
-		idx := m5AddItem(ci.Username, info.Item, yield)
+		idx := addItem(ci.Username, info.Item, yield)
 		_ = gnet.Send(ci.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
 			Slot: &slotData{Index: idx, Key: info.Item, Count: yield, Enchantments: map[string]any{}},
@@ -2497,14 +2717,14 @@ func hitResource(attacker, instance string) {
 		markDirty(ci.Username)
 	}
 	// M5: table experience lands on the real gathering skill.
-	m5GatherXP(attacker, skill, info.Experience)
+	gatherXP(attacker, skill, info.Experience)
 	// Statistics: successful exhausts count toward gather milestones
 	// (resourceskill.ts:121 handleSkill parity — after item + XP land).
 	attackerConn, _ := worldcore.Find[*playerConn](attacker)
 	statsHandleSkill(attackerConn, skill)
 	// M11: quest resource stages fire on exhaust (quest.ts resourceCallback
 	// from resourceskill.ts:131 — after the item + XP land).
-	m11Resource(attackerConn, skill, desc.Key)
+	questResource(attackerConn, skill, desc.Key)
 	resMu.Lock()
 	st.depleted = true
 	delay := resourceRespawnDelay(info)
@@ -2534,6 +2754,9 @@ type clientFrame []json.RawMessage
 // sendEntities/sendEntityPositions). The client diffs Spawns vs its spawned
 // set and asks for the missing ones via Who.
 func handleList(c *playerConn) {
+	if c == nil || c.Conn == nil {
+		return
+	}
 	regions := c.Conn.Regions()
 	regionSet := make(map[int]bool, len(regions))
 	for _, r := range regions {
@@ -2556,9 +2779,11 @@ func handleList(c *playerConn) {
 }
 
 // handleWho answers C->S Who (packet 7, [ids]): one S Spawn per known live
-// entity (incoming.ts handleWho). Unknown ids are ignored (logged).
+// entity (incoming.ts handleWho). Unknown ids are ignored (logged). Replies
+// are scoped to the requester's 9-region interest set (List parity): ids
+// outside it are skipped so a client cannot enumerate the whole world.
 func handleWho(c *playerConn, frame clientFrame) {
-	if len(frame) < 2 {
+	if c == nil || c.Conn == nil || len(frame) < 2 {
 		return
 	}
 	var ids []string
@@ -2572,6 +2797,10 @@ func handleWho(c *playerConn, frame clientFrame) {
 			log.Printf("who unknown instance=%s", id)
 			continue
 		}
+		if x, y, found := worldcore.EntityPos(id); !found || !worldcore.ClientInterested(c, x, y) {
+			log.Printf("who out-of-interest instance=%s", id)
+			continue
+		}
 		_ = gnet.Send(c.Conn, pkt(PacketSpawn, payload))
 	}
 	log.Printf("who reply instances=%d", len(ids))
@@ -2579,20 +2808,19 @@ func handleWho(c *playerConn, frame clientFrame) {
 
 // handleSyncReq forwards a C->S Sync (packet 10, PlayerData) to the other
 // players whose interest includes the sender (other-player equip/appearance
-// broadcast, connection.ts handleSync). Unicast echo is skipped.
+// broadcast, connection.ts handleSync). Unicast echo is skipped. The
+// instance is always the sender's own (spoofed instances are overwritten)
+// so a client cannot impersonate another entity's Sync.
 func handleSyncReq(c *playerConn, frame clientFrame) {
-	if len(frame) < 2 {
+	if c == nil || c.Conn == nil || len(frame) < 2 {
 		return
 	}
 	var data map[string]any
 	if err := json.Unmarshal(frame[1], &data); err != nil {
 		return
 	}
-	inst, _ := data["instance"].(string)
-	if inst == "" {
-		inst = c.Instance
-		data["instance"] = inst
-	}
+	inst := c.Instance
+	data["instance"] = inst
 	x, y, found := worldcore.EntityPos(inst)
 	if !found {
 		x, y = c.Sess.PlayerX, c.Sess.PlayerY
@@ -2629,7 +2857,7 @@ func spawnPayload(instance string) (any, bool) {
 	}
 	projMu.Unlock()
 	// M5: live loot entities resolve here for Who.
-	if p, ok := m5LootPayload(instance); ok {
+	if p, ok := lootPayload(instance); ok {
 		return p, true
 	}
 	resMu.Lock()
@@ -2658,7 +2886,7 @@ func spawnPayload(instance string) (any, bool) {
 			ph.X, ph.Y = x, y
 			// M10: Spawn PlayerData.pvp mirrors the live PVP state
 			// (player.ts serialize).
-			ph.Pvp = m10PVPState(instance)
+			ph.Pvp = pvpState(instance)
 			return ph, true
 		}
 	}
@@ -2666,7 +2894,7 @@ func spawnPayload(instance string) (any, bool) {
 		return d, true
 	}
 	// Marker NPCs (real-mode world.json `entities` markers): showcase Spawn
-	// shape, so NPC talk/store/bank resolve through m6ResolveNPCKey.
+	// shape, so NPC talk/store/bank resolve through resolveNPCKey.
 	if d, ok := markerNPCPayload(instance); ok {
 		return d, true
 	}
@@ -2847,9 +3075,10 @@ func handleConn(conn *websocket.Conn) {
 					// Version contract failed: notice on an existing opcode
 					// (Notification Text + hub redirect payload, no wire
 					// change) then close (ban-path parity). GVER_STRICT=0
-					// disables the gate for dev.
+					// disables the gate for dev. The deferred RemoveClient
+					// runs the disconnect fanout (idempotent — no explicit
+					// call here).
 					sendGVerReject(conn, gv)
-					worldcore.RemoveClient(conn)
 					return
 				}
 				reply := HandshakeData{
@@ -2862,7 +3091,20 @@ func handleConn(conn *websocket.Conn) {
 					log.Printf("write handshake: %v", err)
 					return
 				}
+				c.handshakeDone = true
 			case PacketLogin: // C Login (opcode lives inside data) -> Welcome + Map only
+				// Login requires a prior successful Handshake (reject
+				// handshake-less logins that skip the gVer contract).
+				if !c.handshakeDone {
+					log.Printf("login rejected instance=%s (no prior handshake)", c.Instance)
+					return
+				}
+				// Double Login would switch identity mid-socket (c.Username
+				// overwrite + second Welcome); reject it.
+				if c.loggedIn {
+					log.Printf("login rejected instance=%s (already logged in as %s)", c.Instance, c.Username)
+					return
+				}
 				var login struct {
 					Username  string `json:"username"`
 					SeedGold  int    `json:"seedGold,omitempty"`
@@ -2873,24 +3115,46 @@ func handleConn(conn *websocket.Conn) {
 				if len(frame) >= 2 {
 					_ = json.Unmarshal(frame[1], &login)
 				}
+				// M13 login gate BEFORE any login state creation (Node
+				// login.go database loader -> connection.reject): banned
+				// users get the 'ban' text frame and a close with no
+				// pstates/SetEntityPos/dirty/seed side effects.
+				if login.Username != "" && checkBan(login.Username) {
+					_ = gnet.WriteText(conn, []byte("ban"), 2*time.Second)
+					return
+				}
 				// M5: Welcome from DB when the login username is known, else
 				// fresh; Container/Skill batches restore visible state.
-				ph, extra := m5LoginWelcome(c, login.Username)
+				ph, extra := loginWelcome(c, login.Username)
 				// M6 e2e hook (TESTMAP only): seedGold tops the account up to N
-				// gold before the Container batch is built, giving the harness a
-				// deterministic wallet (Node e2e accounts start pre-loaded).
+				// gold, folding the seeded wallet into the single inventory
+				// Container Batch (no double-Batch: the welcome Batch is
+				// replaced in place when present).
 				if login.SeedGold > 0 && testMode && !cleanMode && !combatMode {
-					m6SeedGold(c.Username, login.SeedGold)
-					extra = append(extra, pktOp(PacketContainer, ContainerBatch, containerData{
+					seedGold(c.Username, login.SeedGold)
+					seeded := pktOp(PacketContainer, ContainerBatch, containerData{
 						Type: ContainerTypeInventory,
-						Data: &containerBatch{Slots: m6InvSlots(c.Username)},
-					}))
+						Data: &containerBatch{Slots: invSlots(c.Username)},
+					})
+					replaced := false
+					for i, f := range extra {
+						if len(f) == 3 && f[0] == PacketContainer && f[1] == ContainerBatch {
+							if cd, ok := f[2].(containerData); ok && cd.Type == ContainerTypeInventory {
+								extra[i] = seeded
+								replaced = true
+								break
+							}
+						}
+					}
+					if !replaced {
+						extra = append(extra, seeded)
+					}
 				}
 				// M6 equipment e2e hook (TESTMAP only): seedArrow appends a
 				// fresh arrow stack so the harness gets a deterministic slot
 				// index (arrows are Equipment.Arrows-equippable).
 				if login.SeedArrow > 0 && testMode && !cleanMode && !combatMode {
-					arrowIdx := m6SeedItem(c.Username, "arrow", login.SeedArrow)
+					arrowIdx := seedItem(c.Username, "arrow", login.SeedArrow)
 					extra = append(extra, pktOp(PacketContainer, ContainerAdd, containerData{
 						Type: ContainerTypeInventory,
 						Slot: &slotData{Index: arrowIdx, Key: "arrow", Count: login.SeedArrow, Enchantments: map[string]any{}},
@@ -2906,7 +3170,7 @@ func handleConn(conn *websocket.Conn) {
 				// M8 e2e hook (TESTMAP only): seedPos teleports the freshly
 				// logged-in player to a tile (usually inside a minigame lobby
 				// area) so the harness skips the long walk from spawn.
-				// Tracked via m5TrackPos (same helper walked movement uses:
+				// Tracked via trackPos (same helper walked movement uses:
 				// st.X/Y + dirty + plateau), so saves persist the seeded
 				// tile rather than the stale spawn tile.
 				if len(login.SeedPos) == 2 && testMode && !cleanMode && !combatMode {
@@ -2914,35 +3178,28 @@ func handleConn(conn *websocket.Conn) {
 					c.Sess.PlayerX, c.Sess.PlayerY = x, y
 					worldcore.SetEntityPos(c.Instance, x, y)
 					worldcore.UpdateRegion(c, x, y)
-					m5TrackPos(c)
+					trackPos(c)
 					ph.X, ph.Y = x, y
 					extra = append(extra, pkt(PacketTeleport, teleportData{Instance: c.Instance, X: x, Y: y}))
 					// M8: the position change may cross a lobby area boundary
 					// (onEnter parity for the seeded tile).
-					m8OnPositionUpdate(c)
+					minigamePositionUpdate(c)
 					// M10: seed area state (pvp/overlay/camera/song) so the
 					// Welcome Spawn carries the right pvp flag.
-					m10OnPositionUpdate(c)
+					areaPositionUpdate(c)
 				}
-				// M13 login gates: banned users get the 'ban' text frame and a
-				// close (Node login.go database loader -> connection.reject);
-				// the persisted mspeed override applies to the session before
-				// the first movement check.
-				if m13CheckBan(c.Username) {
-					_ = gnet.WriteText(conn, []byte("ban"), 2*time.Second)
-					worldcore.RemoveClient(conn)
-					return
-				}
-				if ms := m13MovementSpeed(c.Username); ms > 0 {
+				// M13 mspeed override applies to the session before the first
+				// movement check (ban already gated above, pre-state).
+				if ms := cmdMovementSpeed(c.Username); ms > 0 {
 					c.Sess.MovementSpeed = ms
 				}
 				frames := append([][]any{pkt(PacketWelcome, ph), buildMapFrame()}, extra...)
 				// M11: restore + batch quest/achievement state after the login
 				// extras (handler.ts:69-70 onLoaded → handleQuests/
-				// handleAchievements Batch frames; m5Load precedent).
-				m11EnsureTables()
-				m11LoadQuests(c.Username)
-				frames = append(frames, m11LoginBatches(c.Username)...)
+				// handleAchievements Batch frames; loadPlayerState precedent).
+				ensureQuestTables()
+				loadQuests(c.Username)
+				frames = append(frames, questLoginBatches(c.Username)...)
 				// Abilities: restore unlocks + queue the Ability Batch
 				// (handler.ts onLoaded ability serialize).
 				abLoadAbilities(c.Username)
@@ -2956,6 +3213,8 @@ func handleConn(conn *websocket.Conn) {
 					log.Printf("write welcome/map: %v", err)
 					return
 				}
+				c.loggedIn = true
+				resetRegionsLoaded(c) // region streaming: seed loaded-set from actual pos
 				worldPushLights(c) // world: login region-enter Lamp fan-out
 				maybeBannerConn(c) // R2: refresh banner when behind preferred (hub-gated no-op)
 			case PacketReady: // C Ready{regionsLoaded,userAgent} -> Spawn* (only here)
@@ -2971,23 +3230,23 @@ func handleConn(conn *websocket.Conn) {
 			case PacketSync: // C Sync PlayerData -> forward to region neighbours
 				handleSyncReq(c, frame)
 			case PacketChat: // C Chat [text] -> sanitize, commands, region bubble (M7)
-				m7HandleChat(c, frame)
+				handleChat(c, frame)
 			case PacketMinigame: // C Minigame {m8test|m9test|m10test} -> test hooks (M8-M10 TESTMAP)
-				m8HandleTest(c, frame)
-				m10HandleTest(c, frame)
+				handleMinigameTest(c, frame)
+				handleAreaTest(c, frame)
 				if len(frame) >= 2 {
 					var probe map[string]json.RawMessage
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m9test"] != nil {
-						m9TestHandler(c, frame[1])
+						handleMobTest(c, frame[1])
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m11test"] != nil {
-						m11HandleTest(c, frame[1])
+						handleQuestTest(c, frame[1])
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m12test"] != nil {
-						m12HandleTest(c, frame[1])
+						handleTradeTest(c, frame[1])
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["m13test"] != nil {
-						m13TestHandler(c, frame[1])
+						handleCommandTest(c, frame[1])
 					}
 					if err := json.Unmarshal(frame[1], &probe); err == nil && probe["abtest"] != nil {
 						abTestHandler(c, frame[1])
@@ -3006,10 +3265,10 @@ func handleConn(conn *websocket.Conn) {
 					}
 				}
 			case PacketEquipment: // C Equipment {opcode,type} -> Unequip (M6)
-				m6HandleEquipment(c, frame)
+				handleEquipment(c, frame)
 			case PacketQuest: // C Quest {key} -> accept the start prompt (M11)
 				if len(frame) >= 2 {
-					m11HandleAccept(c, frame[1])
+					handleQuestAccept(c, frame[1])
 				}
 			case PacketAbility: // C Ability {opcode,key,index} -> use / quickslot
 				if len(frame) >= 2 {
@@ -3031,18 +3290,18 @@ func handleConn(conn *websocket.Conn) {
 				}
 			case PacketTrade: // C Trade (M12)
 				if len(frame) >= 2 {
-					m12HandleTrade(c, frame[1])
+					handleTrade(c, frame[1])
 				}
 			case PacketEnchant: // C Enchant Select/Confirm (M12)
 				if len(frame) >= 2 {
-					m12HandleEnchant(c, frame[1])
+					handleEnchant(c, frame[1])
 				}
 			case PacketCrafting: // C Crafting Select/Craft (M12)
 				if len(frame) >= 2 {
-					m12HandleCrafting(c, frame[1])
+					handleCrafting(c, frame[1])
 				}
 			case PacketRespawn: // C Respawn [] -> player.respawn (M9)
-				m9HandleRespawn(c)
+				handleMobRespawn(c)
 			case PacketMovement: // C [11,{opcode,...}] -> Stop/Teleport on blocked tiles
 				if len(frame) < 2 {
 					continue
@@ -3057,9 +3316,9 @@ func handleConn(conn *websocket.Conn) {
 			case PacketTarget: // C Target [opcode, instance] -> gather / loot / NPC talk
 				handleTarget(c, frame)
 			case PacketStore: // C Store {opcode,key,index,count} -> Buy/Sell/Select (M6)
-				m6HandleStore(c, frame)
+				handleStore(c, frame)
 			case PacketContainer: // C Container {opcode,...} -> bank moves/swap/drop (M6)
-				m6HandleContainer(c, frame)
+				handleContainer(c, frame)
 			case PacketCombat: // C Combat {instance,target} -> hero swing on killables
 				handleCombatReq(c, frame)
 			case PacketExamine: // C Examine [instance] -> description notify (mob/item)
@@ -3069,7 +3328,7 @@ func handleConn(conn *websocket.Conn) {
 			case PacketAnimation: // C Animation {resourceInstance} -> chop on that oak
 				handleAnimationReq(frame)
 			default:
-				// Log-only: stub answers nothing else.
+				log.Printf("unknown opcode id=%d instance=%s (dropped)", id, c.Instance)
 			}
 		}
 	}
@@ -3079,18 +3338,18 @@ func handleConn(conn *websocket.Conn) {
 // persist + registries + schedulers + tick loop + entity seed + showcase +
 // combat brains + API/console starts. Called once by app.Run via Steps.
 func Boot() {
-	m5Init()
-	m6StartStoreTicker() // M6: stores.json registry + 20s stock refresh
-	m11EnsureTables()    // M11: quests/achievements SQLite tables (schema up-front)
-	m13EnsureTables()    // M13: mute/ban/jail/noclip flags table (schema up-front)
+	initPlayerState()
+	startStoreTicker() // M6: stores.json registry + 20s stock refresh
+	ensureQuestTables()    // M11: quests/achievements SQLite tables (schema up-front)
+	ensureCmdTables()    // M13: mute/ban/jail/noclip flags table (schema up-front)
 	abEnsureTables()     // abilities: unlock table (schema up-front)
 	socEnsureTables()    // social: guilds + friends tables (schema up-front)
 	socLoadGuilds()      // social: rebuild the guild registry from the tables
 	worldBoot()          // world: warps registry + globals + event scheduler
-	m8LoadGames()        // M8: world.json minigame areas + 1s tick engines
-	m10LoadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
-	m10InjectTestAreas() // M10: TESTMAP synthetic area bands for the e2e
-	m9Engine()           // M9: mob AI engine (mobs.json/spawns.json, 500ms tick)
+	loadMinigames()        // M8: world.json minigame areas + 1s tick engines
+	loadAreas()       // M10: world.json camera/music/pvp/overlay/chest/dynamic areas
+	injectTestAreas() // M10: TESTMAP synthetic area bands for the e2e
+	mobEngine()           // M9: mob AI engine (mobs.json/spawns.json, 500ms tick)
 	startTickLoop()
 	initEntities()
 	// D2a: region geometry + region-enter hook for the world Registry (the
@@ -3098,8 +3357,10 @@ func Boot() {
 	// disconnect fanout hooks owned by the Registry.
 	worldcore.Configure(sideLen, mapDivisionSize, surroundingRegions, func(v any) {
 		if pc, ok := v.(*playerConn); ok {
+			streamNewRegions(pc) // region streaming: send newly visible regions
 			worldPushLights(pc) // world: region-enter Lamp fan-out (deduped, no-op when none new)
 			markLoiterRegion(pc, worldcore.TileRegion(pc.Sess.PlayerX, pc.Sess.PlayerY))
+			markRegionChange(pc) // anti-cheat: 1.5s speed exemption after region change
 		}
 	})
 	registerDisconnectHooks()

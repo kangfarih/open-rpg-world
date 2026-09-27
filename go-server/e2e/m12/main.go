@@ -255,7 +255,7 @@ func login(user string, seedPos []int) *websocket.Conn {
 	drain(600 * time.Millisecond)
 	lastFrames = nil
 	posJSON, _ := json.Marshal(seedPos)
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s}]`, user, posJSON))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s,"seedRank":2}]`, user, posJSON))
 	drain(1500 * time.Millisecond)
 	for _, f := range lastFrames {
 		var id int

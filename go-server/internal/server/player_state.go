@@ -1,4 +1,4 @@
-// M5 slice 1: drops/loot + XP/skills + SQLite persist slice.
+// Player state — drops/loot + XP/skills + SQLite persist slice.
 //
 // Drops mirror packages/server mob.getDrops: one roll on the mob's personal
 // `drops` list plus one roll per `dropTables` entry (tables.json), chance vs
@@ -24,18 +24,20 @@ import (
 	"database/sql"
 	"encoding/json"
 	"log"
-	"math"
-	"math/rand"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"rpg-world-server/internal/abilities"
 	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/meta"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/persist"
 	"rpg-world-server/internal/player"
+	"rpg-world-server/internal/player/chat"
+	"rpg-world-server/internal/resets"
 	worldcore "rpg-world-server/internal/world"
 
 	_ "modernc.org/sqlite"
@@ -57,7 +59,7 @@ func nextExp(xp int) int { return player.NextExp(xp) }
 //
 // Canonical owner: internal/entity (loot.go). The aliases + wrappers below
 // keep the root names every other seam uses with identical values.
-type m5DropEntry struct {
+type dropEntry struct {
 	Key     string `json:"key"`
 	Chance  int    `json:"chance"`
 	Count   int    `json:"count"`
@@ -66,44 +68,43 @@ type m5DropEntry struct {
 }
 
 type (
-	m5MobProfile = entity.MobProfile
-	m5DropJSON   = entity.DropJSON
-	m5Drop       = entity.Drop
-	m5Loot       = entity.Loot
+	dropJSON = entity.DropJSON
+	dropDef  = entity.Drop
+	lootBag  = entity.Loot
 )
 
-const m5DropProbability = entity.DropProbability
+const dropProbability = entity.DropProbability
 
-func m5DataPath(name string) string {
+func dataPath(name string) string {
 	return resourceDataPath(name)
 }
 
 func loadM5Tables() { entity.LoadLootTables() }
 
-// m5RollEntry ports mob.getRandomItem (canonical owner: internal/entity
-// RollEntry). Gate filtering lives in m5RollEntryGated (M11 quest gates
+// rollEntry ports mob.getRandomItem (canonical owner: internal/entity
+// RollEntry). Gate filtering lives in rollEntryGated (M11 quest gates
 // evaluate against the killer's progression); this rolls uniformly over the
 // entries given.
-func m5RollEntry(entries []m5DropJSON, level int) (key string, count int, ok bool) {
+func rollEntry(entries []dropJSON, level int) (key string, count int, ok bool) {
 	return entity.RollEntry(entries, level)
 }
 
-// m5GetDrops ports mob.getDrops for a mob key (canonical owner:
+// getDrops ports mob.getDrops for a mob key (canonical owner:
 // internal/entity GetDrops).
-func m5GetDrops(mobKey string) []m5Drop {
+func getDrops(mobKey string) []dropDef {
 	return entity.GetDrops(mobKey)
 }
 
-// m5GetDropsFor ports mob.getDrops with a killer context (canonical owner:
+// getDropsFor ports mob.getDrops with a killer context (canonical owner:
 // internal/entity GetDropsFor).
-func m5GetDropsFor(mobKey, username string) []m5Drop {
+func getDropsFor(mobKey, username string) []dropDef {
 	return entity.GetDropsFor(mobKey, username)
 }
 
-// m5RollEntryGated filters quest/achievement-gated entries by the killer's
+// rollEntryGated filters quest/achievement-gated entries by the killer's
 // progression, then rolls uniformly (canonical owner: internal/entity
 // RollEntryGated).
-func m5RollEntryGated(username string, entries []m5DropJSON, level int) (string, int, bool) {
+func rollEntryGated(username string, entries []dropJSON, level int) (string, int, bool) {
 	return entity.RollEntryGated(username, entries, level)
 }
 
@@ -124,31 +125,52 @@ func (lootWorld) EntityPos(inst string) (int, int, bool) { return worldcore.Enti
 func (lootWorld) RemoveEntity(inst string)               { worldcore.RemoveEntity(inst) }
 func (lootWorld) Broadcast(frames ...[]any)              { worldcore.Broadcast(frames...) }
 
-func m5NearWalkable(x, y int) (int, int) { return entity.NearWalkable(x, y) }
+func nearWalkable(x, y int) (int, int) { return entity.NearWalkable(x, y) }
 
-// m5SpawnLoot drops the roll at the corpse: single -> Item, multi -> LootBag
+// spawnLoot drops the roll at the corpse: single -> Item, multi -> LootBag
 // (take-all on Target/Step; lootbag menu Open flow deferred, logged).
-func m5SpawnLoot(mobKey string, cx, cy int, owner string) {
+func spawnLoot(mobKey string, cx, cy int, owner string) {
 	entity.SpawnLoot(mobKey, cx, cy, owner)
 }
 
-func m5BlinkLoot(inst string) { entity.BlinkLoot(inst) }
+func blinkLoot(inst string) { entity.BlinkLoot(inst) }
 
-func m5DestroyLoot(inst, why string) { entity.DestroyLoot(inst, why) }
+func destroyLoot(inst, why string) { entity.DestroyLoot(inst, why) }
+
+// ---------------------------------------------------------------------------
+// Effect entities (type 9).
+// ---------------------------------------------------------------------------
+//
+// Canonical owner: internal/entity (effects.go: registry, duration loading,
+// spawn/destroy). The adapter below implements entity.EffectWorld over the
+// same worldcore seam as lootWorld.
+
+// effectWorld implements entity.EffectWorld over the world Registry.
+type effectWorld struct{}
+
+func (effectWorld) SetEntityPos(inst string, x, y int) { worldcore.SetEntityPos(inst, x, y) }
+func (effectWorld) RemoveEntity(inst string)           { worldcore.RemoveEntity(inst) }
+func (effectWorld) Broadcast(frames ...[]any)          { worldcore.Broadcast(frames...) }
+
+// spawnEffect creates a timed effect entity at (x, y) with auto-despawn
+// (effectentities.json duration or 4000ms default).
+func spawnEffect(key string, x, y int) string {
+	return entity.SpawnEffect(key, x, y)
+}
 
 // ---------------------------------------------------------------------------
 // Player state: inventory + skills + XP.
 // ---------------------------------------------------------------------------
 
-type m5Slot struct {
+type slotDef struct {
 	Key   string
 	Count int
 	Ench  Enchantments // item enchantments {enchantmentId: {level}} (M12)
 }
 
-// m5SlotEnchJSON serializes a slot's enchantments for the inventory DB
+// slotEnchJSON serializes a slot's enchantments for the inventory DB
 // column ({} when none).
-func m5SlotEnchJSON(s m5Slot) string {
+func slotEnchJSON(s slotDef) string {
 	if s.Ench == nil {
 		return "{}"
 	}
@@ -159,8 +181,8 @@ func m5SlotEnchJSON(s m5Slot) string {
 	return string(raw)
 }
 
-// m5SlotEnchParse restores a slot's enchantments from the DB column.
-func m5SlotEnchParse(raw string) Enchantments {
+// slotEnchParse restores a slot's enchantments from the DB column.
+func slotEnchParse(raw string) Enchantments {
 	if raw == "" || raw == "{}" {
 		return nil
 	}
@@ -174,25 +196,29 @@ func m5SlotEnchParse(raw string) Enchantments {
 	return ench
 }
 
-type m5Skill struct {
+type skillDef struct {
 	Level int
 	XP    int
 }
 
-type m5State struct {
+type playerState struct {
 	X, Y   int
 	Level  int
 	HP     int
 	Rank   int // Modules.Ranks value (persist rank column parity)
-	Inv    []m5Slot
-	Bank   []m5Slot
-	Equip  []m5Slot // length ModulesEquipmentCount; Count 0 = empty slot
-	Skills map[int]*m5Skill
+	HomeX  int // home-point x (/sethome bind; respawn target)
+	HomeY  int // home-point y (/sethome bind; respawn target)
+	LastDailyReset  int64 // epoch ms of last daily reset (0 = never)
+	LastWeeklyReset int64 // epoch ms of last weekly reset (0 = never)
+	Inv    []slotDef
+	Bank   []slotDef
+	Equip  []slotDef // length ModulesEquipmentCount; Count 0 = empty slot
+	Skills map[int]*skillDef
 }
 
 var (
 	pstateMu sync.Mutex
-	pstates  = map[string]*m5State{}
+	pstates  = map[string]*playerState{}
 )
 
 // Skill ids mirror Modules.Skills order (canonical owner: internal/player).
@@ -209,32 +235,35 @@ const (
 	SkillForaging      = player.SkillForaging
 )
 
-func m5SkillName(id int) string { return player.SkillName(id) }
+func skillName(id int) string { return player.SkillName(id) }
 
-func m5CombatSkill(id int) bool { return player.CombatSkill(id) }
+func combatSkill(id int) bool { return player.CombatSkill(id) }
 
-func m5StateFor(key string) *m5State {
+func playerStateFor(key string) *playerState {
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	st, ok := pstates[key]
 	if !ok {
-		st = &m5State{X: 100, Y: 96, Level: 1, HP: 100, Skills: map[int]*m5Skill{}}
+		// New player: level 1, full HP (39 + 1*30 = 69).
+		st = &playerState{X: 100, Y: 96, Level: 1, HP: meta.HeroMaxHPForLevel(1),
+			HomeX: entity.HeroSpawnX, HomeY: entity.HeroSpawnY,
+			Skills: map[int]*skillDef{}}
 		pstates[key] = st
 	}
 	if st.Skills == nil {
-		st.Skills = map[int]*m5Skill{}
+		st.Skills = map[int]*skillDef{}
 	}
 	// Equipment is a fixed 12-slot array (Modules.Equipment): nil or short
 	// slices would panic on slot indexing, so normalize lazily here.
 	if len(st.Equip) != ModulesEquipmentCount {
-		eq := make([]m5Slot, ModulesEquipmentCount)
+		eq := make([]slotDef, ModulesEquipmentCount)
 		copy(eq, st.Equip)
 		st.Equip = eq
 	}
 	return st
 }
 
-func m5CombatLevelLocked(st *m5State) int {
+func combatLevelLocked(st *playerState) int {
 	levels := make(map[int]int, len(st.Skills))
 	for id, s := range st.Skills {
 		levels[id] = s.Level
@@ -245,10 +274,10 @@ func m5CombatLevelLocked(st *m5State) int {
 // connByInstance moved to internal/world (D2a): use
 // worldcore.Find[*playerConn](inst) at the former call sites.
 
-// m5AddXP awards skill XP (canonical owner: internal/player AddXP). The
+// addXP awards skill XP (canonical owner: internal/player AddXP). The
 // state transition runs under pstateMu here; frames, level-up fanout and
 // logs live in the package with identical shapes/text.
-func m5AddXP(c *playerConn, key string, skill, amount int) int {
+func addXP(c *playerConn, key string, skill, amount int) int {
 	var pc *player.Conn
 	if c != nil {
 		cc := c
@@ -263,18 +292,18 @@ func m5AddXP(c *playerConn, key string, skill, amount int) int {
 	return player.AddXP(xpDeps(), pc, key, skill, amount)
 }
 
-// xpDeps wires the player.XP seams to the root globals (m5StateFor/pstateMu
+// xpDeps wires the player.XP seams to the root globals (playerStateFor/pstateMu
 // state, gnet/worldcore transport, welcomePlayer Sync payload, persist
 // dirty set, world XP event).
 func xpDeps() player.Deps {
 	return player.Deps{
 		ApplyAward: func(key string, skill, amount int) player.AwardResult {
-			st := m5StateFor(key)
+			st := playerStateFor(key)
 			pstateMu.Lock()
 			defer pstateMu.Unlock()
 			s, ok := st.Skills[skill]
 			if !ok {
-				s = &m5Skill{Level: 1}
+				s = &skillDef{Level: 1}
 				st.Skills[skill] = s
 			}
 			prev := s.Level
@@ -286,8 +315,8 @@ func xpDeps() player.Deps {
 			if s.Level < 1 {
 				s.Level = 1
 			}
-			if m5CombatSkill(skill) {
-				st.Level = m5CombatLevelLocked(st)
+			if combatSkill(skill) {
+				st.Level = combatLevelLocked(st)
 			}
 			return player.AwardResult{
 				Prev: prev, Level: s.Level, XP: s.XP,
@@ -320,9 +349,9 @@ func xpDeps() player.Deps {
 	}
 }
 
-func m5Percentage(xp int) float64 { return player.Percentage(xp) }
+func percentage(xp int) float64 { return player.Percentage(xp) }
 
-// m5AwardCombatXP ports player.handleExperience (canonical owner:
+// awardCombatXP ports player.handleExperience (canonical owner:
 // internal/player AwardCombatXP). The class flags mirror
 // weapon.isArcher/isMagic (heroIsArcher/heroIsMagic over the equipped
 // weapon, with precedence over the style switch exactly as in TS);
@@ -331,7 +360,7 @@ func m5Percentage(xp int) float64 { return player.Percentage(xp) }
 // the hasManaForAttack gate (player.ts:1700 — current mana >= weapon
 // manaCost via the same heroManaCost lookup the swing gate uses;
 // 0 for non-magic weapons so melee never halves).
-func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
+func awardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 	var pc *player.Conn
 	d := xpDeps()
 	if c != nil {
@@ -343,29 +372,29 @@ func m5AwardCombatXP(c *playerConn, key string, damage int, archer, mage bool) {
 				_ = gnet.Send(cc.Conn, frames...)
 			},
 		}
-		d.Style = func() int { return controller.AttackStyleFor(m6deps(), cc.Username) }
+		d.Style = func() int { return controller.AttackStyleFor(econDeps(), cc.Username) }
 		d.HasMana = func() bool { return abilities.ManaFor(cc.Instance) >= heroManaCost(cc.Username) }
 	}
 	player.AwardCombatXP(d, pc, key, damage, archer, mage)
 }
 
-// m5AwardGatherXP is the M4-hook successor: table experience on exhaust
+// awardGatherXP is the M4-hook successor: table experience on exhaust
 // (canonical owner: internal/player GatherXP).
-func m5GatherXP(attackerInstance, skill string, xp int) {
+func gatherXP(attackerInstance, skill string, xp int) {
 	player.GatherXP(xpDeps(), attackerInstance, skill, xp)
 }
 
-// m5AddItem stacks (items.json stackable) or appends; returns slot index.
-func m5AddItem(key, itemKey string, count int) int {
-	return m5AddItemEnch(key, itemKey, count, nil)
+// addItem stacks (items.json stackable) or appends; returns slot index.
+func addItem(key, itemKey string, count int) int {
+	return addItemEnch(key, itemKey, count, nil)
 }
 
-// m5AddItemEnch adds with enchantments (M12 crafting/enchant/trade paths);
+// addItemEnch adds with enchantments (M12 crafting/enchant/trade paths);
 // stacking only merges when both stacks have identical enchantment maps —
 // a non-nil ench always takes a fresh slot.
-func m5AddItemEnch(key, itemKey string, count int, ench Enchantments) int {
+func addItemEnch(key, itemKey string, count int, ench Enchantments) int {
 	loadM5Tables()
-	st := m5StateFor(key)
+	st := playerStateFor(key)
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	if ench == nil && entity.Stackable(itemKey) {
@@ -376,17 +405,27 @@ func m5AddItemEnch(key, itemKey string, count int, ench Enchantments) int {
 			}
 		}
 	}
-	st.Inv = append(st.Inv, m5Slot{Key: itemKey, Count: count, Ench: ench})
+	st.Inv = append(st.Inv, slotDef{Key: itemKey, Count: count, Ench: ench})
 	return len(st.Inv) - 1
 }
 
-// m5Pickup takes one loot entity for the player: inventory + Container Add +
+// pickup takes one loot entity for the player: inventory + Container Add +
 // Despawn. Step path calls with the on-tile instance; Target path with the
 // clicked instance (range-lenient, logged - truth enforces adjacency via
 // getDistance, slice 1 keeps pickup observable).
-func m5Pickup(c *playerConn, inst string) bool {
+func pickup(c *playerConn, inst string) bool {
+	if c == nil || c.Conn == nil || inst == "" {
+		return false
+	}
 	l, ok := entity.FindLoot(inst)
 	if !ok {
+		return false
+	}
+	// Owner gate (lootbag.ts parity): someone else's bag never takes here.
+	// The Step path routes bags through openLootBagFor (Open only); the
+	// Target path checks the same gate before Open — either way a denied bag
+	// must not fall through to take-all.
+	if l.Bag && lootBagOwnerDenied(c, l.Owner) {
 		return false
 	}
 	dx := c.Sess.PlayerX - l.X
@@ -400,11 +439,26 @@ func m5Pickup(c *playerConn, inst string) bool {
 	if dx+dy > 1 {
 		log.Printf("m5: %s takes %s from %d tiles (lenient pickup)", c.Instance, inst, dx+dy)
 	}
+	// Inventory cap (lootbag take path parity: misc:NO_SPACE, no partial take).
+	nItems := 0
+	for _, it := range l.Items {
+		if it.Key != "" {
+			nItems++
+		}
+	}
+	st := playerStateFor(c.Username)
+	pstateMu.Lock()
+	invLen := len(st.Inv)
+	pstateMu.Unlock()
+	if ModulesInventorySize-invLen < nItems {
+		notifyPlayer(c, "misc:NO_SPACE")
+		return false
+	}
 	for _, it := range l.Items {
 		if it.Key == "" {
 			continue // taken lootbag slot (hole — single-take path)
 		}
-		idx := m5AddItem(c.Username, it.Key, it.Count)
+		idx := addItem(c.Username, it.Key, it.Count)
 		_ = gnet.Send(c.Conn, pktOp(PacketContainer, ContainerAdd, containerData{
 			Type: ContainerTypeInventory,
 			Slot: &slotData{Index: idx, Key: it.Key, Count: it.Count, Enchantments: map[string]any{}},
@@ -416,36 +470,39 @@ func m5Pickup(c *playerConn, inst string) bool {
 		}
 	}
 	markDirty(c.Username)
-	m5DestroyLoot(inst, "picked up by "+c.Instance)
+	destroyLoot(inst, "picked up by "+c.Instance)
 	return true
 }
 
-// m5PickupAt steps onto loot: any loot on the player's tile is taken —
+// pickupAt steps onto loot: any loot on the player's tile is taken —
 // single Items instantly, bags via the Open menu (lootbag.ts parity:
 // handleMovementStop opens bags instead of taking them).
-func m5PickupAt(c *playerConn) {
-	m5PickupAtTile(c, c.Sess.PlayerX, c.Sess.PlayerY)
+func pickupAt(c *playerConn) {
+	pickupAtTile(c, c.Sess.PlayerX, c.Sess.PlayerY)
 }
 
-// m5PickupAtTile takes loot lying on (x,y) (Step destination path).
-func m5PickupAtTile(c *playerConn, x, y int) {
+// pickupAtTile takes loot lying on (x,y) (Step destination path).
+func pickupAtTile(c *playerConn, x, y int) {
+	if c == nil || c.Conn == nil {
+		return
+	}
 	if inst, ok := entity.FindLootAt(x, y); ok {
 		if entity.IsBag(inst) {
 			openLootBagFor(c, inst)
 			return
 		}
-		m5Pickup(c, inst)
+		pickup(c, inst)
 	}
 }
 
-// m5TrackPos records the authoritative tile and marks the row dirty.
+// trackPos records the authoritative tile and marks the row dirty.
 // The tracked plateauLevel refreshes on the same update (handler.ts:333
 // player.plateauLevel parity — every authoritative position update).
-func m5TrackPos(c *playerConn) {
-	if c.Username == "" {
+func trackPos(c *playerConn) {
+	if c == nil || c.Username == "" {
 		return
 	}
-	st := m5StateFor(c.Username)
+	st := playerStateFor(c.Username)
 	pstateMu.Lock()
 	st.X, st.Y = c.Sess.PlayerX, c.Sess.PlayerY
 	pstateMu.Unlock()
@@ -453,30 +510,25 @@ func m5TrackPos(c *playerConn) {
 	plateauTrack(c)
 }
 
-// m5RegisterLoot adds a pre-built loot entry to the registry without any
+// registerLoot adds a pre-built loot entry to the registry without any
 // timers (M10 chest drops: persistent items with no blink/expiry — Node
 // chest items never expire on their own). Pickup routing is shared.
-func m5RegisterLoot(inst, key string, count, x, y int, owner string) {
+func registerLoot(inst, key string, count, x, y int, owner string) {
 	entity.RegisterLoot(inst, key, count, x, y, owner)
 }
 
-// m5IsLoot reports whether id is a live loot entity.
-func m5IsLoot(id string) bool { return entity.IsLoot(id) }
+// isLoot reports whether id is a live loot entity.
+func isLoot(id string) bool { return entity.IsLoot(id) }
 
-// m5LootPayload rebuilds the Spawn payload for a loot instance (Who path;
+// lootPayload rebuilds the Spawn payload for a loot instance (Who path;
 // canonical owner: internal/entity LootPayload).
-func m5LootPayload(inst string) (any, bool) { return entity.LootPayload(inst) }
+func lootPayload(inst string) (any, bool) { return entity.LootPayload(inst) }
 
 // ---------------------------------------------------------------------------
 // Player combat (C Combat {instance,target} vs killable mobs).
 // ---------------------------------------------------------------------------
 
-var (
-	mobHPMu sync.Mutex
-	mobHP   = map[string]int{} // non-combat-mode mob instances (m1).
-)
-
-func m5MobMaxHP(instance, mobKey string) int {
+func mobMaxHP(instance, mobKey string) int {
 	if instance == "m1" {
 		return 30 // spawnFrames flat default.
 	}
@@ -498,27 +550,23 @@ func handlePlayerAttack(c *playerConn, target string) {
 	}
 	// Arrow gate (combat.ts:208-210 sendRangedAttack): a non-magic archer
 	// with no arrows stops the loop — the per-swing Go equivalent is a
-	// silent no-swing (no frames). Same heroIsArcher detection the
-	// damage-type roll uses, same EquipmentArrows slot lookup the equip
-	// code uses. No arrows are consumed per shot (TS has no consumption).
+	// silent no-swing (no frames).
 	if heroIsArcher(c.Username) && !heroIsMagic(c.Username) && !heroHasArrows(c.Username) {
 		log.Printf("m5: %s bow swing refused (no arrows)", c.Instance)
 		return
 	}
-	dmg := 8 + rand.Intn(5)
-	// Attack-style damage bonus (formulas.getMaxDamage parity): the hero's
-	// current style scales the swing (bots keep their own styles via
-	// combatMaxDamageFloat). Round (not truncate) so slash/crush/shared
-	// stay observable on the small 8-12 hero roll.
-	if mult := controller.StyleDamageMult(controller.AttackStyleFor(m6deps(), c.Username)); mult != 1 {
-		dmg = int(math.Round(float64(dmg) * mult))
-	}
+	// Hero damage formula (formulas.ts getMaxDamage + getDamage parity):
+	// accuracy-weighted roll on [0, maxDamage] where maxDamage =
+	// (equipBonus + skillLevel) * 1.25 + 5 * style * strengthBuff.
+	combatRandMu.Lock()
+	dmg := heroDamageRoll(c.Username, c.Instance, target, combatRand)
+	combatRandMu.Unlock()
 	// M9: engine mobs first — Points/retaliate/death/respawn/loot live in
-	// the engine now (m9PlayerHit -> m9KillMob -> m5SpawnLoot).
+	// the engine now (mobPlayerHit -> killMob -> spawnLoot).
 	// M11_HERODMG debug accelerator (mirrors M9_MOBDMG): keeps the e2e's
 	// 140-HP mobs in a few-swing kill range.
-	dmg = int(float64(dmg) * m11HeroDamageMult())
-	if m := m9MobFor(target); m != nil {
+	dmg = int(float64(dmg) * heroDamageMult())
+	if m := mobFor(target); m != nil {
 		if m.dead {
 			log.Printf("m5: %s swings at dead %s (ignored)", c.Instance, target)
 			return
@@ -540,11 +588,16 @@ func handlePlayerAttack(c *playerConn, target string) {
 		if !heroMagicGate(c) {
 			return
 		}
+		// Arrow consumption (handler.ts:238-242 + equipments.ts:188-198):
+		// one arrow decremented per shot; slot clears at count 0.
+		if heroIsArcher(c.Username) && !heroIsMagic(c.Username) {
+			heroDecrementArrows(c.Username)
+		}
 		abSetTarget(c.Instance, target)
 		worldcore.Broadcast(pkt(PacketAnimation, animationData{Instance: c.Instance, Action: ActionAttack}))
 		// Hero damage-type roll (player.ts getDamageType): the TYPE (+ AoE
-		// flag) changes, damage numbers stay in the 8-12 roll shape.
-		hitType, aoe := heroDamageType(c.Username, combatRand)
+		// flag) changes the hit effect; damage is from the formula above.
+		hitType, aoe := lockedHeroDamageType(c.Username)
 		hit := HitData{Type: hitType, Damage: dmg}
 		if aoe > 0 {
 			hit.Aoe = intp(aoe)
@@ -553,7 +606,7 @@ func handlePlayerAttack(c *playerConn, target string) {
 			Instance: c.Instance, Target: target,
 			Hit: hit,
 		}))
-		m9PlayerHit(m, c, dmg)
+		mobPlayerHit(m, c, dmg)
 		// TS combat.ts sendAttack order: hit, then target.addStatusEffect.
 		// Skip corpses (TS death clears status; the engine has no death
 		// clear, so a tracker entry on a corpse would leak).
@@ -569,16 +622,25 @@ func handlePlayerAttack(c *playerConn, target string) {
 		}
 		// Bloodsucking proc on the attacker (character.ts handleBloodsucking
 		// — inside hit(), before the death check, so it runs here too).
-		if ok, level := heroBloodsucking(c.Username); ok && bloodsuckRoll(combatRand) {
+		if ok, level := heroBloodsucking(c.Username); ok && lockedBloodsuckRoll() {
 			if heal := bloodsuckHeal(dmg, level); heal >= 1 {
-				m6vitals{}.HealHero(c.Instance, heal, 0)
+				econVitals{}.HealHero(c.Instance, heal, 0)
 			}
 		}
-		// TS combat.ts poison-on-hit: a poisonous weapon poisons the victim.
+		// TS combat.ts poison-on-hit: a poisonous weapon poisons the victim
+		// with level-based chance (formulas.ts getPoisonChance: randomInt(0,
+		// 235-level) < POISON_CHANCE(15)). No damage gate — poison applies
+		// on any hit (even 0-damage rolls) if the weapon is poisonous.
 		if abHeroWeaponPoisonous(c.Username) {
-			abApplyPoison(target)
+			mobLevel := 1
+			m.mu.Lock()
+			mobLevel = m.prof.Level
+			m.mu.Unlock()
+			if heroPoisonChance(mobLevel) {
+				abApplyPoison(target)
+			}
 		}
-		m5AwardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
+		awardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
 		return
 	}
 	switch target {
@@ -595,20 +657,23 @@ func handlePlayerAttack(c *playerConn, target string) {
 			combatMu.Unlock()
 			return
 		}
-		hitType, _ := heroDamageType(c.Username, combatRand)
+		// Arrow consumption (handler.ts:238-242 parity).
+		if heroIsArcher(c.Username) && !heroIsMagic(c.Username) {
+			heroDecrementArrows(c.Username)
+		}
+		hitType, _ := lockedHeroDamageType(c.Username)
 		abSetTarget(c.Instance, target)
 		applyBossHitLocked(c.Instance, dmg, hitType, nil, false, -1, true)
-		died := combatDead
 		combatMu.Unlock()
-		if ok, level := heroBloodsucking(c.Username); ok && bloodsuckRoll(combatRand) {
+		if ok, level := heroBloodsucking(c.Username); ok && lockedBloodsuckRoll() {
 			if heal := bloodsuckHeal(dmg, level); heal >= 1 {
-				m6vitals{}.HealHero(c.Instance, heal, 0)
+				econVitals{}.HealHero(c.Instance, heal, 0)
 			}
 		}
-		m5AwardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
-		if died {
-			m5SpawnLoot("golem", combatDummyX, combatDummyY, c.Instance)
-		}
+		awardCombatXP(c, c.Username, dmg, heroIsArcher(c.Username), heroIsMagic(c.Username))
+		// Boss loot spawns exactly once inside applyBossHitLocked on the
+		// killing blow (boot.go death path) — no second spawn here (double
+		// boss-loot fix: the per-swing duplicate is deleted).
 	default:
 		// M9: engine-registered mobs were handled above; anything else is
 		// not killable (legacy note kept from slice 1).
@@ -629,15 +694,15 @@ func handlePlayerAttack(c *playerConn, target string) {
 // Snapshot, FlushDirty, Close — moved here verbatim, identical schema,
 // WAL+NORMAL pragmas, identical log text). This section keeps the root
 // names every other seam uses — dbConn/dbMu for the m11/m13/social/
-// abilities/ops direct-table access, and m5Init/markDirty/flushDirty/
-// m5SaveSync/m5Load/m5LoginWelcome with unchanged signatures — and
-// delegates to the store (converting m5State <-> persist.State).
+// abilities/ops direct-table access, and initPlayerState/markDirty/flushDirty/
+// savePlayerSync/loadPlayerState/loginWelcome with unchanged signatures — and
+// delegates to the store (converting playerState <-> persist.State).
 // dbConn aliases the store handle (single connection, SetMaxOpenConns(1)).
-// Ticker/goroutine ownership stays in root: m5Init starts the 10s dirty
+// Ticker/goroutine ownership stays in root: initPlayerState starts the 10s dirty
 // flush and the SIGTERM/SIGINT final-flush handler exactly as before.
 // Lock discipline: never hold dbMu and pstateMu at the same time
-// (m5Snapshot needs pstateMu). flushDirty/m5SaveSync snapshot first, then
-// write under dbMu; m5Load holds dbMu across the store read and takes
+// (playerSnapshot needs pstateMu). flushDirty/savePlayerSync snapshot first, then
+// write under dbMu; loadPlayerState holds dbMu across the store read and takes
 // pstateMu only to install the result.
 
 var (
@@ -653,14 +718,17 @@ func dbPath() string {
 	return "data.db"
 }
 
-func m5Init() {
+func initPlayerState() {
 	loadM5Tables()
 	entity.ConfigureLoot(entity.LootDeps{
 		World:       lootWorld{},
 		Walkable:    func(x, y int) bool { return !blocked(x, y) },
 		DoubleDrops: worldDoubleDrops,
-		Gate:        m11DropGated,
+		Gate:        questDropGated,
 		DataPath:    resourceDataPath,
+	})
+	entity.ConfigureEffects(entity.EffectDeps{
+		World: effectWorld{},
 	})
 	st, err := persist.Open(dbPath())
 	if err != nil {
@@ -689,6 +757,8 @@ func m5Init() {
 	startDrainDriver()
 	// R1 shard role: hub Client registration (all-in-one starts none).
 	startShardClient()
+	// Reset ticker: 60s background sweep for daily/weekly boundary crossings.
+	startResetTicker()
 }
 
 func markDirty(key string) {
@@ -698,39 +768,44 @@ func markDirty(key string) {
 	persistStore.MarkDirty(key)
 }
 
-func m5Snapshot(key string) *m5State {
+func playerSnapshot(key string) *playerState {
 	pstateMu.Lock()
 	defer pstateMu.Unlock()
 	st, ok := pstates[key]
 	if !ok {
 		return nil
 	}
-	cp := &m5State{X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank, Skills: map[int]*m5Skill{}}
+	cp := &playerState{X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
+		HomeX: st.HomeX, HomeY: st.HomeY,
+		LastDailyReset: st.LastDailyReset, LastWeeklyReset: st.LastWeeklyReset,
+		Skills: map[int]*skillDef{}}
 	cp.Inv = append(cp.Inv, st.Inv...)
 	cp.Bank = append(cp.Bank, st.Bank...)
 	cp.Equip = append(cp.Equip, st.Equip...)
 	for id, s := range st.Skills {
-		cp.Skills[id] = &m5Skill{Level: s.Level, XP: s.XP}
+		cp.Skills[id] = &skillDef{Level: s.Level, XP: s.XP}
 	}
 	return cp
 }
 
-// m5ToPersist converts an in-memory player state to the persist snapshot
+// toPersist converts an in-memory player state to the persist snapshot
 // (inventory + equipment enchantments serialized to the DB column format;
 // bank rows carry no enchantments, matching the bank table).
-func m5ToPersist(st *m5State) persist.State {
+func toPersist(st *playerState) persist.State {
 	ps := persist.State{
 		X: st.X, Y: st.Y, Level: st.Level, HP: st.HP, Rank: st.Rank,
+		HomeX: st.HomeX, HomeY: st.HomeY,
+		LastDailyReset: st.LastDailyReset, LastWeeklyReset: st.LastWeeklyReset,
 		Skills: make(map[int]persist.Skill, len(st.Skills)),
 	}
 	for _, s := range st.Inv {
-		ps.Inv = append(ps.Inv, persist.Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchJSON(s)})
+		ps.Inv = append(ps.Inv, persist.Slot{Key: s.Key, Count: s.Count, Ench: slotEnchJSON(s)})
 	}
 	for _, s := range st.Bank {
 		ps.Bank = append(ps.Bank, persist.Slot{Key: s.Key, Count: s.Count})
 	}
 	for _, e := range st.Equip {
-		ps.Equip = append(ps.Equip, persist.Slot{Key: e.Key, Count: e.Count, Ench: m5SlotEnchJSON(e)})
+		ps.Equip = append(ps.Equip, persist.Slot{Key: e.Key, Count: e.Count, Ench: slotEnchJSON(e)})
 	}
 	for id, s := range st.Skills {
 		ps.Skills[id] = persist.Skill{Level: s.Level, XP: s.XP}
@@ -740,40 +815,46 @@ func m5ToPersist(st *m5State) persist.State {
 
 // persistToM5 converts a persist snapshot back to the in-memory state,
 // normalizing the fixed ModulesEquipmentCount slot array (slot indexing
-// must never panic) exactly like the old m5Load tail.
-func persistToM5(ps persist.State) *m5State {
-	st := &m5State{X: ps.X, Y: ps.Y, Level: ps.Level, HP: ps.HP, Rank: ps.Rank, Skills: map[int]*m5Skill{}}
+// must never panic) exactly like the old loadPlayerState tail.
+func persistToM5(ps persist.State) *playerState {
+	st := &playerState{X: ps.X, Y: ps.Y, Level: ps.Level, HP: ps.HP, Rank: ps.Rank,
+		HomeX: ps.HomeX, HomeY: ps.HomeY,
+		LastDailyReset: ps.LastDailyReset, LastWeeklyReset: ps.LastWeeklyReset,
+		Skills: map[int]*skillDef{}}
 	for _, s := range ps.Inv {
-		st.Inv = append(st.Inv, m5Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchParse(s.Ench)})
+		st.Inv = append(st.Inv, slotDef{Key: s.Key, Count: s.Count, Ench: slotEnchParse(s.Ench)})
 	}
 	for _, s := range ps.Bank {
-		st.Bank = append(st.Bank, m5Slot{Key: s.Key, Count: s.Count})
+		st.Bank = append(st.Bank, slotDef{Key: s.Key, Count: s.Count})
 	}
-	eslots := make([]m5Slot, 0, len(ps.Equip))
+	eslots := make([]slotDef, 0, len(ps.Equip))
 	for _, s := range ps.Equip {
-		eslots = append(eslots, m5Slot{Key: s.Key, Count: s.Count, Ench: m5SlotEnchParse(s.Ench)})
+		eslots = append(eslots, slotDef{Key: s.Key, Count: s.Count, Ench: slotEnchParse(s.Ench)})
 	}
-	eq := make([]m5Slot, ModulesEquipmentCount)
+	eq := make([]slotDef, ModulesEquipmentCount)
 	copy(eq, eslots)
 	st.Equip = eq
 	for id, s := range ps.Skills {
-		st.Skills[id] = &m5Skill{Level: s.Level, XP: s.XP}
+		st.Skills[id] = &skillDef{Level: s.Level, XP: s.XP}
 	}
 	return st
 }
 
-func writePlayer(key string, st *m5State) {
+func writePlayer(key string, st *playerState) {
 	if persistStore == nil {
 		return
 	}
 	// Statistics counters ride the same row write as a JSON blob in the
 	// additive `statistics` table (key-aware call site: the converters stay
 	// key-agnostic so handoff.go keeps compiling untouched).
-	ps := m5ToPersist(st)
+	ps := toPersist(st)
 	snap := statsCopyOf(key)
 	ps.Stats = persist.StatsBlob{
 		MobKills: snap.MobKills, MobExamines: snap.MobExamines,
 		Resources: snap.Resources, Drops: snap.Drops,
+		PvPKills: snap.PvPKills, PvPDeaths: snap.PvPDeaths,
+		CreationTime: snap.CreationTime, TotalTimePlayed: snap.TotalTimePlayed,
+		LastLogin: snap.LastLogin, LoginCount: snap.LoginCount,
 	}
 	_ = persistStore.WritePlayer(key, ps)
 }
@@ -783,10 +864,10 @@ func flushDirty() {
 		return
 	}
 	// Lock discipline: never hold dbMu and pstateMu at the same time
-	// (m5Snapshot needs pstateMu). Snapshot first, then write under dbMu.
+	// (playerSnapshot needs pstateMu). Snapshot first, then write under dbMu.
 	keys := persistStore.DirtyList()
 	for _, key := range keys {
-		st := m5Snapshot(key)
+		st := playerSnapshot(key)
 		dbMu.Lock()
 		if st != nil {
 			writePlayer(key, st)
@@ -796,13 +877,13 @@ func flushDirty() {
 	}
 }
 
-// m5SaveSync flushes one player immediately (disconnect path).
+// savePlayerSync flushes one player immediately (disconnect path).
 // Lock discipline: never hold dbMu and pstateMu at the same time.
-func m5SaveSync(key string) {
+func savePlayerSync(key string) {
 	if dbConn == nil || persistStore == nil || key == "" {
 		return
 	}
-	st := m5Snapshot(key)
+	st := playerSnapshot(key)
 	dbMu.Lock()
 	if st != nil {
 		writePlayer(key, st)
@@ -811,8 +892,8 @@ func m5SaveSync(key string) {
 	dbMu.Unlock()
 }
 
-// m5Load restores a player row (Welcome from DB when the instance is known).
-func m5Load(key string) (*m5State, bool) {
+// loadPlayerState restores a player row (Welcome from DB when the instance is known).
+func loadPlayerState(key string) (*playerState, bool) {
 	if dbConn == nil || persistStore == nil || key == "" {
 		return nil, false
 	}
@@ -833,22 +914,39 @@ func m5Load(key string) (*m5State, bool) {
 	return st, true
 }
 
-// m5LoginWelcome builds the Welcome payload: DB row when the login username
+// loginWelcome builds the Welcome payload: DB row when the login username
 // is known, else the fresh hero. Also queues Container + Skill batches so a
 // reconnect visibly restores inventory/skills.
-func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
+func loginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 	key := username
 	if key == "" {
 		key = c.Instance
 	}
+	// Username sanitization (incoming.ts:199): lowercase, slice to 32, trim,
+	// then profanity filter. Applied to the key (username or instance fallback;
+	// instance IDs are generated and won't trigger the filter).
+	key = strings.ToLower(key)
+	if len(key) > 32 {
+		key = key[:32]
+	}
+	key = strings.TrimSpace(key)
+	key = chat.Clean(key)
 	c.Username = key
-	var st *m5State
-	if loaded, ok := m5Load(key); ok {
+	var st *playerState
+	if loaded, ok := loadPlayerState(key); ok {
 		st = loaded
 	} else {
-		st = m5StateFor(key)
+		st = playerStateFor(key)
 		markDirty(key)
 	}
+	// Statistics: record login lifecycle fields (creationTime on first
+	// login, lastLogin, loginCount) after the counters are restored.
+	statsRecordLogin(key)
+	// Daily/weekly reset: check at login so a player who logs in after a
+	// boundary crossing sees the reset immediately (the 60s ticker handles
+	// players already online). Notifications are sent after the Welcome
+	// frame lands (notifyPlayer needs a connected client).
+	loginResetFired := checkLoginResets(key, time.Now())
 	// Rank durability (database.setRank parity): a persisted offline /setrank
 	// lands on the session at login. Fresh rows carry 0 (None), a no-op.
 	c.rank = st.Rank
@@ -876,8 +974,8 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 	for id, s := range st.Skills {
 		skills = append(skills, map[string]any{
 			"type": id, "experience": s.XP, "level": s.Level,
-			"percentage": m5Percentage(s.XP), "nextExperience": nextExp(s.XP),
-			"combat": m5CombatSkill(id),
+			"percentage": percentage(s.XP), "nextExperience": nextExp(s.XP),
+			"combat": combatSkill(id),
 		})
 	}
 	pstateMu.Unlock()
@@ -910,12 +1008,23 @@ func m5LoginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
 		if e.Key == "" || e.Count < 1 {
 			continue
 		}
-		data := m6EquipmentData(t, e.Key, e.Count, true)
+		data := equipmentData(t, e.Key, e.Count, true)
 		data["enchantments"] = enchAny(e.Ench)
 		eqs = append(eqs, data)
 	}
 	if len(eqs) > 0 {
 		extra = append(extra, pktOp(PacketEquipment, EquipmentBatch, equipBatchData{Equipments: eqs}))
+	}
+	// Daily/weekly reset notifications: appended to the login frame batch so
+	// the client sees them right after Welcome+Map+Inventory+Skills.
+	for _, k := range loginResetFired {
+		label := "daily"
+		if k == resets.Weekly {
+			label = "weekly"
+		}
+		extra = append(extra, pktOp(PacketNotification, NotificationText, notificationPacketData{
+			Message: "reset:" + label,
+		}))
 	}
 	return ph, extra
 }

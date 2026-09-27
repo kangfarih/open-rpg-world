@@ -47,9 +47,10 @@ func TestLoadParsesLightsWithDefaults(t *testing.T) {
 		t.Fatalf("len(Lights) = %d, want 3", len(g.Lights))
 	}
 
-	// Fully-specified entry keeps its colour and distance (Radius).
-	if got := g.Lights[0]; got != (Light{X: 10, Y: 10, Radius: 160, Colour: "rgba(255, 0, 0, 0.5)"}) {
-		t.Fatalf("Lights[0] = %+v, want explicit colour/radius", got)
+	// Fully-specified entry keeps its colour, distance (Radius), diffuse,
+	// and id; flickerSpeed/flickerIntensity fall back to defaults.
+	if got := g.Lights[0]; got != (Light{ID: 1096, X: 10, Y: 10, Radius: 160, Colour: "rgba(255, 0, 0, 0.5)", Diffuse: 0.3, FlickerSpeed: 300, FlickerIntensity: 1}) {
+		t.Fatalf("Lights[0] = %+v, want explicit colour/radius/diffuse", got)
 	}
 
 	// Missing colour falls back to the impl/light.ts constructor default.
@@ -59,9 +60,12 @@ func TestLoadParsesLightsWithDefaults(t *testing.T) {
 	if got := g.Lights[1].Radius; got != 100 {
 		t.Fatalf("Lights[1].Radius = %d, want 100", got)
 	}
+	if got := g.Lights[1].Diffuse; got != 0.4 {
+		t.Fatalf("Lights[1].Diffuse = %f, want 0.4", got)
+	}
 
-	// Bare entry gets both defaults.
-	if got := g.Lights[2]; got != (Light{X: 10, Y: 50, Radius: DefaultLightRadius, Colour: DefaultLightColour}) {
+	// Bare entry gets all defaults.
+	if got := g.Lights[2]; got != (Light{ID: 1098, X: 10, Y: 50, Radius: DefaultLightRadius, Colour: DefaultLightColour, Diffuse: DefaultLightDiffuse, FlickerSpeed: DefaultLightFlickerSpeed, FlickerIntensity: DefaultLightFlickerIntensity}) {
 		t.Fatalf("Lights[2] = %+v, want defaults", got)
 	}
 }

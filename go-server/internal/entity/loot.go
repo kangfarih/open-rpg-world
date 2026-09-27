@@ -78,6 +78,7 @@ type Loot struct {
 	Owner    string
 	blinkT   *time.Timer
 	destroyT *time.Timer
+	seq      int // spawn order (FindLootAt oldest-pick parity)
 }
 
 // LootWorld is the transport/world seam implemented by the root adapter.
@@ -125,10 +126,9 @@ func lootDataPath(name string) string {
 	if _, err := os.Stat(rel); err == nil {
 		return rel
 	}
-	if alt := filepath.Join("..", "..", "packages", "server", "data", name+".json"); true {
-		if _, err := os.Stat(alt); err == nil {
-			return alt
-		}
+	alt := filepath.Join("..", "..", "packages", "server", "data", name+".json")
+	if _, err := os.Stat(alt); err == nil {
+		return alt
 	}
 	return "/Users/appfuxion/repo/rpg-world-sim/packages/server/data/" + name + ".json"
 }
@@ -210,6 +210,9 @@ func RollEntry(entries []DropJSON, level int) (key string, count int, ok bool) {
 	if len(avail) == 0 {
 		return "", 0, false
 	}
+	if level < 1 {
+		level = 1
+	}
 	drop := avail[rand.Intn(len(avail))]
 	count = drop.Count
 	if count <= 0 {
@@ -239,22 +242,21 @@ func RollEntry(entries []DropJSON, level int) (key string, count int, ok bool) {
 
 // RollEntryGated filters quest/achievement-gated entries by the killer's
 // progression (mob.getRandomItem receives the player), then rolls uniformly
-// over the survivors (RollEntry body). Empty username = gates closed.
+// over the survivors (RollEntry body). Empty username = gates closed (gated
+// entries never pass without a killer context).
 func RollEntryGated(username string, entries []DropJSON, level int) (string, int, bool) {
-	if username != "" {
-		gate := lootDeps.Gate
-		filtered := entries[:0:0]
-		for _, e := range entries {
-			pass := e.Quest == "" && e.Achievement == ""
-			if !pass && gate != nil {
-				pass = gate(username, e.Quest, e.Achievement, e.Status)
-			}
-			if pass {
-				filtered = append(filtered, e)
-			}
+	gate := lootDeps.Gate
+	filtered := make([]DropJSON, 0, len(entries))
+	for _, e := range entries {
+		pass := e.Quest == "" && e.Achievement == ""
+		if !pass && username != "" && gate != nil {
+			pass = gate(username, e.Quest, e.Achievement, e.Status)
 		}
-		entries = filtered
+		if pass {
+			filtered = append(filtered, e)
+		}
 	}
+	entries = filtered
 	return RollEntry(entries, level)
 }
 
@@ -336,7 +338,7 @@ var (
 )
 
 // NearWalkable finds the nearest walkable tile to (x, y) (m5NearWalkable
-// verbatim: self, then the r=1..3 spiral).
+// verbatim: self, then the r=1..3 spiral perimeter).
 func NearWalkable(x, y int) (int, int) {
 	walkable := lootDeps.Walkable
 	if walkable == nil {
@@ -348,6 +350,9 @@ func NearWalkable(x, y int) (int, int) {
 	for r := 1; r <= 3; r++ {
 		for dy := -r; dy <= r; dy++ {
 			for dx := -r; dx <= r; dx++ {
+				if dx != r && dx != -r && dy != r && dy != -r {
+					continue // perimeter only (interior already probed)
+				}
 				if nx, ny := x+dx, y+dy; walkable(nx, ny) {
 					return nx, ny
 				}
@@ -360,15 +365,18 @@ func NearWalkable(x, y int) (int, int) {
 func lootIntp(v int) *int { return &v }
 
 // spawnLocked registers one loot entity and emits its Spawn frame. Caller
-// holds no locks; timers are armed before return.
+// holds no locks; timers are armed under the registry lock before return
+// so a concurrent Destroy cannot slip between registration and arming.
 func spawnLocked(drops []Drop, cx, cy int, owner, logPrefix string) string {
 	lx, ly := NearWalkable(cx, cy)
 	lootMu.Lock()
 	lootSeq++
 	inst := fmt.Sprintf("loot-%d", lootSeq)
 	bag := len(drops) > 1
-	l := &Loot{Instance: inst, Bag: bag, Items: drops, X: lx, Y: ly, Owner: owner}
+	l := &Loot{Instance: inst, Bag: bag, Items: drops, X: lx, Y: ly, Owner: owner, seq: lootSeq}
 	loots[inst] = l
+	l.blinkT = time.AfterFunc(lootBlinkDelay, func() { BlinkLoot(inst) })
+	l.destroyT = time.AfterFunc(lootDespawnDelay, func() { DestroyLoot(inst, "expired") })
 	lootMu.Unlock()
 	if lootDeps.World != nil {
 		lootDeps.World.SetEntityPos(inst, lx, ly)
@@ -389,8 +397,6 @@ func spawnLocked(drops []Drop, cx, cy int, owner, logPrefix string) string {
 	}
 	log.Printf("%s loot %s spawned (%s x%d) at %d,%d owner=%s bag=%v items=%v",
 		logPrefix, inst, drops[0].Key, drops[0].Count, lx, ly, owner, bag, keys)
-	l.blinkT = time.AfterFunc(lootBlinkDelay, func() { BlinkLoot(inst) })
-	l.destroyT = time.AfterFunc(lootDespawnDelay, func() { DestroyLoot(inst, "expired") })
 	return inst
 }
 
@@ -400,6 +406,9 @@ func SpawnLoot(mobKey string, cx, cy int, owner string) string {
 	drops := GetDropsFor(mobKey, owner)
 	if lootDeps.DoubleDrops != nil {
 		drops = lootDeps.DoubleDrops(drops) // world: double-drops event duplicates the roll
+	}
+	if len(drops) == 0 {
+		return ""
 	}
 	return spawnLocked(drops, cx, cy, owner, "m5:")
 }
@@ -424,11 +433,13 @@ func SpawnLootAt(owner, key string, count, x, y int) string {
 func BlinkLoot(inst string) {
 	lootMu.Lock()
 	l, ok := loots[inst]
+	if ok {
+		l.Owner = ""
+	}
 	lootMu.Unlock()
 	if !ok {
 		return
 	}
-	l.Owner = ""
 	if lootDeps.World != nil {
 		lootDeps.World.Broadcast(protocol.Pkt(protocol.PacketBlink, inst))
 	}
@@ -470,11 +481,45 @@ func DestroyLoot(inst, why string) {
 // chest items never expire on their own). Pickup routing is shared.
 func RegisterLoot(inst, key string, count, x, y int, owner string) {
 	lootMu.Lock()
-	loots[inst] = &Loot{Instance: inst, Bag: false, Items: []Drop{{Key: key, Count: count}}, X: x, Y: y, Owner: owner}
+	lootSeq++
+	loots[inst] = &Loot{Instance: inst, Bag: false, Items: []Drop{{Key: key, Count: count}}, X: x, Y: y, Owner: owner, seq: lootSeq}
 	lootMu.Unlock()
 	if lootDeps.World != nil {
 		lootDeps.World.SetEntityPos(inst, x, y)
 	}
+}
+
+// TakeLoot atomically claims + removes one loot entity (single-Item
+// Find+Destroy duplication gap: Find then Destroy lets two pickups both
+// succeed). Reports false when the loot is already gone. Teardown mirrors
+// DestroyLoot (timers stopped, openers cleared, Remove + Despawn frames).
+func TakeLoot(inst string) (Loot, bool) {
+	lootMu.Lock()
+	l, ok := loots[inst]
+	if !ok {
+		lootMu.Unlock()
+		return Loot{}, false
+	}
+	delete(loots, inst)
+	if l.blinkT != nil {
+		l.blinkT.Stop()
+	}
+	if l.destroyT != nil {
+		l.destroyT.Stop()
+	}
+	cp := *l
+	cp.Items = append([]Drop(nil), l.Items...)
+	lootMu.Unlock()
+	clearBagOpeners(inst)
+	if lootDeps.World != nil {
+		lootDeps.World.RemoveEntity(inst)
+		if l.Bag {
+			lootDeps.World.Broadcast(protocol.PktOp(protocol.PacketLootBag, protocol.LootBagClose, map[string]any{}))
+		}
+		lootDeps.World.Broadcast(protocol.Pkt(protocol.PacketDespawn, protocol.DespawnData{Instance: inst}))
+	}
+	log.Printf("m5: loot %s taken", inst)
+	return cp, true
 }
 
 // ---------------------------------------------------------------------------
@@ -503,12 +548,14 @@ var (
 
 // OpenBag records player as the opener of a live bag
 // (player.activeLootBag parity). Reports false when inst is not a bag.
+// The live-bag check and the opener record happen under the registry lock
+// (lootMu outer, bagMu inner) so a concurrent Destroy cannot slip between
+// validation and recording.
 func OpenBag(player, inst string) bool {
 	lootMu.Lock()
+	defer lootMu.Unlock()
 	l, ok := loots[inst]
-	isBag := ok && l.Bag
-	lootMu.Unlock()
-	if !isBag {
+	if !ok || !l.Bag {
 		return false
 	}
 	bagMu.Lock()
@@ -616,15 +663,25 @@ func FindLoot(inst string) (Loot, bool) {
 }
 
 // FindLootAt returns the id of the loot lying on (x, y) (Step path).
+// When several share a tile the oldest spawn (lowest seq) wins so the
+// result is deterministic across map iteration order.
 func FindLootAt(x, y int) (string, bool) {
 	lootMu.Lock()
 	defer lootMu.Unlock()
+	best := ""
+	bestSeq := 0
+	found := false
 	for id, l := range loots {
 		if l.X == x && l.Y == y {
-			return id, true
+			if !found || l.seq < bestSeq {
+				best, bestSeq, found = id, l.seq, true
+			}
 		}
 	}
-	return "", false
+	if !found {
+		return "", false
+	}
+	return best, true
 }
 
 // LootPayload rebuilds the Spawn payload for a loot instance (Who path).
@@ -643,6 +700,9 @@ func LootPayload(inst string) (any, bool) {
 	}
 	if l.Bag {
 		return protocol.EntityData{Instance: inst, Type: protocol.EntityLootBag, Key: "lootbag", Name: "Loot Bag", X: x, Y: y}, true
+	}
+	if len(l.Items) == 0 {
+		return nil, false
 	}
 	return protocol.EntityData{Instance: inst, Type: protocol.EntityItem, Key: l.Items[0].Key, Name: l.Items[0].Key, X: x, Y: y, Count: lootIntp(l.Items[0].Count)}, true
 }

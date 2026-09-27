@@ -13,11 +13,11 @@ import (
 // Examine resolution matrix (incoming.ts handleExamine parity):
 // mob with description / mob without / item with / bag + unknown silent.
 func TestExamineResolve(t *testing.T) {
-	m9Mu.Lock()
-	m9Mobs["ex-rat"] = &m9Mob{instance: "ex-rat", key: "rat"}
-	m9Mobs["ex-golem"] = &m9Mob{instance: "ex-golem", key: "golem"}
-	m9Mu.Unlock()
-	t.Cleanup(func() { m9Remove("ex-rat"); m9Remove("ex-golem") })
+	mobMu.Lock()
+	mobs["ex-rat"] = &mob{instance: "ex-rat", key: "rat"}
+	mobs["ex-golem"] = &mob{instance: "ex-golem", key: "golem"}
+	mobMu.Unlock()
+	t.Cleanup(func() { removeMob("ex-rat"); removeMob("ex-golem") })
 
 	key, desc, ok := examineResolve("ex-rat")
 	if !ok || key != "rat" || desc == "" {
@@ -65,13 +65,13 @@ func TestHandleExamineFrameShapes(t *testing.T) {
 	c := &playerConn{Conn: gnet.NewConn(nil, "p-ex")}
 	c.Username = "u-exshape"
 	c.Sess.PlayerX, c.Sess.PlayerY = 100, 96
-	m9Mu.Lock()
-	m9Mobs["ex-shape"] = &m9Mob{instance: "ex-shape", key: "rat"}
-	m9Mobs["ex-shape-bare"] = &m9Mob{instance: "ex-shape-bare", key: "skeleton"}
-	m9Mu.Unlock()
+	mobMu.Lock()
+	mobs["ex-shape"] = &mob{instance: "ex-shape", key: "rat"}
+	mobs["ex-shape-bare"] = &mob{instance: "ex-shape-bare", key: "skeleton"}
+	mobMu.Unlock()
 	t.Cleanup(func() {
-		m9Remove("ex-shape")
-		m9Remove("ex-shape-bare")
+		removeMob("ex-shape")
+		removeMob("ex-shape-bare")
 		stats.Forget("u-exshape")
 	})
 

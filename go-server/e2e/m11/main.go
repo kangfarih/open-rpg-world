@@ -303,7 +303,7 @@ func login(user string, seedPos []int) *websocket.Conn {
 	drain(800 * time.Millisecond)
 	lastFrames = nil
 	posJSON, _ := json.Marshal(seedPos)
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s}]`, user, posJSON))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s,"seedRank":2}]`, user, posJSON))
 	// Drain the Welcome bulk into a slice (drain returns counts) so both the
 	// instance capture and the batch checks below see the same frames.
 	var loginFrames [][]json.RawMessage

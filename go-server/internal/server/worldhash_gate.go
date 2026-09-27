@@ -1,6 +1,6 @@
 // D3 world_hash boot gate (additive, behavior-frozen when data unchanged).
 //
-// At boot, after the persist store opens (still inside m5Init, the first
+// At boot, after the persist store opens (still inside initPlayerState, the first
 // frozen boot step — boot order unchanged), the gate compares the sha256 of
 // the world.json bytes actually resolved for this boot
 // (internal/data.WorldHash: WORLD_JSON override, then checkout filesystem,
@@ -74,7 +74,6 @@ func checkWorldHashGate() {
 			log.Fatalf("worldhash: MISMATCH data=%s stored=%s: refusing boot (WORLD_HASH_STRICT=1). "+
 				"Restore the matching world.json, or reset data.db to re-stamp (loses persisted players).",
 				hash, stored)
-			return
 		}
 		log.Printf("worldhash: WARN MISMATCH data=%s stored=%s (continuing; set WORLD_HASH_STRICT=1 to refuse boot on drift)", hash, stored)
 	}

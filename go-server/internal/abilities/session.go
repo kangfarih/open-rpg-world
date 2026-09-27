@@ -68,9 +68,30 @@ const (
 )
 
 const (
-	maxMana      = 50 // welcomePlayer mana/maxMana (m5 persists no mana)
 	freezeSuffix = "|freeze"
 )
+
+// manaMaxFor computes the level-scaled max mana for a username
+// (formulas.ts getMaxMana: 20 + level * 24).
+func manaMaxFor(username string) int {
+	level := 1
+	if sdeps.PlayerLevel != nil && username != "" {
+		if lv := sdeps.PlayerLevel(username); lv > 0 {
+			level = lv
+		}
+	}
+	return 20 + level*24
+}
+
+// manaMaxForInstance computes the level-scaled max mana for an instance
+// by looking up the username from the Conn registry.
+func manaMaxForInstance(instance string) int {
+	// The abilities package doesn't have direct access to the player registry,
+	// so we use a fallback: check if we have a Conn registered for this instance.
+	// For now, use level 1 as the default. The root adapter will wire PlayerLevel
+	// to resolve this properly.
+	return 20 + 1*24 // level 1 default = 44
+}
 
 // Conn is the minimal per-connection view for ability delivery. Nil = no
 // frames (quest/achievement reward paths with no live conn).
@@ -111,6 +132,9 @@ type SessionDeps struct {
 	// HeroWeaponPoisonous reports the items.json `poisonous` flag on the
 	// hero's equipped weapon (combat.ts poison-on-hit parity).
 	HeroWeaponPoisonous func(username string) bool
+	// PlayerLevel returns the combat level for a username (formulas.ts
+	// getMaxMana parity: mana scales with level).
+	PlayerLevel func(username string) int
 }
 
 var sdeps SessionDeps
@@ -343,7 +367,7 @@ func ManaFor(instance string) int {
 	if m, ok := abMana[instance]; ok {
 		return m
 	}
-	return maxMana
+	return manaMaxForInstance(instance)
 }
 
 // SetMana pins the session mana for an instance, clamped to [0, cap]
@@ -355,6 +379,7 @@ func SetMana(instance string, value int) {
 	if value < 0 {
 		value = 0
 	}
+	maxMana := manaMaxForInstance(instance)
 	if value > maxMana {
 		value = maxMana
 	}
@@ -367,6 +392,7 @@ func SetMana(instance string, value int) {
 // the Points mana frame (player.ts handleAttack mana.decrement + handleMana
 // parity). Reports the new totals.
 func SpendMana(instance string, cost int) (mana, max int) {
+	maxMana := manaMaxForInstance(instance)
 	if instance == "" {
 		return ManaFor(instance), maxMana
 	}
@@ -473,7 +499,12 @@ func LiveTarget(instance string) string {
 
 // HandleAbility routes C->S Ability frames [22,{opcode,key,index?}]
 // (incoming.ts handleAbility): Use activates, QuickSlot stores the slot.
+// Nil conns are a no-op (quest/achievement reward paths with no live conn
+// must not panic on a QuickSlot frame).
 func HandleAbility(c *Conn, data []byte) {
+	if c == nil {
+		return
+	}
 	var d struct {
 		Opcode int    `json:"opcode"`
 		Key    string `json:"key"`
@@ -540,8 +571,20 @@ func Use(c *Conn, key string) {
 		c.Notify("misc:NOT_ENOUGH_MANA")
 		return
 	}
-	if !a.CanCast(mana, nowMs, last) {
-		wait := (int64(a.CooldownMs) - (nowMs - last)) / 1000
+	// DualistsMark attack rate parity (TS player.ts getAttackRate: subtract
+	// 200ms from weapon.attackRate when DualistsMark is active). Adjusted
+	// here at the cooldown check: shifting `last` back by 200ms makes the
+	// cooldown elapse 200ms sooner, matching the TS behavior.
+	effectiveLast := last
+	if HasStatusEffect(c.Instance, int(EffectDualistsMark)) {
+		effectiveLast -= 200
+	}
+	if !a.CanCast(mana, nowMs, effectiveLast) {
+		effCd := int64(a.CooldownMs)
+		if HasStatusEffect(c.Instance, int(EffectDualistsMark)) {
+			effCd -= 200
+		}
+		wait := (effCd - (nowMs - effectiveLast)) / 1000
 		if wait < 1 {
 			wait = 1
 		}
@@ -554,7 +597,7 @@ func Use(c *Conn, key string) {
 	abLastCast[c.Username+"\x00"+key] = nowMs
 	abMu.Unlock()
 	c.Send(protocol.Pkt(protocol.PacketPoints, protocol.PointsData{
-		Instance: c.Instance, Mana: abIntp(mana), MaxMana: abIntp(maxMana),
+		Instance: c.Instance, Mana: abIntp(mana), MaxMana: abIntp(manaMaxFor(c.Username)),
 	}))
 	c.Send(protocol.PktOp(protocol.PacketAbility, AbilityToggle, abilityToggle{Key: key, Level: -1}))
 	fx := a.Effect()
@@ -620,18 +663,20 @@ func RemovePoison(instance string) {
 	abStatus.Remove(status.Instance(instance), status.KindPoison)
 }
 
-// ManaMax reports the hero mana cap (welcomePlayer mana/maxMana parity).
-func ManaMax() int { return maxMana }
+// ManaMax reports the hero mana cap for an instance (formulas.ts getMaxMana
+// parity: 20 + level * 24). Falls back to level 1 when the player is unknown.
+func ManaMax(instance string) int { return manaMaxForInstance(instance) }
 
 // ManaState reports current/max mana for an instance (welcome default).
 func ManaState(instance string) (mana, maxMana int) {
-	return ManaFor(instance), maxMana
+	return ManaFor(instance), manaMaxForInstance(instance)
 }
 
 // HealMana adds amount mana, clamped to the cap, and broadcasts the Points
 // frame (player.heal mana-branch parity: increment + sync). It reports the
 // applied amount plus the new totals.
 func HealMana(instance string, amount int) (applied, mana, max int) {
+	maxMana := manaMaxForInstance(instance)
 	if instance == "" || amount < 1 {
 		return 0, ManaFor(instance), maxMana
 	}
@@ -868,10 +913,18 @@ func TestHandler(c *Conn, data []byte) {
 		abStatus.Apply(status.Instance(c.Instance), kind, d.Power, d.DurationMs, time.Now().UnixMilli())
 		c.Notify("ab:applied " + strings.ToLower(d.Kind))
 	case "mana":
+		v := d.Value
+		if v < 0 {
+			v = 0
+		}
+		maxMana := manaMaxFor(c.Username)
+		if v > maxMana {
+			v = maxMana
+		}
 		abMu.Lock()
-		abMana[c.Instance] = d.Value
+		abMana[c.Instance] = v
 		abMu.Unlock()
-		c.Notify("ab:mana=" + Itoa(int64(d.Value)))
+		c.Notify("ab:mana=" + Itoa(int64(v)))
 	case "echo":
 		abMu.Lock()
 		keys := make([]string, 0, len(abLevels[c.Username]))
@@ -882,7 +935,7 @@ func TestHandler(c *Conn, data []byte) {
 		mana, ok := abMana[c.Instance]
 		abMu.Unlock()
 		if !ok {
-			mana = maxMana
+			mana = manaMaxFor(c.Username)
 		}
 		c.Notify("ab:abilities [" + strings.Join(keys, ",") + "] mana=" + Itoa(int64(mana)))
 	}

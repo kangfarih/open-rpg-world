@@ -13,7 +13,6 @@ package server
 import (
 	"encoding/json"
 
-	"rpg-world-server/internal/guilds"
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/social"
 	worldcore "rpg-world-server/internal/world"
@@ -54,7 +53,7 @@ const (
 )
 
 // socConn converts a root conn to the package view (nil-safe). Delivery
-// stays direct (gnet.Send on the live socket, m6Notify on the same conn).
+// stays direct (gnet.Send on the live socket, notifyPlayer on the same conn).
 func socConn(c *playerConn) *social.Conn {
 	if c == nil {
 		return nil
@@ -66,21 +65,60 @@ func socConn(c *playerConn) *social.Conn {
 			_ = gnet.Send(c.Conn, frames...)
 		},
 		Notify: func(message string) {
-			m6Notify(c, message)
+			notifyPlayer(c, message)
 		},
 	}
 }
 
 // socPlayerConn resolves an online player to the package view (nil-safe).
 func socPlayerConn(name string) (*social.Conn, bool) {
-	c := m7PlayerByName(name)
+	c := playerByName(name)
 	if c == nil {
 		return nil, false
 	}
 	return socConn(c), true
 }
 
-// socConfigure wires the social seams (called once from m5Init, before
+// socGuildCreationGates checks the economy/progression gates for guild
+// creation (TS guilds.ts create() lines 44-60 parity): 30,000 gold + tutorial
+// finished. When both pass, the gold is deducted and (true, "") is returned.
+// When either fails, (false, errMsg) is returned and the caller notifies.
+func socGuildCreationGates(username string) (bool, string) {
+	const guildCost = 30_000
+
+	// Tutorial gate (TS: if (!player.tutorialFinished) return).
+	if !loiterTutorialFinished(username) {
+		return false, "misc:TUTORIAL_NOT_FINISHED"
+	}
+
+	// Gold gate (TS: if (!player.inventory.hasItem('gold', 30_000)) return).
+	st := playerStateFor(username)
+	if st == nil {
+		return false, "misc:NOT_ENOUGH_GOLD"
+	}
+	goldIdx := -1
+	for i, slot := range st.Inv {
+		if slot.Key == "gold" {
+			goldIdx = i
+			break
+		}
+	}
+	if goldIdx < 0 || st.Inv[goldIdx].Count < guildCost {
+		return false, "misc:NOT_ENOUGH_GOLD"
+	}
+
+	// Deduct gold (TS: player.inventory.removeItem('gold', 30_000)).
+	st.Inv[goldIdx].Count -= guildCost
+	if st.Inv[goldIdx].Count == 0 {
+		// Remove the empty slot.
+		st.Inv = append(st.Inv[:goldIdx], st.Inv[goldIdx+1:]...)
+	}
+	markDirty(username)
+
+	return true, ""
+}
+
+// socConfigure wires the social seams (called once from initPlayerState, before
 // tables, logins or ticks run).
 func socConfigure() {
 	social.Configure(social.Deps{
@@ -93,10 +131,13 @@ func socConfigure() {
 			worldcore.Broadcast(frame)
 		},
 		PlayerConn:  socPlayerConn,
-		PlayerNames: m7PlayerUsernames,
-		Sanitize:    m7Sanitize,
+		PlayerNames: playerUsernames,
+		Sanitize:    sanitize,
 		IsNonBlank:  whitespaceRe.MatchString,
-		FormatName:  m7FormatName,
+		FormatName:  formatName,
+		// Guild creation gates (TS guilds.ts create() parity): 30k gold +
+		// tutorial finished. The func deducts gold on success.
+		GuildCreationGates: socGuildCreationGates,
 		// R2 cross-shard fanout (hub-gated, nil-safe no-ops in all-in-one:
 		// the funcs close over shardHubClient and check it per call, since
 		// the client starts after this wiring runs).
@@ -156,14 +197,18 @@ func socGuildRankCommand(c *playerConn, rankStr, username string) {
 	social.GuildRankCommand(socConn(c), rankStr, username)
 }
 
-// socGuildOf reports the caller's guild (m13 command-gate parity).
-func socGuildOf(username string) (*guilds.Guild, error) { return social.GuildOf(username) }
-
 func socRouteChat(target string) *playerConn {
 	social.RouteChat(target)
-	return m7PlayerByName(target)
+	return playerByName(target)
 }
 
 func socRouteGlobal(frame []any) { social.RouteGlobal(frame) }
 
-func socTestHandler(c *playerConn, data []byte) { social.TestHandler(socConn(c), data) }
+func socTestHandler(c *playerConn, data []byte) {
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client social-seed hole).
+	if !isAdmin(c) {
+		return
+	}
+	social.TestHandler(socConn(c), data)
+}

@@ -54,27 +54,48 @@ func InvSlots(d EconomyDeps, username string) []any {
 // BankAdd stacks (stackables) or appends into the bank; returns the slot
 // index or -1 when full (Modules.Constants.BANK_SIZE).
 func BankAdd(d EconomyDeps, username, itemKey string, count int) int {
-	if it := ItemInfoFor(itemKey); it != nil && it.Stackable {
-		slots := d.Store.BankSlots(username)
-		for i, s := range slots {
-			if s.Key == itemKey {
-				slots[i].Count += count
-				d.Store.SetBank(username, slots)
-				return i
+	return BankAddEnch(d, username, itemKey, count, nil)
+}
+
+// BankAddEnch is BankAdd carrying enchantments: plain stacks merge only
+// into un-enchanted same-key slots with room under MaxStack (bank
+// stackSize is MAX_STACK; container.find parity skips enchanted sides),
+// everything else appends a fresh slot. Atomic: -1 returns before any
+// write, so callers can restore without duplicating a partial move.
+func BankAddEnch(d EconomyDeps, username, itemKey string, count int, ench protocol.Enchantments) int {
+	slots := d.Store.BankSlots(username)
+	if len(ench) == 0 {
+		if max := MaxStack(itemKey); max > 1 {
+			for i, s := range slots {
+				if s.Key == itemKey && len(s.Ench) == 0 && s.Count+count <= max {
+					slots[i].Count += count
+					d.Store.SetBank(username, slots)
+					return i
+				}
 			}
 		}
-	} else {
-		// Fall back to the Store seam's stackable view when the catalogue
-		// misses the key (unknown items are non-stackable parity).
-		_ = 0
 	}
-	if len(d.Store.BankSlots(username)) >= protocol.ModulesBankSize {
+	if len(slots) >= protocol.ModulesBankSize {
 		return -1
 	}
-	slots := d.Store.BankSlots(username)
-	slots = append(slots, Slot{Key: itemKey, Count: count})
+	slots = append(slots, Slot{Key: itemKey, Count: count, Ench: CopyEnchantments(ench)})
 	d.Store.SetBank(username, slots)
 	return len(slots) - 1
+}
+
+// bankHasRoom reports whether a deposit of slot fits without mutating:
+// a full-fit un-enchanted merge, or a free bank slot.
+func bankHasRoom(d EconomyDeps, username string, slot Slot) bool {
+	if len(slot.Ench) == 0 {
+		if max := MaxStack(slot.Key); max > 1 {
+			for _, s := range d.Store.BankSlots(username) {
+				if s.Key == slot.Key && len(s.Ench) == 0 && s.Count+slot.Count <= max {
+					return true
+				}
+			}
+		}
+	}
+	return len(d.Store.BankSlots(username)) < protocol.ModulesBankSize
 }
 
 // BankBatch builds the bank Container Batch payload (bank.serialize(true)).
@@ -83,7 +104,7 @@ func BankBatch(d EconomyDeps, username string) protocol.ContainerData {
 	out := make([]any, 0, len(slots))
 	for i, s := range slots {
 		out = append(out, map[string]any{
-			"index": i, "key": s.Key, "count": s.Count, "enchantments": map[string]any{},
+			"index": i, "key": s.Key, "count": s.Count, "enchantments": protocol.EnchAny(s.Ench),
 		})
 	}
 	return protocol.ContainerData{Type: protocol.ContainerTypeBank, Data: &protocol.ContainerBatchPayload{Slots: out}}
@@ -143,22 +164,35 @@ func HandleContainerSelect(c EconomyConn, msg *protocol.ClientContainer, d Econo
 		if slot.Key == "" || slot.Count < 1 {
 			return
 		}
+		// Capacity is checked before touching the inventory (TS move is
+		// atomic: a full bank leaves the source slot alone).
+		if !bankHasRoom(d, username, slot) {
+			Notify(c, d, "Bank is full.")
+			return
+		}
 		nslots := append(slots[:fromIndex], slots[fromIndex+1:]...)
 		d.Store.SetInventory(username, nslots)
 
-		bankIdx := BankAdd(d, username, slot.Key, slot.Count)
+		bankIdx := BankAddEnch(d, username, slot.Key, slot.Count, slot.Ench)
 		if bankIdx < 0 {
-			_ = d.Store.AddItem(username, slot.Key, slot.Count)
+			// Defensive only (pre-checked above): put the stack back
+			// and resync the client, so the move never loses items.
+			invIdx := d.Store.AddItemEnch(username, slot.Key, slot.Count, slot.Ench)
+			d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
+				Type: protocol.ContainerTypeInventory,
+				Slot: &protocol.SlotData{Index: invIdx, Key: slot.Key, Count: slot.Count, Enchantments: protocol.EnchAny(slot.Ench)},
+			}))
+			d.Store.MarkDirty(username)
 			Notify(c, d, "Bank is full.")
 			return
 		}
 		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerRemove, protocol.ContainerData{
 			Type: protocol.ContainerTypeInventory,
-			Slot: &protocol.SlotData{Index: fromIndex, Key: slot.Key, Count: 0, Enchantments: map[string]any{}},
+			Slot: &protocol.SlotData{Index: fromIndex, Key: slot.Key, Count: 0, Enchantments: protocol.EnchAny(slot.Ench)},
 		}))
 		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
 			Type: protocol.ContainerTypeBank,
-			Slot: &protocol.SlotData{Index: bankIdx, Key: slot.Key, Count: slot.Count, Enchantments: map[string]any{}},
+			Slot: &protocol.SlotData{Index: bankIdx, Key: slot.Key, Count: slot.Count, Enchantments: protocol.EnchAny(slot.Ench)},
 		}))
 		d.Store.MarkDirty(username)
 		log.Printf("m6: %s deposit %s x%d (bank slot %d)", c.InstanceID(), slot.Key, slot.Count, bankIdx)
@@ -178,17 +212,23 @@ func HandleContainerSelect(c EconomyConn, msg *protocol.ClientContainer, d Econo
 			return
 		}
 
-		invIdx := d.Store.AddItem(username, slot.Key, slot.Count)
+		// The bank slot is dropped only after the inventory add lands:
+		// a failed add must not destroy the bank stack.
+		invIdx := d.Store.AddItemEnch(username, slot.Key, slot.Count, slot.Ench)
+		if invIdx < 0 {
+			Notify(c, d, "Your inventory is full.")
+			return
+		}
 		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
 			Type: protocol.ContainerTypeInventory,
-			Slot: &protocol.SlotData{Index: invIdx, Key: slot.Key, Count: slot.Count, Enchantments: map[string]any{}},
+			Slot: &protocol.SlotData{Index: invIdx, Key: slot.Key, Count: slot.Count, Enchantments: protocol.EnchAny(slot.Ench)},
 		}))
 
 		nb := append(bslots[:fromIndex], bslots[fromIndex+1:]...)
 		d.Store.SetBank(username, nb)
 		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerRemove, protocol.ContainerData{
 			Type: protocol.ContainerTypeBank,
-			Slot: &protocol.SlotData{Index: fromIndex, Key: slot.Key, Count: 0, Enchantments: map[string]any{}},
+			Slot: &protocol.SlotData{Index: fromIndex, Key: slot.Key, Count: 0, Enchantments: protocol.EnchAny(slot.Ench)},
 		}))
 		d.Store.MarkDirty(username)
 		log.Printf("m6: %s withdraw %s x%d (bank slot %d)", c.InstanceID(), slot.Key, slot.Count, fromIndex)
@@ -207,7 +247,22 @@ func HandleContainerSwap(c EconomyConn, d EconomyDeps, fromIndex, toIndex int) {
 	slots[fromIndex], slots[toIndex] = slots[toIndex], slots[fromIndex]
 	d.Store.SetInventory(c.PlayerName(), slots)
 	d.Store.MarkDirty(c.PlayerName())
+	// Resync the client (container.swap fires loadCallback on both
+	// containers, which the handler fans out as a Container Batch).
+	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketContainer, protocol.ContainerBatch, inventoryBatch(c.PlayerName(), slots)))
 	log.Printf("m6: %s swap inventory %d <-> %d", c.InstanceID(), fromIndex, toIndex)
+}
+
+// inventoryBatch builds the inventory Container Batch payload for slots
+// (inventory.serialize(true) parity for the swap resync).
+func inventoryBatch(username string, slots []Slot) protocol.ContainerData {
+	out := make([]any, 0, len(slots))
+	for i, s := range slots {
+		out = append(out, map[string]any{
+			"index": i, "key": s.Key, "count": s.Count, "enchantments": protocol.EnchAny(s.Ench),
+		})
+	}
+	return protocol.ContainerData{Type: protocol.ContainerTypeInventory, Data: &protocol.ContainerBatchPayload{Slots: out}}
 }
 
 // HandleContainer routes the C->S Container frame.
@@ -237,6 +292,14 @@ func HandleContainer(c EconomyConn, data []byte, d EconomyDeps) {
 		if *msg.Type != protocol.ContainerTypeInventory {
 			return
 		}
+		// Quest/special items cannot be dropped (inventory.remove
+		// undroppable+drop gate parity). Sell and bank moves have no
+		// such gate in TS — intentionally unchecked there too.
+		droppedSlot, droppedOk := d.Store.SlotAt(c.PlayerName(), *msg.FromIndex)
+		if droppedOk && droppedSlot.Key != "" && d.Store.ItemUndroppable(droppedSlot.Key) {
+			Notify(c, d, "You cannot drop this item.")
+			return
+		}
 		if mob, item, ok := d.Pets.DropKey(c, *msg.FromIndex); ok {
 			if d.Pets.HasOwner(c.InstanceID()) {
 				Notify(c, d, "misc:ALREADY_HAVE_PET")
@@ -250,6 +313,11 @@ func HandleContainer(c EconomyConn, data []byte, d EconomyDeps) {
 		}
 		InventoryRemoveAt(c, d, c.PlayerName(), *msg.FromIndex, *msg.Value)
 		d.Store.MarkDirty(c.PlayerName())
+		// World item spawn (container.ts drop parity): the removed item
+		// becomes a world Item entity other players can see and pick up.
+		if d.Drops.SpawnItem != nil && droppedOk && droppedSlot.Key != "" {
+			d.Drops.SpawnItem(c.PlayerName(), droppedSlot.Key, *msg.Value, c.TileX(), c.TileY())
+		}
 		log.Printf("m6: %s drop idx %d x%d", c.InstanceID(), *msg.FromIndex, *msg.Value)
 	}
 }

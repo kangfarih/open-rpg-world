@@ -144,7 +144,7 @@ func TestTickTeleportToOwner(t *testing.T) {
 	reg := NewRegistry()
 	rec, _ := reg.Grant("p1", 0, 0, "rat", "ratpet", 1000)
 	w := newFakeWorld()
-	w.pos["p1"] = [2]int{20, 0} // distance 20 > 12: teleport
+	w.pos["p1"] = [2]int{20, 0} // distance 20 > 10: teleport
 
 	reg.Tick(w)
 

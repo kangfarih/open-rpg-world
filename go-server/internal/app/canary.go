@@ -115,9 +115,9 @@ func CanaryToNewest(key string, pct int) bool {
 
 // PreviousRunning reports the previous healthy RUNNING world version: the
 // second-newest version with at least one RUNNING shard. Within that
-// version the lowest-load shard wins (ties: name ascending), mirroring the
-// newestRunningLocked tie-break. ok is false when fewer than two healthy
-// versions are registered.
+// version the lowest-load shard wins (ties: latest firstSeen, then name
+// ascending), mirroring the newestRunningLocked tie-break. ok is false
+// when fewer than two healthy versions are registered.
 func PreviousRunning(h *hub.Server) (hub.ShardInfo, bool) {
 	if h == nil {
 		return hub.ShardInfo{}, false
@@ -131,8 +131,9 @@ func PreviousRunning(h *hub.Server) (hub.ShardInfo, bool) {
 		if in.State != version.StateRunning || in.Version == prefVer {
 			continue
 		}
-		// First distinct non-preferred version in newest-first order is
-		// the previous version; only compare shards within it.
+		// First distinct non-preferred version in version-grouped
+		// newest-first order is the previous version; only compare
+		// shards within it.
 		if best != nil && in.Version != best.Version {
 			continue
 		}
@@ -141,7 +142,9 @@ func PreviousRunning(h *hub.Server) (hub.ShardInfo, bool) {
 			best = &cp
 			continue
 		}
-		if in.Load < best.Load || (in.Load == best.Load && in.Name < best.Name) {
+		if in.Load < best.Load ||
+			(in.Load == best.Load && (in.FirstSeen.After(best.FirstSeen) ||
+				(in.FirstSeen.Equal(best.FirstSeen) && in.Name < best.Name))) {
 			cp := in
 			best = &cp
 		}
@@ -202,9 +205,10 @@ func NewWarmTracker() *WarmTracker {
 	return &WarmTracker{seen: make(map[string]time.Time)}
 }
 
-// Observe stamps the first-observation time of every version currently in
-// the hub table (RUNNING or otherwise — presence is what matters for
-// hold measurement). Versions never observed before stamp now.
+// Observe stamps the first-observation time of every RUNNING version
+// currently in the hub table. DRAINING/shutdown shards never extend the
+// hold: the warm-hold measures from the newest RUNNING version's first
+// observation. Versions never observed before stamp now.
 func (t *WarmTracker) Observe(h *hub.Server, now time.Time) {
 	if t == nil || h == nil {
 		return
@@ -215,6 +219,9 @@ func (t *WarmTracker) Observe(h *hub.Server, now time.Time) {
 		t.seen = make(map[string]time.Time)
 	}
 	for _, in := range h.ListShards() {
+		if in.State != version.StateRunning {
+			continue
+		}
 		if _, ok := t.seen[in.Version]; !ok {
 			t.seen[in.Version] = now
 		}

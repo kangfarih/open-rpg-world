@@ -34,7 +34,7 @@ const (
 
 // abConn converts a root conn to the package view (nil-safe; quest reward
 // paths pass nil). Delivery stays direct (gnet.Send on the live socket,
-// m6Notify on the same conn — never re-resolved).
+// notifyPlayer on the same conn — never re-resolved).
 func abConn(c *playerConn) *abilities.Conn {
 	if c == nil {
 		return nil
@@ -46,12 +46,12 @@ func abConn(c *playerConn) *abilities.Conn {
 			_ = gnet.Send(c.Conn, frames...)
 		},
 		Notify: func(message string) {
-			m6Notify(c, message)
+			notifyPlayer(c, message)
 		},
 	}
 }
 
-// abConfigure wires the ability-session seams (called once from m5Init,
+// abConfigure wires the ability-session seams (called once from initPlayerState,
 // before login batches or ticks run — same point abEnsureTables ran).
 func abConfigure() {
 	abilities.ConfigureSessions(abilities.SessionDeps{
@@ -70,7 +70,7 @@ func abConfigure() {
 				defer combatMu.Unlock()
 				return !combatDead, true
 			}
-			if m := m9MobFor(target); m != nil {
+			if m := mobFor(target); m != nil {
 				m.mu.Lock()
 				defer m.mu.Unlock()
 				return !m.dead, true
@@ -82,15 +82,15 @@ func abConfigure() {
 			if c == nil {
 				return 0, false
 			}
-			m9DamagePlayer(c, dmg, nil)
-			return m9PlayerHP(c), true
+			mobDamagePlayer(c, dmg, nil)
+			return playerHP(c), true
 		},
 		DamageMob: func(instance string, dmg int) bool {
-			m := m9MobFor(instance)
+			m := mobFor(instance)
 			if m == nil {
 				return false
 			}
-			m9PlayerHit(m, nil, dmg)
+			mobPlayerHit(m, nil, dmg)
 			return true
 		},
 		HeroWeaponPoisonous: func(username string) bool {
@@ -102,10 +102,10 @@ func abConfigure() {
 				if a.Key == "" {
 					return false
 				}
-				it := m6ItemInfoFor(a.Key)
+				it := itemInfoFor(a.Key)
 				return it != nil && it.Poisonous
 			}
-			st := m5StateFor(username)
+			st := playerStateFor(username)
 			if len(st.Equip) <= EquipmentWeapon {
 				return false
 			}
@@ -113,8 +113,14 @@ func abConfigure() {
 			if key == "" {
 				return false
 			}
-			it := m6ItemInfoFor(key)
+			it := itemInfoFor(key)
 			return it != nil && it.Poisonous
+		},
+		PlayerLevel: func(username string) int {
+			st := playerStateFor(username)
+			pstateMu.Lock()
+			defer pstateMu.Unlock()
+			return st.Level
 		},
 	})
 }
@@ -145,7 +151,13 @@ func abHandleAbility(c *playerConn, data []byte) { abilities.HandleAbility(abCon
 
 func abUse(c *playerConn, key string) { abilities.Use(abConn(c), key) }
 
-func itoa(v int64) string { return abilities.Itoa(v) }
+// abFlushShutdown covers the abilities table in the pre-shutdown barrier
+// (drain.go preShutdownFlush): grants persist write-through on grant
+// (INSERT OR REPLACE + MarkDirty, so the player-row flush already carries
+// the dirty flag), hence no per-user queue exists like quests/friends —
+// this hook keeps the barrier explicit so future buffered writes cannot
+// slip through it.
+func abFlushShutdown() {}
 
 func abApplyPoison(instance string) { abilities.ApplyPoison(instance) }
 
@@ -172,4 +184,11 @@ func abForgetPlayer(c *playerConn) {
 	abilities.ForgetPlayer(c.Instance)
 }
 
-func abTestHandler(c *playerConn, data []byte) { abilities.TestHandler(abConn(c), data) }
+func abTestHandler(c *playerConn, data []byte) {
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client ability-grant hole).
+	if !isAdmin(c) {
+		return
+	}
+	abilities.TestHandler(abConn(c), data)
+}

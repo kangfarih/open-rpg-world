@@ -8,7 +8,7 @@ import (
 )
 
 // A DoT tick kills through the DamagePlayer seam with no mob attacker
-// (StatusTick -> m9DamagePlayer(c, dmg, nil) parity): the full HeroDied
+// (StatusTick -> mobDamagePlayer(c, dmg, nil) parity): the full HeroDied
 // funnel must run — Death unicast to the victim only, Despawn broadcast,
 // synchronous save — exactly once per life (a second lethal tick is
 // silent).
@@ -17,9 +17,9 @@ func TestDotKillHeroRunsDeathFunnelOnce(t *testing.T) {
 	petConfigure() // production companion wiring (disconnect parity)
 
 	user, inst := "dot-hero", "dot-hero-inst"
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Skills[SkillDefense] = &m5Skill{Level: 5, XP: 4321}
+	st.Skills[SkillDefense] = &skillDef{Level: 5, XP: 4321}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -30,20 +30,20 @@ func TestDotKillHeroRunsDeathFunnelOnce(t *testing.T) {
 	victim, _ := deathConn(t, inst, user)
 	observer, _ := deathConn(t, "dot-observer-inst", "dot-observer-user")
 	t.Cleanup(func() {
-		m9DeathFired.Delete(inst)
-		m9PlayerHPs.Delete(inst)
+		deathFired.Delete(inst)
+		playerHPs.Delete(inst)
 	})
 
-	m9PlayerHPs.Store(inst, 5)
+	playerHPs.Store(inst, heroHPEntry{hp: 5, maxHP: 69})
 	drainOutbox(victim)
 	drainOutbox(observer)
 
 	// Poison-scale environmental damage: no mob involved.
-	m9DamagePlayer(victim, 50, nil)
+	mobDamagePlayer(victim, 50, nil)
 	// A second lethal tick on the corpse must be silent (exactly-once).
-	m9DamagePlayer(victim, 50, nil)
+	mobDamagePlayer(victim, 50, nil)
 
-	if got := m9PlayerHP(victim); got != 0 {
+	if got := playerHP(victim); got != 0 {
 		t.Fatalf("hero HP = %d, want 0", got)
 	}
 
@@ -88,21 +88,21 @@ func TestDotKillHeroRunsDeathFunnelOnce(t *testing.T) {
 // credit is invented).
 func TestDotKillMobDropsLootAndRespawns(t *testing.T) {
 	const inst = "dot-mob"
-	m := &m9Mob{
+	m := &mob{
 		instance: inst, key: "rat",
 		prof:   entity.MobProfile{Name: "Rat", Level: 1, HitPoints: 10, RespawnDelay: 0},
 		spawnX: 104, spawnY: 104, x: 104, y: 104,
 		hp: 10, maxHP: 10,
 		attackers: map[string]time.Time{},
-		over:      m9Overrides{Respawn: 30 * time.Millisecond},
+		over:      mobOverrides{Respawn: 30 * time.Millisecond},
 	}
-	m9Mu.Lock()
-	m9Mobs[inst] = m
-	m9Mu.Unlock()
-	t.Cleanup(func() { m9Remove(inst) })
+	mobMu.Lock()
+	mobs[inst] = m
+	mobMu.Unlock()
+	t.Cleanup(func() { removeMob(inst) })
 
 	// Lethal DoT-scale hit with no attacker.
-	m9PlayerHit(m, nil, 9999)
+	mobPlayerHit(m, nil, 9999)
 
 	m.mu.Lock()
 	dead := m.dead

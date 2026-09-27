@@ -2,10 +2,10 @@
 //
 // Plateau (map.ts getPlateauLevel over `map.plateau`, handler.ts:333,
 // mob.ts:148): every authoritative player position update refreshes the
-// player's tracked plateauLevel (hooked into m5TrackPos, which runs on
+// player's tracked plateauLevel (hooked into trackPos, which runs on
 // Movement Started/Step, handoffs, warp landings and every server-side
-// teleport: m7Teleport, m8Teleport, respawn, test tp, login seedPos).
-// Mobs track their spawn plateau in m9SpawnMob (mob.ts:148 parity).
+// teleport: teleport, minigameTeleport, respawn, test tp, login seedPos).
+// Mobs track their spawn plateau in spawnMob (mob.ts:148 parity).
 //
 // The mob roam-step refusal lives at its dispatch point, and each swing
 // direction carries the TS-exact ranged-only plateau gate at its own
@@ -47,9 +47,9 @@ func plateauLevelOf(x, y int) int {
 }
 
 // plateauTrack refreshes the tracked plateauLevel from the connection's
-// authoritative tile. Called from m5TrackPos (movement/handoff/warp/teleport
-// paths) and directly from m7Teleport/m9 respawn (idempotent double refresh
-// alongside the m5TrackPos call there).
+// authoritative tile. Called from trackPos (movement/handoff/warp/teleport
+// paths) and directly from teleport/m9 respawn (idempotent double refresh
+// alongside the trackPos call there).
 func plateauTrack(c *playerConn) {
 	if c == nil {
 		return
@@ -86,19 +86,19 @@ type questProg struct {
 }
 
 func (q questProg) QuestFinished(key string) bool {
-	def := m11Q[key]
+	def := questDefs[key]
 	if def == nil {
 		return false
 	}
-	return m11StateFor(q.username).PlayerState.IsFinished(key)
+	return questStateFor(q.username).PlayerState.IsFinished(key)
 }
 
 func (q questProg) AchFinished(key string) bool {
-	def := m11A[key]
+	def := achDefs[key]
 	if def == nil {
 		return false
 	}
-	st := m11StateFor(q.username)
+	st := questStateFor(q.username)
 	return st.PlayerState.Achs[key] >= def.StageCount
 }
 
@@ -118,7 +118,7 @@ func dynamicRemapFor(c *playerConn, x, y int) (int, int, bool) {
 // quest requirements — TS isColliding without a player).
 func blockedForPlayer(c *playerConn, x, y int) bool {
 	if mx, my, ok := dynamicRemapFor(c, x, y); ok {
-		return tileBlocked(mx, my) || resourceAt(mx, my) != "" || m10ChestItemsAt(mx, my)
+		return tileBlocked(mx, my) || resourceAt(mx, my) != "" || chestItemsAt(mx, my)
 	}
 	return blocked(x, y)
 }

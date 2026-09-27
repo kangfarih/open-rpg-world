@@ -166,6 +166,8 @@ type CommandConn interface {
 	// MovementSpeed is the session ms-per-tile override.
 	MovementSpeed() int
 	SetMovementSpeed(int)
+	// SetStoreOpen tracks which store the player has open (admin /store).
+	SetStoreOpen(string)
 }
 
 // CommandBus extends Bus with global fan-out, the ban text frame, socket
@@ -262,6 +264,8 @@ type MobAdmin interface {
 	// SpawnMob spawns key at the tile with Chase override (m9SpawnMob
 	// parity); false when no mob with key exists.
 	SpawnMob(instance, key string, x, y int) bool
+	// MobTalk fires a speech bubble over the mob (talkCallback parity).
+	MobTalk(instance, message string)
 }
 
 // QuestAdmin abstracts the m11 quest/achievement bridging.
@@ -322,6 +326,17 @@ type LootAdmin interface {
 	SpawnLootBag(owner string, x, y int, items []Drop)
 }
 
+// HomeStore abstracts the home-point registry (get/set bound coords +
+// persist dirtying). The server package implements it over playerStateFor.
+type HomeStore interface {
+	// GetHome returns the bound home-point coordinates for the player.
+	// (0,0) means no home bound (caller falls back to spawn).
+	GetHome(username string) (x, y int)
+	// SetHome binds the player's home-point to (x,y) and marks persist
+	// dirty so the binding survives restarts.
+	SetHome(username string, x, y int)
+}
+
 // CommandDeps bundles the command seams for one call.
 type CommandDeps struct {
 	Flags     Flags
@@ -339,6 +354,7 @@ type CommandDeps struct {
 	Pets      PetAdmin
 	Poison    PoisonAdmin
 	Misc      MiscAdmin
+	Home      HomeStore
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +365,7 @@ type CommandDeps struct {
 // table handles players/coords/ping/g/pm; this adds guild + the full
 // moderator/admin tables.
 func ParseCommand(c CommandConn, command string, blocks []string, d CommandDeps) {
+	HomeCommands(c, command, blocks, d)
 	GuildCommand(c, command, blocks, d)
 	ModeratorCommands(c, command, blocks, d)
 	AdminCommands(c, command, blocks, d)
@@ -361,6 +378,33 @@ func firstBlock(blocks []string) string {
 		return ""
 	}
 	return blocks[0]
+}
+
+// ---------------------------------------------------------------------------
+// Player commands (no rank gate — available to every player).
+// ---------------------------------------------------------------------------
+
+// HomeCommands handles /home and /sethome (home-point recall system).
+// No rank gate: every authenticated player can bind and recall to their
+// home point. /sethome saves the current tile; /home teleports back.
+func HomeCommands(c CommandConn, command string, blocks []string, d CommandDeps) {
+	if d.Home == nil {
+		return
+	}
+	switch command {
+	case "sethome":
+		x, y := c.TileX(), c.TileY()
+		d.Home.SetHome(c.PlayerName(), x, y)
+		d.Bus.Notify(c.InstanceID(), fmt.Sprintf("Home bound to %d, %d", x, y))
+	case "home":
+		hx, hy := d.Home.GetHome(c.PlayerName())
+		if hx == 0 && hy == 0 {
+			d.Bus.Notify(c.InstanceID(), "No home bound. Use /sethome first.")
+			return
+		}
+		d.World.Teleport(c, hx, hy)
+		d.Bus.Notify(c.InstanceID(), fmt.Sprintf("Recalled to home (%d, %d)", hx, hy))
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +504,7 @@ func (c *offlineConn) GrantContainerAccess() {}
 func (c *offlineConn) Rank() int             { return 0 }
 func (c *offlineConn) MovementSpeed() int    { return 0 }
 func (c *offlineConn) SetMovementSpeed(int)  {}
+func (c *offlineConn) SetStoreOpen(string)   {}
 
 // HandleCommandTest ports the m9test/m11test dispatcher pattern: TESTMAP-only
 // seeding + echo back through notifies (the e2e greps these). The testMode

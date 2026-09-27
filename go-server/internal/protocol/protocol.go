@@ -91,7 +91,9 @@ const (
 	EntityMob        = 3
 	EntityChest      = 4
 	EntityProjectile = 5
+	EntityPet        = 7
 	EntityLootBag    = 8
+	EntityEffect     = 9
 	EntityTree       = 10
 	EntityRock       = 11
 	EntityForaging   = 12
@@ -123,6 +125,10 @@ type clientMovement struct {
 	NextGridY      *int   `json:"nextGridY,omitempty"`
 	TargetInstance string `json:"targetInstance,omitempty"`
 	Orientation    *int   `json:"orientation,omitempty"`
+	// Timestamp is the client's performance.now() at send time (ms).
+	// The server uses it to estimate one-way latency for anti-cheat
+	// speed checks (TS player.ts:726-746 parity). Zero = not sent.
+	Timestamp *int `json:"timestamp,omitempty"`
 }
 
 // serverMovement mirrors MovementPacketData (common/network/impl/movement.ts).

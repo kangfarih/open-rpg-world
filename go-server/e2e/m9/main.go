@@ -205,7 +205,7 @@ func login(user string, seedPos []int) *websocket.Conn {
 	drain(800 * time.Millisecond)
 	lastFrames = nil
 	posJSON, _ := json.Marshal(seedPos)
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s}]`, user, posJSON))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedPos":%s,"seedRank":2}]`, user, posJSON))
 	// Capture the hero instance from the Welcome PlayerData (id 1 payload).
 	drain(1200 * time.Millisecond)
 	for _, f := range lastFrames {

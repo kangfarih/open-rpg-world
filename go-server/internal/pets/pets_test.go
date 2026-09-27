@@ -3,18 +3,18 @@ package pets
 import "testing"
 
 func TestShouldTeleportThreshold(t *testing.T) {
-	// Owner at origin; Manhattan distance decides.
-	if ShouldTeleport(0, 0, 12, 0) {
-		t.Error("distance 12 must NOT teleport (rule is > 12)")
+	// Owner at origin; Manhattan distance decides (TS handler.ts parity: > 10).
+	if ShouldTeleport(0, 0, 10, 0) {
+		t.Error("distance 10 must NOT teleport (rule is > 10)")
 	}
-	if ShouldTeleport(0, 0, 6, 6) {
-		t.Error("distance 12 (6+6) must NOT teleport (rule is > 12)")
+	if ShouldTeleport(0, 0, 5, 5) {
+		t.Error("distance 10 (5+5) must NOT teleport (rule is > 10)")
 	}
-	if !ShouldTeleport(0, 0, 13, 0) {
-		t.Error("distance 13 must teleport")
+	if !ShouldTeleport(0, 0, 11, 0) {
+		t.Error("distance 11 must teleport")
 	}
-	if !ShouldTeleport(0, 0, 7, 6) {
-		t.Error("distance 13 (7+6) must teleport")
+	if !ShouldTeleport(0, 0, 6, 5) {
+		t.Error("distance 11 (6+5) must teleport")
 	}
 	if ShouldTeleport(5, 5, 5, 5) {
 		t.Error("distance 0 must NOT teleport")

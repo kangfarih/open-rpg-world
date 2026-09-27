@@ -226,7 +226,7 @@ func main() {
 	drain(1500 * time.Millisecond)
 	lastFrames = nil
 
-	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x"}]`, user))
+	send(conn, fmt.Sprintf(`[2,{"opcode":0,"username":%q,"password":"x","seedRank":2}]`, user))
 	drain(2500 * time.Millisecond)
 
 	var welcome struct {

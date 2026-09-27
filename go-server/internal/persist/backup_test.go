@@ -47,7 +47,10 @@ func TestSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// Package-level Snapshot(dbPath) snapshots a path without a Store handle.
+// Live-DB snapshots route via Store.SnapshotDB only (there is no free
+// Store-less Snapshot by design: a second handle cannot serialize against
+// the owner's write transaction). This covers the owner-connection route
+// twice in one process to exercise the suffixed-retry allocation.
 func TestSnapshotPathFunc(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(EnvBackupDir, dir)
@@ -56,15 +59,20 @@ func TestSnapshotPathFunc(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
+	defer func() { _ = s.Close(nil) }()
 	if err := s.WritePlayer("hero", testState()); err != nil {
 		t.Fatalf("WritePlayer: %v", err)
 	}
-	arch, err := Snapshot(src)
+	arch, err := s.SnapshotDB("")
 	if err != nil {
-		t.Fatalf("Snapshot: %v", err)
+		t.Fatalf("SnapshotDB: %v", err)
 	}
-	if err := s.Close(nil); err != nil {
-		t.Fatalf("Close: %v", err)
+	arch2, err := s.SnapshotDB("")
+	if err != nil {
+		t.Fatalf("SnapshotDB retry: %v", err)
+	}
+	if arch2 == arch {
+		t.Fatalf("second snapshot = %q, want suffixed retry name", arch2)
 	}
 	r, err := Open(arch)
 	if err != nil {
@@ -139,6 +147,26 @@ func TestBackupEnvParsing(t *testing.T) {
 	}
 	if !BackupOnBootFromEnv(on) {
 		t.Fatal("BACKUP_ON_BOOT=1 must be on")
+	}
+}
+
+func TestSnapshotDirModePrivate(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "nested", "archives")
+	src := filepath.Join(t.TempDir(), "src.db")
+	s, err := Open(src)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = s.Close(nil) }()
+	if _, err := s.SnapshotDB(dir); err != nil {
+		t.Fatalf("SnapshotDB: %v", err)
+	}
+	fi, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("Stat dir: %v", err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("backup dir mode = %o, want 0700 (no group/other bits)", fi.Mode().Perm())
 	}
 }
 

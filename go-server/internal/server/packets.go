@@ -78,6 +78,7 @@ const (
 	EntityChest      = protocol.EntityChest
 	EntityProjectile = protocol.EntityProjectile
 	EntityLootBag    = protocol.EntityLootBag
+	EntityEffect     = protocol.EntityEffect
 	EntityTree       = protocol.EntityTree
 	EntityRock       = protocol.EntityRock
 	EntityForaging   = protocol.EntityForaging
@@ -303,5 +304,3 @@ func pkt(id int, data any) []any { return protocol.Pkt(id, data) }
 func pktOp(id, opcode int, data any) []any { return protocol.PktOp(id, opcode, data) }
 
 func mapPkt(base64 string, bufSize int) []any { return protocol.MapPkt(base64, bufSize) }
-
-func bulk(frames ...[]any) []byte { return protocol.Bulk(frames...) }

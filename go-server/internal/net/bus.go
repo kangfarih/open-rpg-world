@@ -56,12 +56,18 @@ type Bus interface {
 }
 
 // Config carries connection-gating knobs for a future net listener.
-// Only the per-IP cap is modelled so far; the rest is TODO.
+// Zero values fall back to the Default* constants in limits.go.
 type Config struct {
 	// MaxConnectionsPerIP caps concurrent conns per IP.
-	// Mirrors the TS MAX_CONNECTIONS=16 (see docs/GO-SERVER-PLAN.md:
-	// per-IP `MAX_CONNECTIONS`, per-conn msg/s + chat token buckets).
+	// Mirrors the TS MAX_CONNECTIONS=16 (see docs/GO-SERVER-PLAN.md).
 	MaxConnectionsPerIP int
-	// TODO: per-conn messages-per-second bucket.
-	// TODO: per-conn chat token bucket + global chat cooldown.
+	// MaxMsgsPerSecond caps per-conn messages under a 1s sliding window.
+	// Mirrors the TS MESSAGE_LIMIT=300 (connection.ts messageRate).
+	MaxMsgsPerSecond int
+	// ChatBurst is the per-conn chat token-bucket capacity.
+	// Mirrors root chatBucketSize=3.
+	ChatBurst float64
+	// ChatRefillPerSec is the per-conn chat token refill rate.
+	// Mirrors root chatRefillPerSec=0.5 (one msg per 2s).
+	ChatRefillPerSec float64
 }

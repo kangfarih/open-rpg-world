@@ -177,14 +177,28 @@ func TestEventBootAndDue(t *testing.T) {
 		t.Fatalf("seeding Due = %v, want nil", due)
 	}
 	due := c.Due(now + 60)
-	if len(due) != 4 {
-		t.Fatalf("Due = %d events, want 4", len(due))
+	if len(due) != 1 {
+		t.Fatalf("Due = %d events, want 1 (single rotation pick)", len(due))
 	}
-	if !c.IsActive("double-drops") || !c.IsActive("experience") {
-		t.Fatal("IsActive missing fired keys")
+	if due[0].Key != "double-drops" {
+		t.Fatalf("Due head = %q, want double-drops (rotation order)", due[0].Key)
 	}
-	if c.Fired() != 4 || c.Interval() != 50 {
-		t.Fatalf("Fired=%d Interval=%d want 4,50", c.Fired(), c.Interval())
+	if !c.IsActive("double-drops") {
+		t.Fatal("IsActive missing fired key")
+	}
+	if c.IsActive("experience") {
+		t.Fatal("single pick must not light the rest of the rotation")
+	}
+	if c.Fired() != 1 || c.Interval() != 50 {
+		t.Fatalf("Fired=%d Interval=%d want 1,50", c.Fired(), c.Interval())
+	}
+	// Next cadence fires the next single pick, not a re-fire of the head.
+	due = c.Due(now + 120)
+	if len(due) != 1 || due[0].Key != "double-drops" {
+		t.Fatalf("second Due = %v, want [double-drops] (flat test cadence re-fires head singly)", due)
+	}
+	if c.Fired() != 2 {
+		t.Fatalf("Fired=%d want 2", c.Fired())
 	}
 }
 

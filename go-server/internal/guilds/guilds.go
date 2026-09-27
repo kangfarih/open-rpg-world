@@ -32,6 +32,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ---------------------------------------------------------------------------
@@ -121,18 +122,41 @@ var (
 // Guild + Registry (transport-free; all state behind a mutex).
 // ---------------------------------------------------------------------------
 
+// Decoration mirrors the TS Decoration interface (impl/guild.ts):
+// banner/outline/outlineColour/crest for guild visual identity.
+type Decoration struct {
+	Banner        string `json:"banner"`
+	Outline       int    `json:"outline"`
+	OutlineColour string `json:"outlineColour"`
+	Crest         string `json:"crest"`
+}
+
+// DefaultDecoration returns the client fallback values (banner Grey, outline
+// StyleOne, outlineColour GoldenYellow, crest none).
+func DefaultDecoration() Decoration {
+	return Decoration{Banner: "grey", Outline: 0, OutlineColour: "goldenyellow", Crest: "none"}
+}
+
 // Guild is one guild. ID is the lowercase-name identifier (TS create():
 // identifier = name.toLowerCase()). Owner is the creator's username (sole
 // RankLandlord under TS rules — SetRank can never grant Landlord since it
 // requires the actor to strictly outrank the new rank). Members maps username
 // (exact case, as TS compares member.username) to rank. XP accumulates via
-// AddXP (TS guild.experience).
+// AddXP (TS guild.experience). InviteOnly mirrors TS GuildData.inviteOnly
+// (hides guilds from the list response when true). CreationDate is the Unix
+// timestamp (milliseconds) when the guild was founded. Decoration holds the
+// guild's visual identity (banner/outline/crest). JoinDates maps username to
+// the Unix timestamp (milliseconds) when the member joined.
 type Guild struct {
-	ID      string
-	Name    string
-	Owner   string
-	Members map[string]Rank
-	XP      int
+	ID           string
+	Name         string
+	Owner        string
+	Members      map[string]Rank
+	XP           int
+	InviteOnly   bool
+	CreationDate int64
+	Decoration   Decoration
+	JoinDates    map[string]int64
 }
 
 // Registry holds all guilds plus the reverse (player -> guild) and pending
@@ -156,21 +180,51 @@ func NewRegistry() *Registry {
 // copyGuild snapshots a guild for safe hand-out (callers must not mutate
 // registry state).
 func copyGuild(g *Guild) *Guild {
-	out := &Guild{ID: g.ID, Name: g.Name, Owner: g.Owner, XP: g.XP, Members: make(map[string]Rank, len(g.Members))}
+	out := &Guild{
+		ID:           g.ID,
+		Name:         g.Name,
+		Owner:        g.Owner,
+		XP:           g.XP,
+		InviteOnly:   g.InviteOnly,
+		CreationDate: g.CreationDate,
+		Decoration:   g.Decoration,
+		Members:      make(map[string]Rank, len(g.Members)),
+		JoinDates:    make(map[string]int64, len(g.JoinDates)),
+	}
 	for u, r := range g.Members {
 		out.Members[u] = r
+	}
+	for u, t := range g.JoinDates {
+		out.JoinDates[u] = t
 	}
 	return out
 }
 
+// normalizeMember lowercases a username for member/invite/reverse-map keys
+// (case-insensitive membership: "Alice" and "alice" are the same member).
+// Leading/trailing whitespace is trimmed. Guild IDs use the same folding
+// via strings.ToLower at creation.
+func normalizeMember(name string) string {
+	return strings.ToLower(strings.TrimSpace(name))
+}
+
 // Create founds a guild owned by owner (TS create(): owner joins as Landlord,
 // 30k gold/tutorial/guest gates are caller-side — see divergences). The name
-// must be unused (case-insensitive) and the owner guild-free.
+// must be unused (case-insensitive) and the owner guild-free. Member keys
+// (owner) are case-normalized so "Alice" and "alice" cannot hold separate
+// memberships.
 func (r *Registry) Create(owner, name string) (*Guild, error) {
-	if owner == "" || name == "" {
+	if strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
 		return nil, ErrInvalid
 	}
-	id := strings.ToLower(name)
+	owner = normalizeMember(owner)
+	if owner == "" {
+		return nil, ErrInvalid
+	}
+	id := strings.ToLower(strings.TrimSpace(name))
+	if id == "" {
+		return nil, ErrInvalid
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if _, ok := r.member[owner]; ok {
@@ -179,7 +233,16 @@ func (r *Registry) Create(owner, name string) (*Guild, error) {
 	if _, ok := r.guilds[id]; ok {
 		return nil, ErrExists
 	}
-	g := &Guild{ID: id, Name: name, Owner: owner, Members: map[string]Rank{owner: RankLandlord}}
+	g := &Guild{
+		ID:           id,
+		Name:         name,
+		Owner:        owner,
+		Members:      map[string]Rank{owner: RankLandlord},
+		InviteOnly:   false,
+		CreationDate: time.Now().UnixMilli(),
+		Decoration:   DefaultDecoration(),
+		JoinDates:    map[string]int64{owner: time.Now().UnixMilli()},
+	}
 	r.guilds[id] = g
 	r.member[owner] = id
 	return copyGuild(g), nil
@@ -188,6 +251,7 @@ func (r *Registry) Create(owner, name string) (*Guild, error) {
 // Disband deletes the actor's guild (TS leave() by the owner: every member is
 // removed and the row deleted). Only the owner may disband.
 func (r *Registry) Disband(actor string) error {
+	actor = normalizeMember(actor)
 	if actor == "" {
 		return ErrInvalid
 	}
@@ -214,8 +278,11 @@ func (r *Registry) Disband(actor string) error {
 
 // Invite records a pending invite for target into the actor's guild (no TS
 // counterpart — TS has no invite RPC; owner-only gate mirrors kick's owner
-// gate — see divergences). Invites are idempotent.
+// gate — see divergences). Invites are idempotent. Member keys are
+// case-normalized.
 func (r *Registry) Invite(actor, target string) error {
+	actor = normalizeMember(actor)
+	target = normalizeMember(target)
 	if actor == "" || target == "" {
 		return ErrInvalid
 	}
@@ -248,7 +315,10 @@ func (r *Registry) Invite(actor, target string) error {
 // AcceptInvite joins username to guildID via a pending invite at Fledgling
 // rank (TS join() starts members at Fledgling). Already-guilded players are
 // rejected (TS 'guilds:ALREADY_IN_GUILD'), keeping one-guild membership.
+// Member keys and the guild ID are case-normalized.
 func (r *Registry) AcceptInvite(username, guildID string) error {
+	username = normalizeMember(username)
+	guildID = strings.ToLower(strings.TrimSpace(guildID))
 	if username == "" || guildID == "" {
 		return ErrInvalid
 	}
@@ -268,6 +338,10 @@ func (r *Registry) AcceptInvite(username, guildID string) error {
 		return ErrFull
 	}
 	g.Members[username] = RankFledgling
+	if g.JoinDates == nil {
+		g.JoinDates = map[string]int64{}
+	}
+	g.JoinDates[username] = time.Now().UnixMilli()
 	r.member[username] = guildID
 	delete(r.invites[guildID], username)
 	// Drop this player's other pending invites so no stale invite outlives
@@ -282,7 +356,10 @@ func (r *Registry) AcceptInvite(username, guildID string) error {
 
 // Kick removes target from the actor's guild (TS kick(): owner-only,
 // self-kick rejected). The victim's reverse mapping is cleared.
+// Member keys are case-normalized.
 func (r *Registry) Kick(actor, target string) error {
+	actor = normalizeMember(actor)
+	target = normalizeMember(target)
 	if actor == "" || target == "" {
 		return ErrInvalid
 	}
@@ -312,8 +389,10 @@ func (r *Registry) Kick(actor, target string) error {
 
 // Leave removes username from their guild (TS leave(): a plain member is
 // filtered out and synced; the OWNER leaving disbands the whole guild —
-// every member mapping cleared and the guild deleted).
+// every member mapping cleared and the guild deleted). Member keys are
+// case-normalized.
 func (r *Registry) Leave(username string) error {
+	username = normalizeMember(username)
 	if username == "" {
 		return ErrInvalid
 	}
@@ -345,8 +424,11 @@ func (r *Registry) Leave(username string) error {
 // [Fledgling, Landlord], and the actor must strictly outrank the NEW rank
 // (TS `playerMember.rank - rank < 1` -> 'guilds:NO_PERMISSION_RANK'). Hence a
 // Landlord (7) can grant at most Master (6): Landlord itself is ungrantable
-// and the owner un-demotable, exactly as in TS.
+// and the owner un-demotable, exactly as in TS. Member keys are
+// case-normalized.
 func (r *Registry) SetRank(actor, target string, rank Rank) error {
+	actor = normalizeMember(actor)
+	target = normalizeMember(target)
 	if actor == "" || target == "" {
 		return ErrInvalid
 	}
@@ -366,9 +448,7 @@ func (r *Registry) SetRank(actor, target string, rank Rank) error {
 	if actor == target {
 		return ErrNoPermission
 	}
-	tr, ok := g.Members[target]
-	_ = tr
-	if !ok {
+	if _, ok := g.Members[target]; !ok {
 		return ErrNotMember
 	}
 	ar, ok := g.Members[actor]
@@ -383,8 +463,10 @@ func (r *Registry) SetRank(actor, target string, rank Rank) error {
 }
 
 // AddXP adds experience to the caller's guild (TS addExperience(): any member
-// may contribute; the sum is unguarded, negatives included).
+// may contribute; the sum is unguarded, negatives included). Member keys
+// are case-normalized.
 func (r *Registry) AddXP(username string, xp int) error {
+	username = normalizeMember(username)
 	if username == "" {
 		return ErrInvalid
 	}
@@ -402,8 +484,37 @@ func (r *Registry) AddXP(username string, xp int) error {
 	return nil
 }
 
+// SetJoinDate sets a member's join date (load path restores persisted dates).
+func (r *Registry) SetJoinDate(guildID, username string, date int64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.guilds[guildID]
+	if !ok {
+		return
+	}
+	if g.JoinDates == nil {
+		g.JoinDates = map[string]int64{}
+	}
+	g.JoinDates[username] = date
+}
+
+// SetGuildMeta sets inviteOnly, creationDate, and decoration (load path
+// restores persisted metadata).
+func (r *Registry) SetGuildMeta(guildID string, inviteOnly bool, creationDate int64, deco Decoration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g, ok := r.guilds[guildID]
+	if !ok {
+		return
+	}
+	g.InviteOnly = inviteOnly
+	g.CreationDate = creationDate
+	g.Decoration = deco
+}
+
 // Get returns a snapshot of the guild by ID (lowercase-name identifier).
 func (r *Registry) Get(id string) (*Guild, error) {
+	id = strings.ToLower(strings.TrimSpace(id))
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	g, ok := r.guilds[id]
@@ -413,8 +524,10 @@ func (r *Registry) Get(id string) (*Guild, error) {
 	return copyGuild(g), nil
 }
 
-// GuildOf returns a snapshot of username's guild.
+// GuildOf returns a snapshot of username's guild (username
+// case-normalized).
 func (r *Registry) GuildOf(username string) (*Guild, error) {
+	username = normalizeMember(username)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	id, ok := r.member[username]
@@ -433,16 +546,15 @@ func (r *Registry) GuildOf(username string) (*Guild, error) {
 // m11EnsureTables loop and the m11/m13 `CREATE TABLE IF NOT EXISTS ... TEXT /
 // INT` column style). No DB work happens inside this package.
 func SchemaSQL() string {
-	return `CREATE TABLE IF NOT EXISTS guilds(id TEXT PRIMARY KEY, name TEXT, owner TEXT, xp INT);` +
+	return `CREATE TABLE IF NOT EXISTS guilds(id TEXT PRIMARY KEY, name TEXT, owner TEXT, xp INT, invite_only INT DEFAULT 0, creation_date INT DEFAULT 0, decoration TEXT DEFAULT '{}');` +
 		"\n" +
-		`CREATE TABLE IF NOT EXISTS guild_members(guild TEXT, player TEXT, rank INT, PRIMARY KEY(guild, player));`
+		`CREATE TABLE IF NOT EXISTS guild_members(guild TEXT, player TEXT, rank INT, join_date INT DEFAULT 0, PRIMARY KEY(guild, player));`
 }
 
 // Divergences from TS (documented; spec-mandated shape or new-in-Go logic):
-//   - Guild struct shape is spec-fixed ({ID, Name, Owner, Members, XP}): it
-//     drops GuildData fields the stub has no systems for — creationDate,
-//     inviteOnly, decoration (banner/outline/crest), joinDate per member, and
-//     serverId/online presence. The caller re-adds them at the packet layer.
+//   - Guild struct now carries creationDate, inviteOnly, decoration, and
+//     per-member joinDate (TS GuildData parity). These fields persist to
+//     SQLite via the social layer's saveGuildRows/LoadGuilds.
 //   - Invite/AcceptInvite are new: TS guilds.ts has NO invite RPC — join() is
 //     open (any guildless player may join any known, non-full guild; the
 //     inviteOnly flag only hides guilds from the list response). Here every
@@ -464,8 +576,11 @@ func SchemaSQL() string {
 //     ErrNoPermission/ErrInvalid so callers can notify instead of dropping.
 //   - AddXP accepts negatives (TS `guild.experience += experience` is
 //     unguarded) and any member may contribute (TS checks membership only).
-//   - Usernames are exact-case keys (TS `member.username ===` compares); only
-//     guild IDs (names) are case-folded. No guest/tutorial/max-gold logic.
+//   - Usernames are case-normalized member keys (lowercase + trimmed);
+//     guild IDs (names) are case-folded the same way. TS compares
+//     `member.username ===` exactly, but the stub normalizes at the
+//     boundary so "Alice" and "alice" cannot double-join or bypass the
+//     one-guild rule. No guest/tutorial/max-gold logic.
 //   - AcceptInvite clears the joiner's OTHER pending invites (no TS
 //     counterpart; TS has no invite state to go stale).
 //   - Rank is a plain int enum: TS GuildRank has no methods either, but TS

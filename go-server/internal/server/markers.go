@@ -10,7 +10,7 @@
 // NOT duplicated here: world.json areas.chest already spawns through the
 // mimic batch (entity.SpawnStaticChests, called just above this hook).
 //
-// Mode convention (shared with resourceSpawns + m9AdoptExisting in
+// Mode convention (shared with resourceSpawns + adoptExistingMobs in
 // boot.go/m9.go): TESTMAP keeps its demo line + showcase grid, CLEAN and
 // COMBAT keep their scenes — marker population runs on the REAL path
 // only, i.e. !testMode && !cleanMode && !combatMode. Entities are separate
@@ -26,7 +26,7 @@
 //
 // Per-type spawn paths (all reuse the existing registries/loaders — no
 // file is re-read, no drop-table/XP/formula or packet-shape change):
-//   - mobs:      m9SpawnMobQuiet — the full m9SpawnMob path (mobs.json +
+//   - mobs:      spawnMobQuiet — the full spawnMob path (mobs.json +
 //     spawns.json per-instance overrides, plateau bind, chest-area
 //     adoption) minus the Spawn broadcast (zero subscribers at boot; late
 //     joiners resolve through List + the marker Who branch below).
@@ -39,7 +39,7 @@
 //   - NPCs:      markerNPCs registry + position index; Who serves the same
 //     EntityData shape as the showcase NPC spawns (Type NPC), so talk,
 //     store, bank and quest-talk resolve through the unchanged
-//     m6ResolveNPCKey -> spawnPayload path.
+//     resolveNPCKey -> spawnPayload path.
 //   - resources: appended to resourceSpawns (+ the resources state map and
 //     the resourceEntities blocker), the same ResourceEntityData shape as
 //     the demo line, so gather/exhaust/respawn/List/Who work unchanged.
@@ -135,7 +135,7 @@ var (
 // nothing is re-read. Unknown keys (oak6, inibti, miniiceknight, empty,
 // greenstoremannpc, ...) report markerUnknown for skip+log.
 func classifyMarker(key string) markerType {
-	m9LoadTables()
+	loadMobTables()
 	loadResources()
 	if key != "" && controller.ItemInfoFor(key) != nil {
 		return markerItem
@@ -143,9 +143,9 @@ func classifyMarker(key string) markerType {
 	if controller.IsNPCKey(key) {
 		return markerNPCKind
 	}
-	m9Mu.Lock()
-	_, mobOK := m9Prof[key]
-	m9Mu.Unlock()
+	mobMu.Lock()
+	_, mobOK := mobProf[key]
+	mobMu.Unlock()
 	if mobOK {
 		return markerMob
 	}
@@ -204,7 +204,7 @@ func markerMobInterval() time.Duration {
 
 // populateMarkers spawns every world.json `entities` marker on the REAL
 // path only (mode gate above). It runs from the static-chest boot hook
-// (m10LoadAreas, right after SpawnStaticChests) — before m9Engine and
+// (loadAreas, right after SpawnStaticChests) — before mobEngine and
 // initEntities, so the registry seed picks the marker resources up. NPCs,
 // resources and items spawn synchronously (cheap registry inserts); mobs
 // drain staggered per the cadence above. Idempotent: repeat calls return
@@ -224,7 +224,7 @@ func populateMarkers() markerCounts {
 	}
 	loadWorld()
 	loadResources()
-	m9LoadTables()
+	loadMobTables()
 	if world == nil {
 		log.Printf("markers: world not loaded, skipping population")
 		return zero
@@ -355,7 +355,7 @@ func spawnMarkerResource(t markerType, idx int, key string, x, y int, run *marke
 // spawnMarkerItem registers one ground item (persistent loot shape, like
 // chest items) so Target/Step pickup works unchanged.
 func spawnMarkerItem(instance, key string, x, y int, run *markerCounts) {
-	m5RegisterLoot(instance, key, 1, x, y, "")
+	registerLoot(instance, key, 1, x, y, "")
 	run.items++
 	run.itemInsts = append(run.itemInsts, instance)
 }
@@ -375,7 +375,7 @@ func drainMarkerMobs(n int) int {
 		remaining := len(markerCounts_.mobQueue)
 		markerMu.Unlock()
 
-		if !m9SpawnMobQuiet(q.instance, q.key, q.x, q.y, m9Overrides{}) {
+		if !spawnMobQuiet(q.instance, q.key, q.x, q.y, mobOverrides{}) {
 			log.Printf("markers: mob %s (%s) at %d,%d skipped (no profile)", q.instance, q.key, q.x, q.y)
 		}
 		if n > 0 {
@@ -443,14 +443,14 @@ func markerNPCPayload(instance string) (any, bool) {
 
 // markerMobFor resolves a MARKER mob only (scoped so m1/m-rat-1 and m9test
 // Who paths stay byte-identical): live engine state at the registry pos.
-func markerMobFor(instance string) *m9Mob {
+func markerMobFor(instance string) *mob {
 	markerMu.Lock()
 	_, ok := markerMobSet[instance]
 	markerMu.Unlock()
 	if !ok {
 		return nil
 	}
-	return m9MobFor(instance)
+	return mobFor(instance)
 }
 
 // resetMarkers undoes one populateMarkers run (tests only): drops every
@@ -468,7 +468,7 @@ func resetMarkers() {
 
 	for _, inst := range run.mobInstances {
 		worldcore.RemoveEntity(inst)
-		m9Remove(inst)
+		removeMob(inst)
 	}
 	for _, inst := range run.npcInstances {
 		worldcore.RemoveEntity(inst)

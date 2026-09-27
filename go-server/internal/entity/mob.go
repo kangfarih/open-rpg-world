@@ -56,6 +56,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"rpg-world-server/internal/meta"
 	"sort"
 	"strconv"
 	"time"
@@ -91,7 +92,8 @@ const (
 
 // HeroMaxHP is the stub hero max HP (the Node getMaxHitPoints shape stays
 // M5-owned; see the root adapter divergence note).
-const HeroMaxHP = 100
+// REMOVED: HeroMaxHP is now level-scaled via meta.HeroMaxHPForLevel.
+// The MobWorld interface exposes HeroMaxHP(instance) for runtime queries.
 
 // HeroSpawnX/HeroSpawnY is getSpawn(): the stub's fixed spawn point.
 const (
@@ -145,6 +147,7 @@ type MobProfile struct {
 	AggroRange    int        `json:"aggroRange"`
 	AttackRange   int        `json:"attackRange"`
 	AttackRate    int        `json:"attackRate"`
+	ProjectileName string   `json:"projectileName"`
 	MovementSpeed int        `json:"movementSpeed"`
 	RespawnDelay  int        `json:"respawnDelay"`
 	RoamDistance  int        `json:"roamDistance"`
@@ -217,9 +220,10 @@ func LoadProfiles(mobsJSON, spawnsJSON []byte) (map[string]*MobProfile, map[stri
 
 // ProfileFor merges profs[key] with spawns["x-y"] overrides (mob.ts
 // loadSpawns keying). Returns nil when the key is unknown/invalid.
+// Defaults are applied so callers never see a nil Roaming or zero cadences.
 func ProfileFor(profs map[string]*MobProfile, spawns map[string]*SpawnOverride, key string, x, y int) *MobProfile {
 	base, ok := profs[key]
-	if !ok {
+	if !ok || base == nil {
 		return nil
 	}
 	p := *base
@@ -248,6 +252,7 @@ func ProfileFor(profs map[string]*MobProfile, spawns map[string]*SpawnOverride, 
 	if p.HitPoints <= 0 {
 		return nil
 	}
+	ApplyDefaults(&p)
 	return &p
 }
 
@@ -365,6 +370,17 @@ type PlayerView struct {
 	Level    int // raw m5 level (0 = unknown)
 	Defense  int // raw m5 defense skill (0 = unknown)
 	Plateau  int // tracked plateauLevel (0 = default/unset)
+	// Equipment defense stats (sum across all 12 slots, controller
+	// ItemDefenseStats). Used by RollMobDamage for triangle advantage.
+	DefCrush   int
+	DefSlash   int
+	DefStab    int
+	DefMagic   int
+	DefArchery int
+	// DamageReduction is the multiplicative damage factor from ThickSkin
+	// ability and defensive/shared attack style (formulas.ts
+	// getDamageReduction). Range (0, 1]; 1.0 = no reduction.
+	DamageReduction float64
 }
 
 // Mob is the live mob state, implemented by the root m9Mob (the single
@@ -460,6 +476,7 @@ type dmgRec struct {
 // Add records clamped damage for an attacker (accumulate per attacker;
 // first hit opens the entry and fixes its tiebreak order + username).
 // Zero-value ready (lazy map init, so struct-literal mobs keep working).
+// The username is first-non-empty sticky (no flap on later hits).
 func (t *DamageTable) Add(inst string, dmg int, username string) {
 	if t.recs == nil {
 		t.recs = map[string]*dmgRec{}
@@ -469,8 +486,7 @@ func (t *DamageTable) Add(inst string, dmg int, username string) {
 		t.seq++
 		r = &dmgRec{order: t.seq, username: username}
 		t.recs[inst] = r
-	}
-	if username != "" {
+	} else if r.username == "" && username != "" {
 		r.username = username
 	}
 	r.total += dmg
@@ -553,6 +569,9 @@ type MobWorld interface {
 	GetHeroHP(instance string) int
 	SetHeroHP(instance string, hp int)
 	ForgetHeroHP(instance string)
+	// HeroMaxHP returns the level-scaled max HP for a hero instance
+	// (formulas.ts getMaxHitPoints parity: 39 + level * 30).
+	HeroMaxHP(instance string) int
 	HeroPoints(instance string, hp, maxHP int)
 	// HeroDied is the player-death funnel (player handleDeath parity),
 	// exactly-once per life (TS character.hit dead-guard parity): the root
@@ -572,6 +591,10 @@ type MobWorld interface {
 	HeroRespawned(instance string, x, y int)
 	AfterDelay(d time.Duration, fn func())
 	ApplyPoison(instance string)
+	// SpawnProjectile spawns a visual-only projectile entity (type 5) from
+	// (x,y) to (tx,ty) with travel time distance*90ms. Damage is already
+	// applied by strikeMob; the projectile is purely cosmetic.
+	SpawnProjectile(projectileName, ownerInst, targetInst string, x, y, tx, ty int)
 }
 
 // ChestLoot is the loot half of the World seam (m5SpawnLoot for kill
@@ -618,9 +641,25 @@ func FindPlayer(players []PlayerView, instance string) (PlayerView, bool) {
 	return PlayerView{}, false
 }
 
+// EffectiveAggro resolves the aggro-range override (0 = profile).
+func EffectiveAggro(p MobProfile, o MobOverrides) int {
+	if o.Aggro > 0 {
+		return o.Aggro
+	}
+	return p.AggroRange
+}
+
+// EffectiveRoam resolves the leash/roam-distance override (0 = profile).
+func EffectiveRoam(p MobProfile, o MobOverrides) int {
+	if o.Leash > 0 {
+		return o.Leash
+	}
+	return p.RoamDistance
+}
+
 // CanAggro ports Mob.canAggro: existing-target gate, aggressive flags
 // (+ the M3 demo Chase override), level*3 gate (unless alwaysAggressive),
-// isNear (Chebyshev) range check.
+// isNear (Chebyshev) range check against the effective aggro range.
 func CanAggro(p MobProfile, o MobOverrides, mx, my int, curTarget string, v PlayerView) bool {
 	if curTarget != "" {
 		return false
@@ -635,7 +674,7 @@ func CanAggro(p MobProfile, o MobOverrides, mx, my int, curTarget string, v Play
 	if p.Level*3 < lvl && !p.AlwaysAggro {
 		return false
 	}
-	return Cheb(mx, my, v.X, v.Y) <= p.AggroRange
+	return Cheb(mx, my, v.X, v.Y) <= EffectiveAggro(p, o)
 }
 
 // FindAggro scans players for the first aggroable one. Call with the mob
@@ -718,9 +757,11 @@ func ChaseStep(mx, my, px, py, attackRange int, blocked func(x, y int) bool) (nx
 
 // RollMobDamage ports formulas.getDamage/getMaxDamage for a mob attacker.
 // defenseLevel is the victim's defense skill (Node default 1); mult is the
-// M9_MOBDMG debug multiplier. The result is NOT clamped to remaining HP
-// (callers clamp, like the original).
-func RollMobDamage(p MobProfile, defenseLevel int, mult float64) int {
+// M9_MOBDMG debug multiplier. defStats are the victim's equipment defense
+// stats [crush, slash, stab, magic, archery] for triangle advantage
+// (AccuracyModifier); pass [5]int{} for zero-defense dummies. The result is
+// NOT clamped to remaining HP (callers clamp, like the original).
+func RollMobDamage(p MobProfile, defenseLevel int, mult float64, defStats [5]int) int {
 	ranged := p.AttackRange > 1
 	bonus, dmgLevel := p.Bonuses.Strength, p.Skills.Strength
 	if ranged {
@@ -741,20 +782,14 @@ func RollMobDamage(p MobProfile, defenseLevel int, mult float64) int {
 	}
 	acc += float64(defLvl) * 0.0175
 
-	// getAccuracyWeight: per-school (attack - defense)/3, positives summed;
-	// archers/mages use only their school. Player defense stats are all 0.
-	w := 0.0
-	if ranged && p.AttackStats.Magic > 0 {
-		w = float64(p.AttackStats.Magic) / 3 // isMagic: own weight
-	} else if ranged {
-		w = float64(p.AttackStats.Archery) / 3
-	} else {
-		for _, v := range []int{p.AttackStats.Crush, p.AttackStats.Slash, p.AttackStats.Stab, p.AttackStats.Archery, p.AttackStats.Magic} {
-			if v > 0 {
-				w += float64(v) / 3
-			}
-		}
-	}
+	// Triangle-advantage weight (AccuracyModifier): archer/mage flag for
+	// mobs — ranged+magic → magic, ranged → archer, else melee.
+	isArcher := ranged && p.AttackStats.Magic == 0
+	isMagic := ranged && p.AttackStats.Magic > 0
+	w := meta.AccuracyModifier(isArcher, isMagic,
+		p.AttackStats.Crush, p.AttackStats.Slash, p.AttackStats.Stab,
+		p.AttackStats.Archery, p.AttackStats.Magic,
+		defStats[0], defStats[1], defStats[2], defStats[3], defStats[4])
 	if w < 0 {
 		acc += 1.5 // Node: negative weight appends the 1.5 accuracy penalty
 	} else {
@@ -791,7 +826,8 @@ func StepMob(m Mob, w GameWorld, now time.Time) {
 	if m.Target() == "" {
 		mx, my := m.Pos()
 		sx, sy := m.SpawnPos()
-		if OutsideRoaming(sx, sy, m.Profile().RoamDistance, mx, my, 0) {
+		prof := m.Profile()
+		if OutsideRoaming(sx, sy, EffectiveRoam(prof, m.Overrides()), mx, my, 0) {
 			sendToSpawn(m, w)
 			return
 		}
@@ -802,6 +838,7 @@ func StepMob(m Mob, w GameWorld, now time.Time) {
 			return
 		}
 		p := m.Profile()
+		o := m.Overrides()
 		// Mob-plugin combat override (attackRange/attackRate): a single
 		// registry lookup; unlisted keys keep the profile untouched.
 		if ar, rate, ok := pluginCombatOverride(m.MobKey(), m.Instance()); ok {
@@ -812,19 +849,26 @@ func StepMob(m Mob, w GameWorld, now time.Time) {
 				p.AttackRate = rate
 			}
 		}
+		roamDist := EffectiveRoam(p, o)
 		sx, sy := m.SpawnPos()
-		if OutsideRoaming(sx, sy, p.RoamDistance, viewer.X, viewer.Y, p.RoamDistance*2) {
+		if OutsideRoaming(sx, sy, roamDist, viewer.X, viewer.Y, roamDist*2) {
 			// Multi-attacker retarget omitted (stub scope: sendToSpawn).
 			m.SetTarget("")
 			sendToSpawn(m, w)
 			return
 		}
 		mx, my := m.Pos()
-		// Attacker pruning (handler.handleCombatLoop).
+		// Attacker pruning (handler.handleCombatLoop): gone attackers are
+		// kept for AttackerTimeout, far live ones drop immediately.
 		for inst, last := range m.Attackers() {
 			ax, ay, ok := w.PlayerPos(inst)
-			far := !ok || Manhattan(mx, my, ax, ay) > p.RoamDistance*2
-			if far || (!ok && now.Sub(last) > AttackerTimeout) {
+			if !ok {
+				if now.Sub(last) > AttackerTimeout {
+					m.DropAttacker(inst)
+				}
+				continue
+			}
+			if Manhattan(mx, my, ax, ay) > roamDist*2 {
 				m.DropAttacker(inst)
 			}
 		}
@@ -882,10 +926,14 @@ func sendToSpawn(m Mob, w GameWorld) {
 // plateau level and cannot roam onto a different one (mob/handler.ts:184);
 // only roam STEPS are gated, never spawn positions (showcase/chase legs are
 // unaffected — a refused draw simply retries on the next roam interval).
-// Call with the mob lock held.
+// A nil Roaming means roaming (mob.ts default true). Call with the mob lock
+// held.
 func roamMob(m Mob, w GameWorld) {
 	p := m.Profile()
-	if !*p.Roaming || m.Dead() {
+	if p.Roaming != nil && !*p.Roaming {
+		return
+	}
+	if m.Dead() {
 		return
 	}
 	sx, sy := m.SpawnPos()
@@ -935,7 +983,12 @@ func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 	if viewer.Defense > defLvl {
 		defLvl = viewer.Defense
 	}
-	dmg := RollMobDamage(p, defLvl, MobDamageMult())
+	defStats := [5]int{viewer.DefCrush, viewer.DefSlash, viewer.DefStab, viewer.DefMagic, viewer.DefArchery}
+	dmg := RollMobDamage(p, defLvl, MobDamageMult(), defStats)
+	// Damage reduction (formulas.ts getDamageReduction): ThickSkin × style.
+	if viewer.DamageReduction > 0 && viewer.DamageReduction < 1 {
+		dmg = int(math.Floor(float64(dmg) * viewer.DamageReduction))
+	}
 	if hp := w.GetHeroHP(viewer.Instance); dmg > hp {
 		dmg = hp
 	}
@@ -952,7 +1005,19 @@ func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 	// Mob-plugin attack hook (combat.onAttack port: forestdragon special,
 	// queen-ant terror attackAll, santa gift cycle). No-op for default mobs.
 	pluginOnAttack(m, p, w)
-	log.Printf("m9: %s hits %s dmg=%d hp=%d/%d", m.Instance(), viewer.Username, dmg, w.GetHeroHP(viewer.Instance), HeroMaxHP)
+	// Projectile spawn (visual-only; damage already applied above).
+	// Resolution: plugin override (santa gift, forestdragon terror) → profile
+	// default (projectileName from mobs.json). Only ranged attacks (range>1)
+	// spawn projectiles; melee mobs with projectileName stay melee.
+	projName := getPluginProjectile(m.Instance())
+	if projName == "" {
+		projName = p.ProjectileName
+	}
+	if projName != "" && p.AttackRange > 1 {
+		mx, my := m.Pos()
+		w.SpawnProjectile(projName, m.Instance(), viewer.Instance, mx, my, viewer.X, viewer.Y)
+	}
+	log.Printf("m9: %s hits %s dmg=%d hp=%d/%d", m.Instance(), viewer.Username, dmg, w.GetHeroHP(viewer.Instance), w.HeroMaxHP(viewer.Instance))
 }
 
 // HitMob applies hero damage to a mob: Points, retaliate, death
@@ -960,14 +1025,25 @@ func strikeMob(m Mob, p MobProfile, viewer PlayerView, w GameWorld) {
 // non-player damage (DoTs, admin commands); a killerless killing blow
 // still runs the full KillMob path (unowned loot, chest hooks, respawn).
 // alive reports whether the mob is still registered (the old m9MobFor
-// check); the respawn timer only fires when it does.
+// check); the respawn timer only fires when it does. Damage is clamped to
+// [0, remaining HP] so negative swings never heal and overkill never
+// over-credits.
 func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, alive func() bool) {
+	if m == nil || w == nil {
+		return
+	}
+	if dmg < 0 {
+		dmg = 0
+	}
 	m.Lock()
 	if m.Dead() {
 		m.Unlock()
 		return
 	}
 	hpBefore := m.HP()
+	if dmg > hpBefore {
+		dmg = hpBefore
+	}
 	hp := hpBefore - dmg
 	if hp < 0 {
 		hp = 0
@@ -979,14 +1055,7 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 		// HP decrement, clamped to remaining HP (addToDamageTable
 		// parity). Only player attackers are recorded (the
 		// attacker?.isPlayer() gate — a non-nil PlayerView is a player).
-		clipped := dmg
-		if clipped > hpBefore {
-			clipped = hpBefore
-		}
-		if clipped < 0 {
-			clipped = 0
-		}
-		m.AddDamage(attacker.Instance, clipped, attacker.Username)
+		m.AddDamage(attacker.Instance, dmg, attacker.Username)
 		// Retaliate (handler.handleHit): idle mobs swing back; busy mobs
 		// keep their current target. Worker-ant minions never respond
 		// (ant.ts handleHit no-op); wild ants retaliate normally.
@@ -1044,6 +1113,9 @@ func HitMob(m Mob, attacker *PlayerView, dmg int, w GameWorld, now time.Time, al
 // the killing-blow dealer — the area achievement goes to the last
 // hitter, exactly like TS).
 func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
+	if m == nil || w == nil {
+		return
+	}
 	m.Lock()
 	if m.Dead() {
 		m.Unlock()
@@ -1116,7 +1188,13 @@ func KillMob(m Mob, killer *PlayerView, w GameWorld, alive func() bool) {
 		return // boss-spawned minion (TS respawnable=false): stay destroyed
 	}
 	w.AfterDelay(delay, func() {
-		if alive == nil || alive() {
+		if m == nil {
+			return
+		}
+		if alive == nil {
+			return // no liveness proof: never respawn a zombie
+		}
+		if alive() {
 			RespawnMob(m, w)
 		}
 	})
@@ -1163,13 +1241,24 @@ func RespawnMob(m Mob, w GameWorld) {
 // relocking would self-deadlock on every killing blow). The killer's
 // target is released here; everything else (status clear, Despawn, pet
 // despawn, save, Death unicast) is HeroDied's, owned by the root adapter.
+// Damage is clamped to [0, remaining HP] so negative swings never heal.
 func DamageHero(w GameWorld, instance, username string, dmg int, from Mob) {
-	hp := w.GetHeroHP(instance) - dmg
+	if w == nil || instance == "" {
+		return
+	}
+	if dmg < 0 {
+		dmg = 0
+	}
+	heroHP := w.GetHeroHP(instance)
+	if dmg > heroHP {
+		dmg = heroHP
+	}
+	hp := heroHP - dmg
 	if hp < 0 {
 		hp = 0
 	}
 	w.SetHeroHP(instance, hp)
-	w.HeroPoints(instance, hp, HeroMaxHP)
+	w.HeroPoints(instance, hp, w.HeroMaxHP(instance))
 	if hp <= 0 {
 		mobInstance := ""
 		if from != nil {
@@ -1189,16 +1278,18 @@ func DamageHero(w GameWorld, instance, username string, dmg int, from Mob) {
 // RespawnHero ports incoming.handleRespawn -> player.respawn: only when
 // dead; the root adapter sets the session position, then this resets HP
 // and emits Teleport + Spawn + Respawn + Points. Reports false when the
-// hero is not dead ("Invalid respawn request." guard).
-func RespawnHero(w GameWorld, instance string) bool {
+// hero is not dead ("Invalid respawn request." guard). The caller supplies
+// the respawn coordinates (home-point when bound, spawn otherwise).
+func RespawnHero(w GameWorld, instance string, rx, ry int) bool {
 	if w.GetHeroHP(instance) > 0 {
 		return false
 	}
-	w.SetHeroHP(instance, HeroMaxHP)
-	w.SetEntityPos(instance, HeroSpawnX, HeroSpawnY)
-	w.TeleportHero(instance, HeroSpawnX, HeroSpawnY)
+	maxHP := w.HeroMaxHP(instance)
+	w.SetHeroHP(instance, maxHP)
+	w.SetEntityPos(instance, rx, ry)
+	w.TeleportHero(instance, rx, ry)
 	w.SpawnHero(instance)
-	w.HeroRespawned(instance, HeroSpawnX, HeroSpawnY)
-	w.HeroPoints(instance, HeroMaxHP, HeroMaxHP)
+	w.HeroRespawned(instance, rx, ry)
+	w.HeroPoints(instance, maxHP, maxHP)
 	return true
 }

@@ -18,9 +18,6 @@ type rootBus struct{}
 // Compile-time assertion that rootBus satisfies the seam.
 var _ opsnet.Bus = rootBus{}
 
-// defaultBus is the package-level Bus backed by the live registry.
-var defaultBus opsnet.Bus = rootBus{}
-
 // Broadcast routes each frame by region scope (world: Broadcast).
 func (rootBus) Broadcast(frames ...opsnet.Frame) { worldcore.Broadcast(frames...) }
 

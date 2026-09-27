@@ -46,22 +46,22 @@ func petConn(c *playerConn) *entity.CompanionConn {
 			_ = gnet.Send(c.Conn, frames...)
 		},
 		Notify: func(message string) {
-			m6Notify(c, message)
+			notifyPlayer(c, message)
 		},
 	}
 }
 
-// petConfigure wires the companion seams (called once from m5Init, before
+// petConfigure wires the companion seams (called once from initPlayerState, before
 // grants or ticks run).
 func petConfigure() {
 	entity.ConfigureCompanions(entity.CompanionDeps{
 		World: petWorld{},
 		Test:  testMode,
 		InventoryCount: func(username string) int {
-			return len(m5StateFor(username).Inv)
+			return len(playerStateFor(username).Inv)
 		},
 		InventoryKey: func(username string, index int) (string, bool) {
-			st := m5StateFor(username)
+			st := playerStateFor(username)
 			pstateMu.Lock()
 			defer pstateMu.Unlock()
 			if index < 0 || index >= len(st.Inv) {
@@ -70,18 +70,18 @@ func petConfigure() {
 			return st.Inv[index].Key, true
 		},
 		AddItem: func(username, key string, count int) int {
-			return m5AddItem(username, key, count)
+			return addItem(username, key, count)
 		},
 		MarkDirty: markDirty,
 		IsMob: func(target string) bool {
-			return m9MobFor(target) != nil
+			return mobFor(target) != nil
 		},
 		CreditMob: func(ownerInstance, target string, dmg int) {
-			m := m9MobFor(target)
+			m := mobFor(target)
 			if m == nil {
 				return
 			}
-			m9PlayerHit(m, petConnByInstance(ownerInstance), dmg)
+			mobPlayerHit(m, petConnByInstance(ownerInstance), dmg)
 		},
 		StrikeDummy: func(petInstance, ownerInstance string, dmg int) bool {
 			combatMu.Lock()
@@ -108,7 +108,7 @@ func (petWorld) RemoveEntity(inst string)           { worldcore.RemoveEntity(ins
 func (petWorld) Broadcast(frames ...[]any)          { worldcore.Broadcast(frames...) }
 
 // petConnByInstance resolves a live playerConn by instance for combat credit
-// (retaliate/loot/quest flow). Nil when the owner is gone; m9PlayerHit is
+// (retaliate/loot/quest flow). Nil when the owner is gone; mobPlayerHit is
 // nil-safe (skips credit, still applies broadcast-side damage already sent).
 func petConnByInstance(instance string) *playerConn {
 	c, _ := worldcore.Find[*playerConn](instance)
@@ -157,5 +157,10 @@ func petResolveKey(key string) (mob, item string) {
 }
 
 func petTestHandler(c *playerConn, data []byte) {
+	// Admin-rank gate (see handleMinigameTest: TESTMAP default stays ON, the gate
+	// closes the any-client pet-grant hole).
+	if !isAdmin(c) {
+		return
+	}
 	entity.CompanionTestHandler(petConn(c), data)
 }

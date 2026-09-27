@@ -136,6 +136,20 @@ func AdminCommands(c CommandConn, command string, blocks []string, d CommandDeps
 	case "clear": // forEachSlot remove — same end state for the inventory
 		EmptyContainer(d, c.PlayerName(), "inventory")
 
+	case "store": // /store [key] — open any store by key (admin shortcut)
+		if len(blocks) == 0 {
+			d.Bus.Notify(c.InstanceID(), "Malformed command, expected /store key")
+			return
+		}
+		key := blocks[0]
+		store := StoreFor(key)
+		if store == nil {
+			d.Bus.Notify(c.InstanceID(), fmt.Sprintf("No store with key %s exists.", key))
+			return
+		}
+		d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketStore, protocol.StoreOpen, SerializeStore(store)))
+		c.SetStoreOpen(key)
+
 	// --- teleport -----------------------------------------------------------
 	case "teleport": // admin version accepts the withAnimation flag
 		if len(blocks) < 2 {
@@ -320,6 +334,18 @@ func AdminCommands(c CommandConn, command string, blocks []string, d CommandDeps
 
 	case "find": // /find [npcKey]
 		FindNPC(c, strings.Join(blocks, " "), d)
+
+	case "talk": // /talk [instance] — trigger mob talkCallback
+		if len(blocks) == 0 {
+			d.Bus.Notify(c.InstanceID(), "Malformed command, expected /talk instance")
+			return
+		}
+		instance := blocks[0]
+		if _, ok := d.Mobs.MobFor(instance); !ok {
+			d.Bus.Notify(c.InstanceID(), fmt.Sprintf("Could not find entity with instance: %s", instance))
+			return
+		}
+		d.Mobs.MobTalk(instance, "This is a test talking message lol")
 
 	// --- world/info ---------------------------------------------------------
 	case "getregion":

@@ -174,7 +174,7 @@ func main() {
 	c.waitFor(2*time.Second, func(f []json.RawMessage) bool { return frameID(f) == 0 })
 	send(conn, `[1,{"gVer":"0.5.5-beta"}]`)
 	c.waitFor(2*time.Second, func(f []json.RawMessage) bool { return frameID(f) == 1 })
-	send(conn, `[2,{"opcode":0,"username":"worldtester","password":"x"}]`)
+	send(conn, `[2,{"opcode":0,"username":"worldtester","password":"x","seedRank":2}]`)
 	wf := c.waitFor(3*time.Second, func(f []json.RawMessage) bool { return frameID(f) == pktWelcome })
 	check(wf != nil, "welcome received")
 	if wf != nil {

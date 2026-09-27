@@ -9,10 +9,12 @@
 package server
 
 import (
+	"database/sql"
 	"net"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 
@@ -29,6 +31,10 @@ const (
 	opsMaxPlayers  = app.MaxPlayers
 )
 
+// serverStartTime is captured at opsConfigure (early in Boot) for the
+// admin dashboard uptime display.
+var serverStartTime = time.Now()
+
 // Transport + accept-gate state moved to internal/net (D2a): the Hub owns
 // the limiter, the update-mode gate, the admitted-conn table and the IP ban
 // set. The accept/release/budget entry points live there as package funcs
@@ -41,7 +47,7 @@ const (
 // opsAccept/opsRelease/opsAllowMsg/opsAllowChat call sites (main.go
 // handler, handleConn read path, m7 chat path).
 
-// opsConfigure wires the ops seams (called once from m5Init, before the
+// opsConfigure wires the ops seams (called once from initPlayerState, before the
 // API/console start).
 func opsConfigure() {
 	port := 9001
@@ -53,9 +59,9 @@ func opsConfigure() {
 	app.ConfigureOps(app.OpsDeps{
 		Port:       port,
 		ConsoleOff: app.ConsoleDisabled(os.Getenv("CONSOLE")),
-		Usernames:  m7PlayerUsernames,
+		Usernames:  playerUsernames,
 		LookupPlayer: func(name string) (string, int, bool) {
-			for _, n := range m7PlayerUsernames() {
+			for _, n := range playerUsernames() {
 				if strings.EqualFold(n, name) {
 					return n, opsPlayerLevel(n), true
 				}
@@ -82,15 +88,15 @@ func opsConfigure() {
 			return len(conns)
 		},
 		KillPlayer: func(username string) (string, bool) {
-			target := m7PlayerByName(username)
+			target := playerByName(username)
 			if target == nil {
 				return "", false
 			}
-			m9DamagePlayer(target, m9PlayerHP(target), nil)
+			mobDamagePlayer(target, playerHP(target), nil)
 			return target.Username, true
 		},
 		DropPlayer: func(username string) (string, bool) {
-			target := m7PlayerByName(username)
+			target := playerByName(username)
 			if target == nil {
 				return "", false
 			}
@@ -99,13 +105,13 @@ func opsConfigure() {
 			return name, true
 		},
 		SetPlayerRank: func(username string, rank int) (string, bool) {
-			target := m7PlayerByName(username)
+			target := playerByName(username)
 			if target == nil {
 				return "", false
 			}
 			target.rank = rank
 			chatStateFor(target).rank = rank
-			st := m5StateFor(username)
+			st := playerStateFor(username)
 			pstateMu.Lock()
 			st.Rank = rank // durable across relogin via the persist rank column
 			pstateMu.Unlock()
@@ -115,17 +121,17 @@ func opsConfigure() {
 		StripPlayerRank: func(username string) (string, bool) {
 			// TS removeadmin/removemod: player.setRank() (rank None + [50])
 			// + 'Your ranks have been stripped from you.' + sync.
-			// Online path mirrors m13ranks.SetRank (rank fields + [50] +
+			// Online path mirrors cmdRanks.SetRank (rank fields + [50] +
 			// Sync) plus the strip notify.
-			target := m7PlayerByName(username)
+			target := playerByName(username)
 			if target == nil {
 				return "", false
 			}
 			target.rank = 0 // Modules.Ranks.None
 			chatStateFor(target).rank = 0
 			_ = gnet.Send(target.Conn, pkt(PacketRank, 0)) // RankPacket(None)
-			m6Notify(target, "Your ranks have been stripped from you.")
-			st := m5StateFor(target.Username)
+			notifyPlayer(target, "Your ranks have been stripped from you.")
+			st := playerStateFor(target.Username)
 			pstateMu.Lock()
 			x, y, level := st.X, st.Y, st.Level
 			st.Rank = 0 // durable across relogin via the persist rank column
@@ -164,18 +170,13 @@ func opsConfigure() {
 			gnet.UnbanIP(ip)
 		},
 		SaveWorld: flushDirty,
+		GetDB:     func() *sql.DB { return dbConn },
+		StartTime: func() time.Time { return serverStartTime },
 	})
 }
 
-// opsPlayerUsernames snapshots online usernames via the world Registry
-// (the Registry mutex is released before the caller touches player state,
-// preserving the old playersMu/pstateMu order).
-func opsPlayerUsernames() []string {
-	return m7PlayerUsernames()
-}
-
 func opsPlayerLevel(username string) int {
-	if st := m5StateFor(username); st != nil && st.Level > 0 {
+	if st := playerStateFor(username); st != nil && st.Level > 0 {
 		return st.Level
 	}
 	return 1

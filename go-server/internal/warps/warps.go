@@ -88,12 +88,17 @@ func Load(path string) (*Registry, error) {
 	return &Registry{Warps: wf.Areas["warps"]}, nil
 }
 
-// At returns the first warp whose rect contains (x, y), or nil.
-// Pure lookup; mirrors the first-match order of areas.ts inArea.
+// At returns a copy of the first warp whose rect contains (x, y), or nil.
+// Pure lookup; mirrors the first-match order of areas.ts inArea. The copy
+// (not an interior pointer) keeps registry state immutable to callers.
 func (r *Registry) At(x, y int) *Warp {
+	if r == nil {
+		return nil
+	}
 	for i := range r.Warps {
 		if r.Warps[i].Contains(x, y) {
-			return &r.Warps[i]
+			cp := r.Warps[i]
+			return &cp
 		}
 	}
 	return nil

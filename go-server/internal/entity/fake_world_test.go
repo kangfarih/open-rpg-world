@@ -270,7 +270,7 @@ func (f *simFake) GetHeroHP(instance string) int {
 	if hp, ok := f.heroHP[instance]; ok {
 		return hp
 	}
-	return HeroMaxHP
+	return 69 // level 1 default
 }
 
 func (f *simFake) SetHeroHP(instance string, hp int) {
@@ -283,6 +283,10 @@ func (f *simFake) ForgetHeroHP(instance string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	delete(f.heroHP, instance)
+}
+
+func (f *simFake) HeroMaxHP(instance string) int {
+	return 69 // level 1 default (39 + 1*30)
 }
 
 func (f *simFake) HeroPoints(instance string, hp, maxHP int) {
@@ -325,6 +329,11 @@ func (f *simFake) ApplyPoison(instance string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.poisons = append(f.poisons, instance)
+}
+
+func (f *simFake) SpawnProjectile(projectileName, ownerInst, targetInst string, x, y, tx, ty int) {
+	// No-op for tests: projectile spawning is visual-only and doesn't affect
+	// the mob/area orchestration being tested.
 }
 
 // --- ChestLoot ---

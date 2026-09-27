@@ -6,15 +6,15 @@ import (
 
 // The SpawnMimic seam (entities.ts onOpen spawnMob('mimic')) must spawn the
 // real mobs.json mimic profile (1200 HP, Lv25) as a non-respawning mob at
-// the chest tile through the full m9SpawnMob path.
+// the chest tile through the full spawnMob path.
 func TestSpawnMimicSeam(t *testing.T) {
 	inst, ok := gameWorld.SpawnMimic(271, 731)
 	if !ok || inst == "" {
 		t.Fatal("SpawnMimic failed")
 	}
-	t.Cleanup(func() { m9Remove(inst) })
+	t.Cleanup(func() { removeMob(inst) })
 
-	m := m9MobFor(inst)
+	m := mobFor(inst)
 	if m == nil {
 		t.Fatal("mimic not registered")
 	}
@@ -44,8 +44,8 @@ func TestRemoveMobSeam(t *testing.T) {
 		t.Fatal("SpawnMimic failed")
 	}
 	gameWorld.RemoveMob(inst)
-	if m := m9MobFor(inst); m != nil {
+	if m := mobFor(inst); m != nil {
 		t.Fatal("mimic still registered after RemoveMob")
-		m9Remove(inst)
+		removeMob(inst)
 	}
 }

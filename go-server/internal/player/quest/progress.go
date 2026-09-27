@@ -25,19 +25,37 @@ func SetStage(c Conn, d Deps, st *PlayerState, key string, stage, subStage int, 
 	isProgress := q.Stage != stage
 
 	// Popup of the stage we are LEAVING fires before the new stage is set.
+	// Colour rides the popup data (PopupData parity) with the legacy green
+	// default when the JSON omits it (all shipped quests pin #33cc33).
 	if progress && isProgress {
 		if p := StageDef(def, q.Stage).Popup; p != nil {
-			SendPopup(c, d, p.Title, p.Text, "#33cc33")
+			colour := p.Colour
+			if colour == "" {
+				colour = "#33cc33"
+			}
+			SendPopup(c, d, p.Title, p.Text, colour)
 		}
 		// Clear the pointer preemptively (quest.ts setStage).
 		SendPointer(c, d, nil)
 	}
 
 	q.Stage, q.SubStage = stage, subStage
-	if !progress || !isProgress {
+	if isProgress {
+		// Stage change clears the substage set (quest.ts setStage parity).
+		q.ClearCompleted()
+	}
+	if !progress {
 		return
 	}
+	// Dirty on ANY progress-flavored mutation — stage moves AND substage
+	// ticks (the old `!isProgress → return` dropped substage persistence,
+	// stranding royalpet-style progress in memory only).
 	d.Store.MarkDirty(st.Username)
+	if !isProgress {
+		// Substage-only: state + dirty advance, no Progress/pointer frames
+		// (quest.ts setStage only fires progressCallback on isProgress).
+		return
+	}
 	if c != nil {
 		SendQuestProgress(c, d, key, q)
 	}
@@ -57,9 +75,13 @@ func SetStage(c Conn, d Deps, st *PlayerState, key string, stage, subStage int, 
 	}
 }
 
-// GiveRewards grants stage itemRewards (givePlayerRewards): NO_SPACE
+// GiveRewards grants stage itemRewards (givePlayerRewards): PLEASE_MAKE_ROOM
 // notify when the inventory cannot fit every entry, else add each item and
 // emit Container Add.
+// VERIFY (NO_SPACE vs PLEASE_MAKE_ROOM): TS splits the strings —
+// handleItemRequirement space check uses misc:NO_SPACE (quest.ts:261) while
+// givePlayerRewards uses misc:PLEASE_MAKE_ROOM_REWARD (quest.ts:333). The old
+// NO_SPACE here was the wrong leg; fixed.
 func GiveRewards(c Conn, d Deps, st *PlayerState, rewards []Item) bool {
 	if len(rewards) == 0 {
 		return false
@@ -67,7 +89,7 @@ func GiveRewards(c Conn, d Deps, st *PlayerState, rewards []Item) bool {
 	free := protocol.ModulesInventorySize - d.Store.InventoryLen(st.Username)
 	if free < len(rewards) {
 		if c != nil {
-			d.Bus.Notify(c.InstanceID(), "misc:NO_SPACE")
+			d.Bus.Notify(c.InstanceID(), "misc:PLEASE_MAKE_ROOM_REWARD")
 		}
 		return false
 	}
@@ -85,14 +107,22 @@ func GiveRewards(c Conn, d Deps, st *PlayerState, rewards []Item) bool {
 }
 
 // skillByName maps quest skill names to skill ids (givePlayerExperience +
-// hasRequirements parity).
+// hasRequirements parity). Full Modules.Skills parity via a case-insensitive
+// enum-name match (utils.getSkill: Capitalize(key) → Modules.Skills[key]) —
+// the old 10-entry subset locked codersglitch (accuracy/strength/defense),
+// codersglitch2 and codersfallacy (alchemy/smithing) behind an
+// always-false requirements gate.
 func skillByName(name string) (int, bool) {
 	id, found := map[string]int{
-		"lumberjacking": SkillLumberjacking, "mining": SkillMining,
-		"fishing": SkillFishing, "foraging": SkillForaging,
-		"accuracy": SkillAccuracy, "archery": SkillArchery,
-		"health": SkillHealth, "magic": SkillMagic, "strength": SkillStrength,
-		"defense": SkillDefense,
+		"lumberjacking": SkillLumberjacking, "accuracy": SkillAccuracy,
+		"archery": SkillArchery, "health": SkillHealth, "magic": SkillMagic,
+		"mining": SkillMining, "strength": SkillStrength,
+		"defense": SkillDefense, "fishing": SkillFishing,
+		"cooking": SkillCooking, "smithing": SkillSmithing,
+		"crafting": SkillCrafting, "chiseling": SkillChiseling,
+		"fletching": SkillFletching, "smelting": SkillSmelting,
+		"foraging": SkillForaging, "eating": SkillEating,
+		"loitering": SkillLoitering, "alchemy": SkillAlchemy,
 	}[strings.ToLower(name)]
 	return id, found
 }
@@ -182,9 +212,11 @@ func Talk(c Conn, d Deps, npcKey string) bool {
 		}
 	}
 	// Achievements: unfinished + npc match (getAchievementFromEntity).
+	// VERIFY (dead clause): the `&& !(... && false)` tail was always false —
+	// simplified to the plain npc-key match with identical behavior.
 	for _, key := range AchOrder {
 		def := Achs[key]
-		if def.Raw.NPC != npcKey && !(def.Raw.NPC == "" && false) {
+		if def.Raw.NPC != npcKey {
 			continue
 		}
 		if st.Achs[key] >= def.StageCount {
@@ -198,12 +230,12 @@ func Talk(c Conn, d Deps, npcKey string) bool {
 }
 
 // RequirementsOK mirrors hasRequirements: skill levels + finished quests.
+// Skill lookup rides skillByName (full Modules.Skills parity) so
+// accuracy/strength/defense/alchemy/smithing gates evaluate instead of
+// auto-failing; unknown names stay locked (return false).
 func RequirementsOK(d Deps, st *PlayerState, def *Quest) bool {
 	for skill, level := range def.Raw.SkillRequirements {
-		id, found := map[string]int{
-			"lumberjacking": SkillLumberjacking, "mining": SkillMining,
-			"fishing": SkillFishing, "foraging": SkillForaging,
-		}[strings.ToLower(skill)]
+		id, found := skillByName(skill)
 		if !found {
 			return false
 		}
@@ -220,18 +252,50 @@ func RequirementsOK(d Deps, st *PlayerState, def *Quest) bool {
 }
 
 // HandleQuestTalk ports handleTalk + getNPCDialogue: dialogue selection
-// (stage text / hasItemText / completedText by search order), progression on
-// dialogue end, item requirement consumption and reward grants.
+// (stage text / hasItemText / completedText by search order, including
+// substage NPCs), progression on dialogue end, item requirement consumption
+// and reward grants.
 func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 	def := Quests[key]
 	q := st.Quest(key)
 
 	// Dialogue resolution (getNPCDialogue): iterate stages backwards from the
-	// current one, first stage that references the NPC wins.
+	// current one, first stage that references the NPC wins. Substage NPCs
+	// resolve against the CURRENT stage's subStages (getSubStageByNPC parity):
+	// completed → completedText, hasItem → hasItemText when stocked.
 	var dialogue []string
 	seen := false
 	for i := q.Stage; i >= 0; i-- {
 		sd := StageDef(def, i)
+		// Current-stage substage reference (royalpet pattern).
+		if i == q.Stage {
+			for _, ss := range sd.SubStages {
+				if NpcOf(ss) != npcKey {
+					continue
+				}
+				seen = true
+				if q.HasCompleted(npcKey) {
+					dialogue = ss.CompletedText
+					break
+				}
+				if len(ss.ItemRequirements) > 0 {
+					if HasAllItems(d, st.Username, ss.ItemRequirements) {
+						dialogue = ss.HasItemText
+						break
+					}
+					// Items missing: TS continues the outer scan (which finds
+					// no older reference) then falls back to [''] — mirror
+					// by leaving dialogue empty for the [''] fallback below.
+					dialogue = nil
+					break
+				}
+				dialogue = ss.Text
+				break
+			}
+			if seen {
+				break
+			}
+		}
 		if NpcOf(sd) != npcKey {
 			continue
 		}
@@ -279,12 +343,17 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 	sd := StageDef(def, q.Stage)
 	isStageNPC := NpcOf(sd) == npcKey
 
-	// Substage NPC (royalpet): completing a substage NPC consumes its items
-	// and advances the substage (handleItemRequirement with substage data).
+	// Substage NPCs (royalpet): each distinct NPC turns in once
+	// (completedSubStages parity). When the last pending substage completes,
+	// the STAGE advances; otherwise only the substage ticks. Re-talking a
+	// completed substage NPC replays completedText with no further progress.
 	for i := range sd.SubStages {
 		ss := &sd.SubStages[i]
 		if NpcOf(*ss) != npcKey {
 			continue
+		}
+		if q.HasCompleted(npcKey) {
+			return true // already turned in: dialogue shown, hold position
 		}
 		if len(ss.ItemRequirements) > 0 {
 			if !HasAllItems(d, st.Username, ss.ItemRequirements) {
@@ -292,8 +361,35 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 			}
 			TakeItems(d, st, ss.ItemRequirements)
 			GiveRewards(c, d, st, ss.ItemRewards)
+			GrantExperience(c, d, st, ss.SkillRewards)
+			if ss.Ability != "" {
+				lvl := ss.AbilityLevel
+				if lvl < 1 {
+					lvl = 1 // abilityLevel || 1 parity
+				}
+				d.Abilities.GrantAbility(c, st.Username, ss.Ability, lvl)
+			}
+		} else {
+			if len(ss.ItemRewards) > 0 {
+				if !GiveRewards(c, d, st, ss.ItemRewards) {
+					return true // PLEASE_MAKE_ROOM: hold until room is made
+				}
+			}
+			GrantExperience(c, d, st, ss.SkillRewards)
+			if ss.Ability != "" {
+				lvl := ss.AbilityLevel
+				if lvl < 1 {
+					lvl = 1
+				}
+				d.Abilities.GrantAbility(c, st.Username, ss.Ability, lvl)
+			}
 		}
-		ProgressSub(c, d, st, key)
+		q.AddCompleted(npcKey)
+		if len(q.Completed) < len(sd.SubStages) {
+			ProgressSub(c, d, st, key)
+		} else {
+			Progress(c, d, st, key)
+		}
 		return true
 	}
 
@@ -326,7 +422,7 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 		// Rewards granted WITHOUT consumption (guard stage 2 pattern): Node
 		// grants then progresses via givePlayerRewards(progress=true).
 		if !GiveRewards(c, d, st, sd.ItemRewards) {
-			return true // NO_SPACE: quest holds until room is made
+			return true // PLEASE_MAKE_ROOM: quest holds until room is made
 		}
 		GrantExperience(c, d, st, sd.SkillRewards)
 		Progress(c, d, st, key)
@@ -335,7 +431,11 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 	if sd.Ability != "" {
 		// Quest stage ability reward (quest.ts givePlayerAbility):
 		// abilities.add(ability, abilityLevel || 1).
-		d.Abilities.GrantAbility(c, st.Username, sd.Ability, sd.AbilityLevel)
+		lvl := sd.AbilityLevel
+		if lvl < 1 {
+			lvl = 1
+		}
+		d.Abilities.GrantAbility(c, st.Username, sd.Ability, lvl)
 	}
 	GrantExperience(c, d, st, sd.SkillRewards)
 	Progress(c, d, st, key)
@@ -380,6 +480,10 @@ func HandleAchTalk(c Conn, d Deps, st *PlayerState, key string) bool {
 // ---------------------------------------------------------------------------
 
 // Kill fires on mob death credited to the killer.
+// VERIFY (requirements on Kill path): TS getQuestFromMob checks only
+// isFinished/isStarted/task/mob — NOT hasRequirements (requirements gate
+// only getQuestFromNPC talk routing). Mirroring that here is parity, not a
+// gap: no requirements check added.
 func Kill(c Conn, d Deps, mobKey string) {
 	if c == nil {
 		return
@@ -430,9 +534,16 @@ func AchHasMob(def *AchDef, mobKey string) bool {
 // ---------------------------------------------------------------------------
 
 // Resource fires when a gather exhausts. skill is the Go skill name
-// (lumberjacking/mining/fishing/foraging), resourceKey the resource def key
+// (lumberjacking/mining/fishing), resourceKey the resource def key
 // (quest.ts handleResource: match stage.<tree|fish|rock> then count down the
 // substage; no count = single-stage progress).
+// VERIFY (requirements on Resource path): TS handleResource checks only
+// isFinished/resource-key — never hasRequirements. No gate added (parity).
+// Foraging/cooking route nowhere in TS either (getResourceType maps only
+// lumberjacking→tree, fishing→fish, mining→rock; everything else defaults to
+// 'tree' and then fails the `if (!resource) return` unless the stage has a
+// tree field). The Go early-return for unmapped skills preserves that
+// no-progress outcome without crediting lumberjacking by accident.
 func Resource(c Conn, d Deps, skill, resourceKey string) {
 	if c == nil {
 		return
@@ -484,12 +595,62 @@ func Resource(c Conn, d Deps, skill, resourceKey string) {
 }
 
 // ---------------------------------------------------------------------------
+// Door trigger (quest.ts handleDoor: stage gate + isDoorTask progress).
+// ---------------------------------------------------------------------------
+
+// HandleDoor ports Quest.handleDoor for door-task stages: the doors.go pass
+// path calls this AFTER the stage gate passes (planDoor parity). When the
+// player's current stage for key is a `task: door` stage, the walk-through
+// progresses the quest; otherwise it is a pure teleport with no quest side
+// effect (non-door tasks, finished quests and unknown keys are no-ops).
+//
+// Verified quest-data notes (do NOT add other triggers):
+//   - tutorial 1/9/15 + ricksroll 2 + evilsanta 1 are `task: door` → covered
+//     here (without this, the tutorial can NEVER advance past stage 1 in
+//     prod — the blocking bug).
+//   - ricksroll 0/1 are `task: cooking` with NPC dialogue: TS has NO cooking
+//     hook (handleResource only maps tree/fish/rock; cooking falls to the
+//     default-'tree' leg and returns). They progress via TALK
+//     (handleTalk/handleItemRequirement on npc rick), already covered by
+//     HandleQuestTalk — no cooking trigger added, matching TS.
+//   - tutorial 4 is `task: npc`: TS has NO separate npc hook either —
+//     handleTalk routes by npc key regardless of task, so HandleQuestTalk
+//     already covers it. No new trigger.
+//   - evilsanta's custom handleDoor override (WHY_GO_THERE/DONT_THINK_GO_IN +
+//     its own reqItem leg) is a per-quest subclass: the shared doors.go
+//     planDoor already enforces the stage/reqItem gates with the same
+//     user-visible notifies, so the default semantics here are the correct
+//     shared port.
+func HandleDoor(c Conn, d Deps, username string, key string) {
+	Load()
+	if !ok || username == "" || key == "" {
+		return
+	}
+	def := Quests[key]
+	if def == nil {
+		return
+	}
+	st := StateFor(username)
+	q := st.Quest(key)
+	if q.Stage >= def.StageCount {
+		return
+	}
+	if StageDef(def, q.Stage).Task != "door" {
+		return
+	}
+	Progress(c, d, st, key)
+}
+
+// ---------------------------------------------------------------------------
 // C→S accept (incoming.handleQuest → quest.handlePrompt).
 // ---------------------------------------------------------------------------
 
 // HeroDamageMult multiplies hero damage vs engine mobs when M11_HERODMG is
 // set (debug accelerator, mirrors M9_MOBDMG) — keeps 140-HP e2e mobs in a
 // few-swing kill range without touching XP accounting.
+// VERIFY (HeroDamageMult placement): the helper lives in the quest package so
+// the root adapter (m11HeroDamageMult) stays a one-line delegate like every
+// other M11 entry point — placement is intentional, not a layering breach.
 func HeroDamageMult() float64 {
 	if v := os.Getenv("M11_HERODMG"); v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
@@ -501,6 +662,8 @@ func HeroDamageMult() float64 {
 
 // HandleAccept processes the C Quest {key} frame: the pending start
 // interface accepted → progress past stage 0 (handlePrompt setStage+1).
+// VERIFY (requirements on Accept path): TS handlePrompt checks only
+// pendingStart/isStarted — never hasRequirements. No gate added (parity).
 func HandleAccept(c Conn, d Deps, data []byte) {
 	var pkt struct {
 		Key string `json:"key"`
@@ -531,6 +694,11 @@ func HandleAccept(c Conn, d Deps, data []byte) {
 // semantics (mob.fullfillsQuest): empty status = require finished;
 // notstarted = require not started; started = started && not finished.
 // achievements gate the same way on stage >= stageCount.
+// VERIFY (DropGated achievement status): TS fullfillsQuest gates ONLY on
+// drop.quest (+status) — drops never carry an achievement status variant.
+// The achievementKey leg here is a Go extension that always requires
+// finished (no notstarted/started variants exist in TS to mirror), so the
+// status parameter intentionally applies to the quest leg only.
 func DropGated(username, questKey, achievementKey, status string) bool {
 	if questKey == "" && achievementKey == "" {
 		return true
@@ -569,10 +737,15 @@ func DropGated(username, questKey, achievementKey, status string) bool {
 // ---------------------------------------------------------------------------
 
 // AchProgress advances an achievement one stage and fires popups/rewards
-// at the finish stage (achievement.setStage).
+// at the finish stage (achievement.setStage). No-op when unknown or already
+// finished (isFinished guard): without it every extra trigger re-granted
+// rewards infinitely.
 func AchProgress(c Conn, d Deps, st *PlayerState, key string) {
 	def := Achs[key]
 	if def == nil {
+		return
+	}
+	if st.Achs[key] >= def.StageCount {
 		return
 	}
 	stage := st.Achs[key] + 1
@@ -580,12 +753,13 @@ func AchProgress(c Conn, d Deps, st *PlayerState, key string) {
 	d.Store.MarkDirty(st.Username)
 	if c != nil {
 		SendAchievementProgress(c, d, key, stage)
-		if stage == 1 {
-			SendPopup(c, d, "Achievement Discovered", def.Raw.Name+" has been discovered!", "#33cc33")
-		}
+		// else-if parity (achievement.setStage): discovery and finish never
+		// double-fire — single-stage achievements emit Completed only.
 		if stage >= def.StageCount {
 			SendPopup(c, d, "Achievement Completed!",
 				"@green@You have completed the achievement @crimson@"+def.Raw.Name+"@green@!", "#33cc33")
+		} else if stage == 1 {
+			SendPopup(c, d, "Achievement Discovered", def.Raw.Name+" has been discovered!", "#33cc33")
 		}
 	}
 	if stage >= def.StageCount {
@@ -625,7 +799,11 @@ func grantAchRewards(c Conn, d Deps, st *PlayerState, def *AchDef) {
 	// Achievement ability reward (achievement.ts finishCallback ->
 	// abilities.add(rewardAbility, rewardAbilityLevel || 1)).
 	if def.Raw.RewardAbility != "" {
-		d.Abilities.GrantAbility(c, st.Username, def.Raw.RewardAbility, def.Raw.RewardAbilityLevel)
+		lvl := def.Raw.RewardAbilityLevel
+		if lvl < 1 {
+			lvl = 1
+		}
+		d.Abilities.GrantAbility(c, st.Username, def.Raw.RewardAbility, lvl)
 	}
 	if c != nil && def.Raw.RewardExperience > 0 {
 		if id, found := skillByName(def.Raw.RewardSkill); found {

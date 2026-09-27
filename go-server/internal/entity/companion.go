@@ -48,7 +48,7 @@
 //
 // Divergences from TS (documented, inherited from the root wire):
 //   - Teleport threshold: TS respawns at distance > 10; internal/pets uses
-//     > 12 per its spec (pets walk a little farther before teleport).
+//     > 10 (TS handler.ts parity).
 //   - Follow stepping is server-side one-tile FollowStep toward the owner
 //     (TS pets move via client pathing on the Follow packet; no server grid
 //     step exists there). Pets never consult blocked() and never register in
@@ -199,22 +199,34 @@ func companionMoveFrame(rec Record) []any {
 type companionWorld struct{}
 
 func (companionWorld) OwnerPos(owner string) (int, int, bool) {
+	if cdeps.World == nil || owner == "" {
+		return 0, 0, false
+	}
 	return cdeps.World.OwnerPos(owner)
 }
 
 func (companionWorld) SpawnPet(rec Record) {
+	if cdeps.World == nil {
+		return
+	}
 	cdeps.World.SetEntityPos(rec.Instance, rec.X, rec.Y)
 	cdeps.World.Broadcast(protocol.Pkt(protocol.PacketSpawn, companionPayload(&rec)))
 	cdeps.World.Broadcast(companionFollowFrame(rec.Instance, rec.Owner))
 }
 
 func (companionWorld) MovePet(rec Record) {
+	if cdeps.World == nil {
+		return
+	}
 	cdeps.World.SetEntityPos(rec.Instance, rec.X, rec.Y)
 	cdeps.World.Broadcast(companionMoveFrame(rec))
 	cdeps.World.Broadcast(companionFollowFrame(rec.Instance, rec.Owner))
 }
 
 func (companionWorld) TeleportPet(rec Record) {
+	if cdeps.World == nil {
+		return
+	}
 	cdeps.World.SetEntityPos(rec.Instance, rec.X, rec.Y)
 	cdeps.World.Broadcast(protocol.Pkt(protocol.PacketDespawn, protocol.DespawnData{Instance: rec.Instance}))
 	cdeps.World.Broadcast(protocol.Pkt(protocol.PacketSpawn, companionPayload(&rec)))
@@ -223,6 +235,9 @@ func (companionWorld) TeleportPet(rec Record) {
 }
 
 func (companionWorld) DespawnPet(instance string) {
+	if cdeps.World == nil {
+		return
+	}
 	cdeps.World.RemoveEntity(instance)
 	cdeps.World.Broadcast(protocol.Pkt(protocol.PacketDespawn, protocol.DespawnData{Instance: instance}))
 }
@@ -235,6 +250,9 @@ func (companionWorld) IsMob(target string) bool {
 }
 
 func (companionWorld) HitMob(petInstance, ownerInstance, target string, dmg int) {
+	if cdeps.World == nil {
+		return
+	}
 	cdeps.World.Broadcast(protocol.Pkt(protocol.PacketAnimation, protocol.AnimationData{Instance: petInstance, Action: protocol.ActionAttack}))
 	cdeps.World.Broadcast(protocol.PktOp(protocol.PacketCombat, protocol.CombatHit, protocol.CombatData{
 		Instance: petInstance, Target: target,
@@ -270,12 +288,14 @@ func companionNow() int64 {
 // setPet: ALREADY_HAVE_PET guard, spawn at the owner's tile, immediate
 // follow). Returns nil when the owner already has a pet.
 func GrantCompanion(c *CompanionConn, mobKey, itemKey string) *Record {
-	if c == nil || mobKey == "" {
+	if c == nil || c.Instance == "" || mobKey == "" {
 		return nil
 	}
 	rec, already := companions.Grant(c.Instance, c.X, c.Y, mobKey, itemKey, companionNow())
 	if already {
-		c.Notify("misc:ALREADY_HAVE_PET")
+		if c.Notify != nil {
+			c.Notify("misc:ALREADY_HAVE_PET")
+		}
 		return nil
 	}
 	if rec == nil {
@@ -332,8 +352,11 @@ func ForgetCompanion(ownerInstance string) {
 // HandleCompanionPacket routes C->S Pet frames [58,{opcode}] (incoming.ts
 // handlePet): Pickup(0) returns the pet to the inventory (removePet:
 // NO_SPACE_PET when full, else a "<mobkey>pet" Container Add + Despawn).
+// The registry removal is the CAS: the space gate runs first (no loss on
+// full), then RemoveByOwner claims the pet — a concurrent double-pickup
+// loses the CAS and returns without a second AddItem.
 func HandleCompanionPacket(c *CompanionConn, frame []json.RawMessage) {
-	if len(frame) < 2 || c == nil {
+	if len(frame) < 2 || c == nil || c.Instance == "" {
 		return
 	}
 	var d struct {
@@ -342,23 +365,32 @@ func HandleCompanionPacket(c *CompanionConn, frame []json.RawMessage) {
 	if err := json.Unmarshal(frame[1], &d); err != nil || d.Opcode == nil || *d.Opcode != CompanionPickup {
 		return
 	}
-	r, ok := companions.ByOwner(c.Instance)
-	if !ok {
+	if _, ok := companions.ByOwner(c.Instance); !ok {
 		return
 	}
-	if cdeps.InventoryCount(c.Username) >= protocol.ModulesInventorySize {
-		c.Notify("misc:NO_SPACE_PET")
+	if cdeps.InventoryCount != nil && cdeps.InventoryCount(c.Username) >= protocol.ModulesInventorySize {
+		if c.Notify != nil {
+			c.Notify("misc:NO_SPACE_PET")
+		}
 		return
+	}
+	if cdeps.AddItem == nil {
+		return
+	}
+	r, ok := companions.RemoveByOwner(c.Instance)
+	if !ok {
+		return // lost the CAS: concurrent pickup already claimed it
 	}
 	idx := cdeps.AddItem(c.Username, r.ItemKey, 1)
-	c.Send(protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
-		Type: protocol.ContainerTypeInventory,
-		Slot: &protocol.SlotData{Index: idx, Key: r.ItemKey, Count: 1, Enchantments: map[string]any{}},
-	}))
+	if c.Send != nil {
+		c.Send(protocol.PktOp(protocol.PacketContainer, protocol.ContainerAdd, protocol.ContainerData{
+			Type: protocol.ContainerTypeInventory,
+			Slot: &protocol.SlotData{Index: idx, Key: r.ItemKey, Count: 1, Enchantments: map[string]any{}},
+		}))
+	}
 	if cdeps.MarkDirty != nil {
 		cdeps.MarkDirty(c.Username)
 	}
-	_, _ = companions.RemoveByOwner(c.Instance)
 	companionWorld{}.DespawnPet(r.Instance)
 	log.Printf("pets: %s picked up by %s (+%s)", r.Instance, c.Instance, r.ItemKey)
 }
@@ -402,33 +434,43 @@ func CompanionTestHandler(c *CompanionConn, data []byte) {
 	case "grant":
 		mob, item := CompanionResolveKey(d.Key)
 		if r := GrantCompanion(c, mob, item); r != nil {
-			c.Notify(fmt.Sprintf("pet:grant %s mob=%s at=%d,%d", r.Instance, mob, r.X, r.Y))
+			if c.Notify != nil {
+				c.Notify(fmt.Sprintf("pet:grant %s mob=%s at=%d,%d", r.Instance, mob, r.X, r.Y))
+			}
 		}
 	case "state":
 		r, ok := companions.ByOwner(c.Instance)
 		if !ok {
-			c.Notify("pet:state none")
+			if c.Notify != nil {
+				c.Notify("pet:state none")
+			}
 			return
 		}
 		now := companionNow()
-		ox, oy, ok := cdeps.World.OwnerPos(r.Owner)
+		ox, oy, ok := companionWorld{}.OwnerPos(r.Owner)
 		dist := -1
 		if ok {
 			dist = pets.Distance(ox, oy, r.X, r.Y)
 		}
-		c.Notify(fmt.Sprintf("pet:state %s mob=%s x=%d y=%d dist=%d hungry=%v expired=%v",
-			r.Instance, r.MobKey, r.X, r.Y, dist,
-			// Hunger/expiry are report-only (no TS source, not enforced):
-			// hunger uses the package threshold, expiry a nominal
-			// never-elapsing lifespan.
-			pets.IsHungry(now, r.FedMs), pets.IsExpired(now, r.BornMs, 1<<62)))
+		if c.Notify != nil {
+			c.Notify(fmt.Sprintf("pet:state %s mob=%s x=%d y=%d dist=%d hungry=%v expired=%v",
+				r.Instance, r.MobKey, r.X, r.Y, dist,
+				// Hunger/expiry are report-only (no TS source, not enforced):
+				// hunger uses the package threshold, expiry a nominal
+				// never-elapsing lifespan.
+				pets.IsHungry(now, r.FedMs), pets.IsExpired(now, r.BornMs, 1<<62)))
+		}
 	case "remove":
 		r, ok := companions.RemoveByOwner(c.Instance)
 		if !ok {
-			c.Notify("pet:state none")
+			if c.Notify != nil {
+				c.Notify("pet:state none")
+			}
 			return
 		}
 		companionWorld{}.DespawnPet(r.Instance)
-		c.Notify("pet:removed " + r.Instance)
+		if c.Notify != nil {
+			c.Notify("pet:removed " + r.Instance)
+		}
 	}
 }

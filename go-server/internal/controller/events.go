@@ -76,9 +76,13 @@ func (c *EventController) Boot() (int, int64) {
 	return len(list), every
 }
 
-// Due fans the scheduler at nowMs, marks due events active and counts
-// them. It returns the due events in rotation order for the caller to
-// announce.
+// Due fans the scheduler at nowMs and activates a single event: the
+// first due one in rotation order. TS keeps one activeEvent at a time
+// (events.ts picks events[weekNumber % len] and holds it until disable),
+// so consuming only the head of the due list is the rotation parity —
+// firing the whole list would stack double-drops with 1.5x experience
+// every cadence. (The scheduler package itself still reports all due
+// events; single-pick lives here per its documented caller guidance.)
 func (c *EventController) Due(nowMs int64) []events.Event {
 	c.mu.Lock()
 	sched := c.sched
@@ -92,11 +96,10 @@ func (c *EventController) Due(nowMs int64) []events.Event {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for _, e := range due {
-		c.active[e.Key] = true
-		c.fired++
-	}
-	return due
+	head := due[0]
+	c.active[head.Key] = true
+	c.fired++
+	return []events.Event{head}
 }
 
 // IsActive reports whether the event key has fired (Utils flag parity:

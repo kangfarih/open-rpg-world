@@ -71,7 +71,9 @@ import (
 	"log"
 	"math/rand"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -212,14 +214,16 @@ func (a *Area) Inside(x, y int) bool {
 	return x >= a.X && x < a.X+a.Width && y >= a.Y && y < a.Y+a.Height
 }
 
-// InPolygon ports Area.inPolygon (ray cast, same winding).
+// InPolygon ports Area.inPolygon (ray cast, same winding, float math like
+// Node — integer division would truncate edge crossings).
 func (a *Area) InPolygon(x, y int) bool {
 	inside := false
 	j := len(a.Polygon) - 1
+	fx, fy := float64(x), float64(y)
 	for i := 0; i < len(a.Polygon); i++ {
-		xi, yi := a.Polygon[i].X, a.Polygon[i].Y
-		xj, yj := a.Polygon[j].X, a.Polygon[j].Y
-		if (yi > y) != (yj > y) && x < (xj-xi)*(y-yi)/(yj-yi)+xi {
+		xi, yi := float64(a.Polygon[i].X), float64(a.Polygon[i].Y)
+		xj, yj := float64(a.Polygon[j].X), float64(a.Polygon[j].Y)
+		if (yi > fy) != (yj > fy) && fx < (xj-xi)*(fy-yi)/(yj-yi)+xi {
 			inside = !inside
 		}
 		j = i
@@ -232,14 +236,15 @@ func (a *Area) IsStatusArea() bool {
 	return a.Type == "freezing"
 }
 
-// RGBList parses the "r,g,b" string (overlay.ts: split(',').map(Number)).
+// RGBList parses the "r,g,b" string (overlay.ts: split(',').map(Number),
+// whitespace-tolerant).
 func (a *Area) RGBList() []int {
-	if a.RGB == "" {
+	if strings.TrimSpace(a.RGB) == "" {
 		return nil
 	}
 	var out []int
-	for _, p := range splitComma(a.RGB) {
-		n, err := strconv.Atoi(p)
+	for _, p := range strings.Split(a.RGB, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(p))
 		if err == nil {
 			out = append(out, n)
 		}
@@ -249,17 +254,27 @@ func (a *Area) RGBList() []int {
 
 // ItemsList splits the chest items CSV (chest.ts: rawData.items.split(',')).
 func (a *Area) ItemsList() []string {
-	if a.Items == "" {
+	if strings.TrimSpace(a.Items) == "" {
 		return nil
 	}
-	return splitComma(a.Items)
+	parts := strings.Split(a.Items, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // OverlayColour builds the overlay colour string (updateOverlay).
 func (a *Area) OverlayColour() string {
 	rgb := a.RGBList()
 	colour := fmt.Sprintf("rgba(0, 0, 0, %v)", a.Darkness)
-	if len(rgb) > 1 {
+	if len(rgb) >= 3 {
 		colour = fmt.Sprintf("rgba(%d, %d, %d, %v)", rgb[0], rgb[1], rgb[2], a.Darkness)
 	}
 	return colour
@@ -281,23 +296,30 @@ func (a *Area) LiveChest() *Chest {
 }
 
 // MappedArea reports the dynamic `mapping` counterpart (dynamic.ts link).
-func (a *Area) MappedArea() *Area { return a.mappedArea }
+// The link is written once under areasMu in LoadAreas and never mutated
+// afterwards, so a lock-free read is safe after load (callers holding
+// areasMu read the field directly; see DynamicAt).
+func (a *Area) MappedArea() *Area {
+	if a == nil {
+		return nil
+	}
+	return a.mappedArea
+}
 
 // MappedAnimation reports the dynamic `animation` counterpart.
-func (a *Area) MappedAnimation() *Area { return a.mappedAnimation }
+func (a *Area) MappedAnimation() *Area {
+	if a == nil {
+		return nil
+	}
+	return a.mappedAnimation
+}
 
 func splitComma(s string) []string {
-	var out []string
-	cur := ""
-	for _, r := range s {
-		if r == ',' {
-			out = append(out, cur)
-			cur = ""
-			continue
-		}
-		cur += string(r)
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.TrimSpace(p))
 	}
-	out = append(out, cur)
 	return out
 }
 
@@ -336,6 +358,8 @@ var (
 	// (mob.chest parity, keyed by mob instance; popped on death).
 	mimicMu     sync.Mutex
 	mimicChests = map[string]*Chest{}
+
+	chestSeq uint64 // atomic chest-entity sequence (no time-based collisions)
 )
 
 // resetAreas clears every registry (tests only; the server loads once).
@@ -349,6 +373,7 @@ func resetAreas() {
 	areasWidth = 0
 	areasLoaded = false
 	areasMu.Unlock()
+	atomic.StoreUint64(&chestSeq, 0)
 	stateMu.Lock()
 	overlayArea = map[string]*Area{}
 	cameraArea = map[string]*Area{}
@@ -491,6 +516,9 @@ func ChestAreaAt(x, y int) *Area {
 // chest spawn guard; a live unlooted chest is removed (chest.ts onSpawn ->
 // removeChest).
 func AddChestMob(area *Area, instance string, respawnDelay time.Duration, w GameWorld) {
+	if area == nil || instance == "" || w == nil {
+		return
+	}
 	area.mobMu.Lock()
 	for _, m := range area.mobs {
 		if m == instance {
@@ -521,6 +549,9 @@ func AddChestMob(area *Area, instance string, respawnDelay time.Duration, w Game
 // (chest.ts onEmpty attacker achievement finish). attackerInstance is "" for
 // killerless clears (no award, TS attacker-undefined parity).
 func RemoveChestMob(area *Area, instance, attackerInstance string, w GameWorld) {
+	if area == nil || instance == "" {
+		return
+	}
 	area.mobMu.Lock()
 	idx := -1
 	for i, m := range area.mobs {
@@ -529,9 +560,11 @@ func RemoveChestMob(area *Area, instance, attackerInstance string, w GameWorld) 
 			break
 		}
 	}
-	if idx >= 0 {
-		area.mobs = append(area.mobs[:idx], area.mobs[idx+1:]...)
+	if idx < 0 {
+		area.mobMu.Unlock()
+		return
 	}
+	area.mobs = append(area.mobs[:idx], area.mobs[idx+1:]...)
 	empty := len(area.mobs) == 0
 	delay := area.spawnDelay
 	if delay <= 0 {
@@ -568,8 +601,11 @@ func KillHookForMob(mobX, mobY int, mobInstance, killerInstance string, w GameWo
 // Spawn frame (type Chest4, key "chest") + registry entry. The area flow
 // passes neither achievement nor mimic (chest.ts spawnChest), so both stay
 // zero — area achievements fire at CLEAR (RemoveChestMob), never on open.
+// The instance carries an atomic sequence so two clears in the same
+// millisecond never collide.
 func spawnChestEntity(area *Area, w GameWorld) {
-	inst := fmt.Sprintf("chest-%d-%d", area.ID, time.Now().UnixMilli()%1_000_000)
+	seq := atomic.AddUint64(&chestSeq, 1)
+	inst := fmt.Sprintf("chest-%d-%d", area.ID, seq)
 	c := &Chest{Instance: inst, X: area.SpawnX, Y: area.SpawnY, Items: area.ItemsList(), Area: area}
 
 	area.mobMu.Lock()
@@ -724,15 +760,24 @@ func handleMimicDeath(mobInstance string, w GameWorld) {
 // the area flow never sets one — TS area spawnChest passes no achievement).
 // The AREA achievement is NOT awarded here: TS awards it in the onEmpty
 // clear callback (RemoveChestMob), not on open.
-func OpenChest(chest *Chest, openerInstance, openerUsername string, w GameWorld) {
-	// Remove the chest first (onOpen -> this.remove(chest)).
-	chest.Area.mobMu.Lock()
-	if chest.Area.chest == chest {
-		chest.Area.chest = nil
+// Reports false (no-op) when the chest was already removed — the double-open
+// guard: only the live registry entry may be opened.
+func OpenChest(chest *Chest, openerInstance, openerUsername string, w GameWorld) bool {
+	if chest == nil || w == nil {
+		return false
 	}
-	// Node's onEmpty fired once already; opening does NOT re-clear mobs —
-	// lastSpawn is NOT reset here (matches chest.ts removeChest).
-	chest.Area.mobMu.Unlock()
+	if chest.Area != nil {
+		// Remove the chest first (onOpen -> this.remove(chest)).
+		chest.Area.mobMu.Lock()
+		if chest.Area.chest != chest {
+			chest.Area.mobMu.Unlock()
+			return false
+		}
+		chest.Area.chest = nil
+		// Node's onEmpty fired once already; opening does NOT re-clear mobs —
+		// lastSpawn is NOT reset here (matches chest.ts removeChest).
+		chest.Area.mobMu.Unlock()
+	}
 
 	w.Despawn(chest.Instance)
 	log.Printf("m10: %s opened chest %s at %d,%d", openerUsername, chest.Instance, chest.X, chest.Y)
@@ -750,12 +795,13 @@ func OpenChest(chest *Chest, openerInstance, openerUsername string, w GameWorld)
 
 	item := RollChestItem(chest.Items)
 	if item == nil {
-		return
+		return true
 	}
 	// Chest item spawns are persistent (isStatic=false, no blink expiry in
 	// the Node chest flow) — spawn via the M5 loot path with no timers.
 	lx, ly := w.NearWalkable(chest.X, chest.Y)
-	inst := fmt.Sprintf("chestitem-%d", time.Now().UnixNano()%1_000_000)
+	seq := atomic.AddUint64(&chestSeq, 1)
+	inst := fmt.Sprintf("chestitem-%d", seq)
 	w.RegisterLoot(inst, item.Key, item.Count, lx, ly, openerUsername)
 	w.SpawnLootItem(LootItem{Instance: inst, Key: item.Key, Count: item.Count, X: lx, Y: ly})
 	log.Printf("m10: chest item %s (x%d) spawned at %d,%d", item.Key, item.Count, lx, ly)
@@ -765,6 +811,7 @@ func OpenChest(chest *Chest, openerInstance, openerUsername string, w GameWorld)
 	if openerUsername != "" && openerInstance != "" && chest.Achievement != "" {
 		w.FinishAchievement(openerInstance, chest.Achievement)
 	}
+	return true
 }
 
 // ChestItem is one rolled drop (chest.ts getItem return).
@@ -816,17 +863,11 @@ func indexOfByte(s string, b byte) int {
 }
 
 func splitColon(s string) []string {
-	var out []string
-	cur := ""
-	for i := 0; i < len(s); i++ {
-		if s[i] == ':' {
-			out = append(out, cur)
-			cur = ""
-			continue
-		}
-		cur += string(s[i])
+	parts := strings.Split(s, ":")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		out = append(out, strings.TrimSpace(p))
 	}
-	out = append(out, cur)
 	return out
 }
 
@@ -853,6 +894,9 @@ func OnPositionUpdate(instance, username string, x, y int, w GameWorld) {
 
 // UpdatePVP ports player.updatePVP: notify + PVP packet on state flip.
 func UpdatePVP(instance, username string, inPVP bool, w GameWorld) {
+	if w == nil || instance == "" {
+		return
+	}
 	stateMu.Lock()
 	if pvpState[instance] == inPVP {
 		stateMu.Unlock()
@@ -875,6 +919,9 @@ func UpdatePVP(instance, username string, inPVP bool, w GameWorld) {
 // UpdateOverlay ports player.updateOverlay: Overlay Set/Remove on area
 // change; freezing status areas apply/remove the Freezing effect.
 func UpdateOverlay(instance, username string, area *Area, w GameWorld) {
+	if w == nil {
+		return
+	}
 	stateMu.Lock()
 	if overlayArea[instance] == area {
 		stateMu.Unlock()
@@ -895,6 +942,8 @@ func UpdateOverlay(instance, username string, area *Area, w GameWorld) {
 	w.SendOverlaySet(instance, area.OverlayImage(), area.OverlayColour())
 	if area.IsStatusArea() {
 		SetFreezing(instance, true, w)
+	} else if prev != nil && prev.IsStatusArea() {
+		SetFreezing(instance, false, w)
 	}
 	log.Printf("m10: %s overlay area %d (%s)", username, area.ID, area.Type)
 }
@@ -904,6 +953,9 @@ func UpdateOverlay(instance, username string, area *Area, w GameWorld) {
 // tracker bridge feeds EFFECT_RATE cold damage through the Points pipeline
 // (character.ts handleColdDamage); the visual Effect frames stay here.
 func SetFreezing(instance string, on bool, w GameWorld) {
+	if w == nil || instance == "" {
+		return
+	}
 	stateMu.Lock()
 	if frozenState[instance] == on {
 		stateMu.Unlock()
@@ -924,6 +976,9 @@ func SetFreezing(instance string, on bool, w GameWorld) {
 // UpdateCamera ports player.updateCamera: mode opcode on enter, FreeFlow
 // on exit (change-detected).
 func UpdateCamera(instance, username string, area *Area, w GameWorld) {
+	if w == nil || instance == "" {
+		return
+	}
 	stateMu.Lock()
 	if cameraArea[instance] == area {
 		stateMu.Unlock()
@@ -951,6 +1006,9 @@ func UpdateCamera(instance, username string, area *Area, w GameWorld) {
 // empty song sends [30,null] explicitly (Node sends newSong=undefined —
 // serialized as a null element).
 func UpdateMusic(instance, username string, area *Area, w GameWorld) {
+	if w == nil || instance == "" {
+		return
+	}
 	song := ""
 	if area != nil {
 		song = area.Song
@@ -978,6 +1036,9 @@ func PVPState(instance string) bool {
 
 // ForgetPlayer drops per-player area state on disconnect.
 func ForgetPlayer(instance string, w GameWorld) {
+	if instance == "" {
+		return
+	}
 	stateMu.Lock()
 	delete(overlayArea, instance)
 	delete(cameraArea, instance)
@@ -985,6 +1046,9 @@ func ForgetPlayer(instance string, w GameWorld) {
 	delete(pvpState, instance)
 	delete(frozenState, instance)
 	stateMu.Unlock()
+	if w == nil {
+		return
+	}
 	w.FreezeClear(instance)
 }
 

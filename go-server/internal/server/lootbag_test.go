@@ -48,7 +48,7 @@ func TestLootBagTakeValidation(t *testing.T) {
 
 	// Take with no open bag: denied, loot untouched.
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 0 {
+	if invCount(user, "gold") != 0 {
 		t.Fatal("take without an open bag must transfer nothing")
 	}
 
@@ -57,8 +57,8 @@ func TestLootBagTakeValidation(t *testing.T) {
 		t.Fatal("sendLootBagOpen must succeed on a live bag")
 	}
 	handleLootBagReq(c, lootTakeFrame(1))
-	if m6InvCount(user, "logs") != 2 {
-		t.Fatalf("logs in inventory = %d, want 2", m6InvCount(user, "logs"))
+	if invCount(user, "logs") != 2 {
+		t.Fatalf("logs in inventory = %d, want 2", invCount(user, "logs"))
 	}
 	if slots, _ := entity.BagSlots(bag); len(slots) != 2 {
 		t.Fatalf("bag slots after take = %d, want 2", len(slots))
@@ -67,20 +67,20 @@ func TestLootBagTakeValidation(t *testing.T) {
 	// Hole + out-of-range takes: denied.
 	handleLootBagReq(c, lootTakeFrame(1))
 	handleLootBagReq(c, lootTakeFrame(9))
-	if m6InvCount(user, "logs") != 2 || m6InvCount(user, "gold") != 0 {
+	if invCount(user, "logs") != 2 || invCount(user, "gold") != 0 {
 		t.Fatal("hole/oob takes must transfer nothing")
 	}
 
 	// Distance: too far denies, adjacent takes.
 	c.Sess.PlayerX, c.Sess.PlayerY = 110, 110
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 0 {
+	if invCount(user, "gold") != 0 {
 		t.Fatal("far take must transfer nothing")
 	}
 	c.Sess.PlayerX, c.Sess.PlayerY = 100, 96
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 5 {
-		t.Fatalf("gold in inventory = %d, want 5", m6InvCount(user, "gold"))
+	if invCount(user, "gold") != 5 {
+		t.Fatalf("gold in inventory = %d, want 5", invCount(user, "gold"))
 	}
 
 	// Last stack empties and destroys the bag (Close + Despawn path).
@@ -91,8 +91,8 @@ func TestLootBagTakeValidation(t *testing.T) {
 	if _, ok := entity.ActiveBag("p-lbtake"); ok {
 		t.Fatal("destroy must clear the opener")
 	}
-	if m6InvCount(user, "arrow") != 9 {
-		t.Fatalf("arrow in inventory = %d, want 9", m6InvCount(user, "arrow"))
+	if invCount(user, "arrow") != 9 {
+		t.Fatalf("arrow in inventory = %d, want 9", invCount(user, "arrow"))
 	}
 }
 
@@ -115,7 +115,7 @@ func TestLootBagTakeDenies(t *testing.T) {
 		t.Fatal("open records the opener even for foreign bags (take gates)")
 	}
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 0 {
+	if invCount(user, "gold") != 0 {
 		t.Fatal("foreign bag take must transfer nothing")
 	}
 	if slots, _ := entity.BagSlots(foreign); len(slots) != 2 {
@@ -130,13 +130,13 @@ func TestLootBagTakeDenies(t *testing.T) {
 	}
 	t.Cleanup(func() { entity.DestroyLoot(full, "test") })
 	for i := 0; i < ModulesInventorySize; i++ {
-		m5AddItem(user, "fillitem", 1)
+		addItem(user, "fillitem", 1)
 	}
 	if !sendLootBagOpen(c, full) {
 		t.Fatal("open must succeed on the fresh bag")
 	}
 	handleLootBagReq(c, lootTakeFrame(0))
-	if m6InvCount(user, "gold") != 0 {
+	if invCount(user, "gold") != 0 {
 		t.Fatal("full-inventory take must transfer nothing")
 	}
 	if slots, _ := entity.BagSlots(full); len(slots) != 2 {

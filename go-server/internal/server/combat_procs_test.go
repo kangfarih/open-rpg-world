@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"rpg-world-server/internal/abilities"
-	"rpg-world-server/internal/entity"
+	"rpg-world-server/internal/meta"
 )
 
 // ---------------------------------------------------------------------------
@@ -86,26 +86,26 @@ func TestRegenSweepIdle(t *testing.T) {
 	}
 	abilities.FreezeClear(inst)
 
-	gameWorld.SetHeroHP(inst, entity.HeroMaxHP)
+	gameWorld.SetHeroHP(inst, meta.HeroMaxHPForLevel(1))
 	runRegenSweep()
-	if got := gameWorld.GetHeroHP(inst); got != entity.HeroMaxHP {
-		t.Fatalf("full hero HP = %d, want %d", got, entity.HeroMaxHP)
+	if got := gameWorld.GetHeroHP(inst); got != meta.HeroMaxHPForLevel(1) {
+		t.Fatalf("full hero HP = %d, want %d", got, meta.HeroMaxHPForLevel(1))
 	}
 }
 
 func TestMobRegenSweepIdle(t *testing.T) {
-	m := &m9Mob{
+	m := &mob{
 		instance: "regen-mob", key: "rat",
 		x: 100, y: 96, hp: 50, maxHP: 100,
 		attackers: map[string]time.Time{},
 	}
-	m9Mu.Lock()
-	m9Mobs[m.instance] = m
-	m9Mu.Unlock()
+	mobMu.Lock()
+	mobs[m.instance] = m
+	mobMu.Unlock()
 	t.Cleanup(func() {
-		m9Mu.Lock()
-		delete(m9Mobs, m.instance)
-		m9Mu.Unlock()
+		mobMu.Lock()
+		delete(mobs, m.instance)
+		mobMu.Unlock()
 		abilities.ClearStatus(m.instance)
 	})
 
@@ -179,9 +179,9 @@ func TestEffectChanceDistribution(t *testing.T) {
 
 func TestHeroDamageTypeCritical(t *testing.T) {
 	user := "crit-hero"
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentWeapon] = m5Slot{Key: "plainsword", Count: 1, Ench: Enchantments{enchCritical: {Level: 1}}}
+	st.Equip[EquipmentWeapon] = slotDef{Key: "plainsword", Count: 1, Ench: Enchantments{enchCritical: {Level: 1}}}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -213,9 +213,9 @@ func TestHeroDamageTypeCritical(t *testing.T) {
 
 func TestHeroDamageTypePlain(t *testing.T) {
 	user := "plain-hero"
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentWeapon] = m5Slot{Key: "plainsword", Count: 1}
+	st.Equip[EquipmentWeapon] = slotDef{Key: "plainsword", Count: 1}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -269,9 +269,9 @@ func TestBloodsuckRollDistribution(t *testing.T) {
 
 func TestHeroBloodsuckingLookup(t *testing.T) {
 	user := "suck-hero"
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentWeapon] = m5Slot{Key: "fangedge", Count: 1, Ench: Enchantments{enchBloodsucking: {Level: 3}}}
+	st.Equip[EquipmentWeapon] = slotDef{Key: "fangedge", Count: 1, Ench: Enchantments{enchBloodsucking: {Level: 3}}}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -325,9 +325,9 @@ func TestThornsRollDistribution(t *testing.T) {
 func TestThornsLoopGuard(t *testing.T) {
 	user, inst := "thorns-hero", "thorns-hero-inst"
 	c, _ := deathConn(t, inst, user)
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentChestplate] = m5Slot{Key: "plate", Count: 1, Ench: Enchantments{enchThorns: {Level: 5}}}
+	st.Equip[EquipmentChestplate] = slotDef{Key: "plate", Count: 1, Ench: Enchantments{enchThorns: {Level: 5}}}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -335,21 +335,21 @@ func TestThornsLoopGuard(t *testing.T) {
 		pstateMu.Unlock()
 		gameWorld.ForgetHeroHP(inst)
 		abilities.ForgetPlayer(inst)
-		m9Mu.Lock()
-		delete(m9Mobs, "thorns-mob")
-		m9Mu.Unlock()
+		mobMu.Lock()
+		delete(mobs, "thorns-mob")
+		mobMu.Unlock()
 	})
-	m := &m9Mob{
+	m := &mob{
 		instance: "thorns-mob", key: "rat",
 		x: 100, y: 96, hp: 100, maxHP: 100,
 		attackers: map[string]time.Time{},
 	}
-	m9Mu.Lock()
-	m9Mobs[m.instance] = m
-	m9Mu.Unlock()
+	mobMu.Lock()
+	mobs[m.instance] = m
+	mobMu.Unlock()
 	gameWorld.SetHeroHP(inst, 100)
 
-	m9DamagePlayerThorns(c, 20, m, true) // thorns-flagged receipt
+	mobDamagePlayerThorns(c, 20, m, true) // thorns-flagged receipt
 
 	m.mu.Lock()
 	hp := m.hp
@@ -365,9 +365,9 @@ func TestThornsLoopGuard(t *testing.T) {
 func TestThornsReflectLive(t *testing.T) {
 	user, inst := "thorns-hero2", "thorns-hero2-inst"
 	c, _ := deathConn(t, inst, user)
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentChestplate] = m5Slot{Key: "plate", Count: 1, Ench: Enchantments{enchThorns: {Level: 5}}}
+	st.Equip[EquipmentChestplate] = slotDef{Key: "plate", Count: 1, Ench: Enchantments{enchThorns: {Level: 5}}}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -375,19 +375,19 @@ func TestThornsReflectLive(t *testing.T) {
 		pstateMu.Unlock()
 		gameWorld.ForgetHeroHP(inst)
 		abilities.ForgetPlayer(inst)
-		m9Mu.Lock()
-		delete(m9Mobs, "thorns-mob2")
-		m9Mu.Unlock()
+		mobMu.Lock()
+		delete(mobs, "thorns-mob2")
+		mobMu.Unlock()
 	})
-	newMob := func() *m9Mob {
-		m := &m9Mob{
+	newMob := func() *mob {
+		m := &mob{
 			instance: "thorns-mob2", key: "rat",
 			x: 100, y: 96, hp: 100, maxHP: 100,
 			attackers: map[string]time.Time{},
 		}
-		m9Mu.Lock()
-		m9Mobs[m.instance] = m
-		m9Mu.Unlock()
+		mobMu.Lock()
+		mobs[m.instance] = m
+		mobMu.Unlock()
 		return m
 	}
 
@@ -412,7 +412,7 @@ func TestThornsReflectLive(t *testing.T) {
 	gameWorld.SetHeroHP(inst, 100)
 	m := newMob()
 	combatRand = rand.New(rand.NewSource(procSeed))
-	m9DamagePlayerThorns(c, 20, m, false)
+	mobDamagePlayerThorns(c, 20, m, false)
 	m.mu.Lock()
 	hp := m.hp
 	m.mu.Unlock()
@@ -428,7 +428,7 @@ func TestThornsReflectLive(t *testing.T) {
 	m2.hp, m2.maxHP = 100, 100
 	m2.mu.Unlock()
 	combatRand = rand.New(rand.NewSource(procSeed))
-	m9DamagePlayerThorns(c, 200, m2, false) // lethal to the hero
+	mobDamagePlayerThorns(c, 200, m2, false) // lethal to the hero
 	m2.mu.Lock()
 	hp = m2.hp
 	m2.mu.Unlock()
@@ -439,7 +439,7 @@ func TestThornsReflectLive(t *testing.T) {
 	// No attacker: no reflect.
 	gameWorld.SetHeroHP(inst, 100)
 	combatRand = rand.New(rand.NewSource(procSeed))
-	m9DamagePlayerThorns(c, 20, nil, false)
+	mobDamagePlayerThorns(c, 20, nil, false)
 	if got := gameWorld.GetHeroHP(inst); got != 80 {
 		t.Fatalf("attackerless hero HP = %d, want 80", got)
 	}
@@ -450,7 +450,7 @@ func TestThornsReflectLive(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestHeroMagicGate(t *testing.T) {
-	it := m6ItemInfoFor("aquastaff")
+	it := itemInfoFor("aquastaff")
 	if it == nil || it.Type != "weaponmagic" {
 		t.Skip("aquastaff catalogue entry missing (needs items.json)")
 	}
@@ -459,9 +459,9 @@ func TestHeroMagicGate(t *testing.T) {
 	}
 	user, inst := "mage-hero", "mage-hero-inst"
 	c, _ := deathConn(t, inst, user)
-	st := m5StateFor(user)
+	st := playerStateFor(user)
 	pstateMu.Lock()
-	st.Equip[EquipmentWeapon] = m5Slot{Key: "aquastaff", Count: 1}
+	st.Equip[EquipmentWeapon] = slotDef{Key: "aquastaff", Count: 1}
 	pstateMu.Unlock()
 	t.Cleanup(func() {
 		pstateMu.Lock()
@@ -495,13 +495,13 @@ func TestHeroMagicGate(t *testing.T) {
 	}
 
 	// Restored mana: swing allowed, cost consumed, warning reset.
-	abilities.SetMana(inst, abilities.ManaMax())
+	abilities.SetMana(inst, abilities.ManaMax(inst))
 	drainOutbox(c)
 	if !heroMagicGate(c) {
 		t.Fatal("full-mana staff swing refused, want allowed")
 	}
-	if mana, _ := abilities.ManaState(inst); mana != abilities.ManaMax()-it.ManaCost {
-		t.Fatalf("mana after swing = %d, want %d", mana, abilities.ManaMax()-it.ManaCost)
+	if mana, _ := abilities.ManaState(inst); mana != abilities.ManaMax(inst)-it.ManaCost {
+		t.Fatalf("mana after swing = %d, want %d", mana, abilities.ManaMax(inst)-it.ManaCost)
 	}
 	if abilities.ManaWarningShown(inst) {
 		t.Fatal("mana warning still shown after funded swing")

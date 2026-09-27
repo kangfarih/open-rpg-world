@@ -205,7 +205,12 @@ func (w *World) BuildTile(x, y int) (Tile, bool) {
 
 // SurroundingRegions mirrors getSurroundingRegions (regions.ts:711-766),
 // region first then neighbours (9 for interior regions like 50).
+// Nil worlds and degenerate (SideLen<=0) worlds return nil instead of
+// dividing by zero.
 func (w *World) SurroundingRegions(region int) []int {
+	if w == nil || w.SideLen <= 0 || w.Width <= 0 || w.Height <= 0 {
+		return nil
+	}
 	total := (w.Width / MapDivisionSize) * (w.Height / MapDivisionSize)
 	if region < 0 || region > total-1 {
 		return nil
@@ -253,9 +258,13 @@ func (w *World) SurroundingRegions(region int) []int {
 
 // RegionData mirrors getRegionData (regions.ts:501-529) for a static spawn:
 // region of (px,py) plus all surrounding regions, empty ones dropped.
+// Nil or degenerate (SideLen<=0) worlds yield an empty map.
 func (w *World) RegionData(px, py int) map[int][]Tile {
-	region := (py/MapDivisionSize)*w.SideLen + (px / MapDivisionSize)
 	data := make(map[int][]Tile)
+	if w == nil || w.SideLen <= 0 {
+		return data
+	}
+	region := (py/MapDivisionSize)*w.SideLen + (px / MapDivisionSize)
 	for _, rid := range w.SurroundingRegions(region) {
 		x0 := (rid % w.SideLen) * MapDivisionSize
 		y0 := (rid / w.SideLen) * MapDivisionSize
@@ -299,6 +308,15 @@ func Default() *World { return defaultWorld }
 
 // DefaultErr returns the cached load error, if any.
 func DefaultErr() error { return defaultErr }
+
+// ResetDefaultForTests clears the LoadDefault cache (tests only). The
+// production path never resets: the first path wins for the process
+// lifetime. Tests that need distinct worlds must call this between cases.
+func ResetDefaultForTests() {
+	defaultOnce = sync.Once{}
+	defaultWorld = nil
+	defaultErr = nil
+}
 
 // MarkerAt returns the static entity marker key at tile index idx
 // (y*Width+x), or ("", false) when the tile carries no marker (map.ts

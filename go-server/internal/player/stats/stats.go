@@ -13,13 +13,13 @@
 //   - addMobExamine dedupes by key and finishes examiner10/25/50 at
 //     10/25/50 distinct examines.
 //   - addDrop is a counter only.
-//   - creationTime/totalTimePlayed/averageTimePlayed/lastLogin/loginCount
-//     are INTENTIONALLY absent: totalTimePlayed/averageTimePlayed/lastLogin/
-//     loginCount round-trip load<->serialize with no gameplay consumer, and
-//     creationTime feeds only isNew() (player.ts:2028), whose sole consumer
-//     is the welcome() greeting variant (WELCOME vs WELCOME_BACK) — a path
-//     the Go server does not implement (no welcome notify). If a welcome
-//     greeting or playtime surface is ever ported, revisit this skip.
+//   - pvpKills/pvpDeaths are incremented on hero-vs-hero combat
+//     (handler.ts handleKill/handleDeath when attacker/victim isPlayer).
+//   - creationTime/totalTimePlayed/lastLogin/loginCount are tracked and
+//     persisted. creationTime is set once on first login; totalTimePlayed
+//     accumulates session durations on disconnect; lastLogin is updated
+//     each login; loginCount increments each login. averageTimePlayed is
+//     derived (totalTimePlayed / loginCount).
 //
 // Transport, achievement delivery and persistence stay with the callers:
 // this package only computes state transitions and returns the achievement
@@ -28,7 +28,10 @@
 // through internal/persist (statistics table JSON blob).
 package stats
 
-import "sync"
+import (
+	"sync"
+	"time"
+)
 
 // Milestones mirrors statistics.ts milestones.
 var Milestones = []int{10, 50, 100, 500, 1000, 5000, 10000}
@@ -37,21 +40,37 @@ var Milestones = []int{10, 50, 100, 500, 1000, 5000, 10000}
 // counts that finish examiner achievements).
 var ExaminerMilestones = map[int]string{10: "examiner10", 25: "examiner25", 50: "examiner50"}
 
-// State is one player's gameplay counters (mobKills/mobExamines/resources/
-// drops parity). Zero value is usable.
+// State is one player's gameplay counters (statistics.ts parity). Zero
+// value is usable; time fields use Unix seconds (time.Now().Unix()).
 type State struct {
 	MobKills    map[string]int
 	MobExamines []string
 	Resources   map[string]int
 	Drops       map[string]int
+	// PvP counters (handler.ts handleKill/handleDeath when isPlayer).
+	PvPKills  int
+	PvPDeaths int
+	// Session/lifecycle tracking (statistics.ts construction + serialize).
+	CreationTime   int64 // first login epoch seconds; set once.
+	TotalTimePlayed int64 // accumulated session seconds across all logins.
+	LastLogin      int64 // most recent login epoch seconds.
+	LoginCount     int   // incremented each login.
+	loginTime      time.Time // transient: when the current session started.
 }
 
-// Snapshot is a detached copy of State (persist handoff).
+// Snapshot is a detached copy of State (persist handoff). Includes all
+// persisted fields (everything except the transient loginTime).
 type Snapshot struct {
 	MobKills    map[string]int
 	MobExamines []string
 	Resources   map[string]int
 	Drops       map[string]int
+	PvPKills    int
+	PvPDeaths   int
+	CreationTime   int64
+	TotalTimePlayed int64
+	LastLogin      int64
+	LoginCount     int
 }
 
 var (
@@ -77,10 +96,16 @@ func Install(username string, snap Snapshot) {
 	mu.Lock()
 	defer mu.Unlock()
 	states[username] = &State{
-		MobKills:    cloneMap(snap.MobKills),
-		MobExamines: append([]string(nil), snap.MobExamines...),
-		Resources:   cloneMap(snap.Resources),
-		Drops:       cloneMap(snap.Drops),
+		MobKills:        cloneMap(snap.MobKills),
+		MobExamines:     append([]string(nil), snap.MobExamines...),
+		Resources:       cloneMap(snap.Resources),
+		Drops:           cloneMap(snap.Drops),
+		PvPKills:        snap.PvPKills,
+		PvPDeaths:       snap.PvPDeaths,
+		CreationTime:    snap.CreationTime,
+		TotalTimePlayed: snap.TotalTimePlayed,
+		LastLogin:       snap.LastLogin,
+		LoginCount:      snap.LoginCount,
 	}
 }
 
@@ -119,10 +144,16 @@ func CopyOf(username string) Snapshot {
 		return Snapshot{}
 	}
 	return Snapshot{
-		MobKills:    cloneMap(st.MobKills),
-		MobExamines: append([]string(nil), st.MobExamines...),
-		Resources:   cloneMap(st.Resources),
-		Drops:       cloneMap(st.Drops),
+		MobKills:        cloneMap(st.MobKills),
+		MobExamines:     append([]string(nil), st.MobExamines...),
+		Resources:       cloneMap(st.Resources),
+		Drops:           cloneMap(st.Drops),
+		PvPKills:        st.PvPKills,
+		PvPDeaths:       st.PvPDeaths,
+		CreationTime:    st.CreationTime,
+		TotalTimePlayed: st.TotalTimePlayed,
+		LastLogin:       st.LastLogin,
+		LoginCount:      st.LoginCount,
 	}
 }
 
@@ -199,6 +230,57 @@ func AddDrop(st *State, key string, count int) {
 	st.Drops[key] += count
 }
 
+// RecordLogin ports the statistics.ts login-time bookkeeping: set
+// creationTime on first login, stamp lastLogin, bump loginCount, and record
+// the session start for AccumulateSession. Caller invokes once per login.
+func RecordLogin(username string) {
+	if username == "" {
+		return
+	}
+	now := time.Now()
+	Update(username, func(st *State) {
+		if st.CreationTime == 0 {
+			st.CreationTime = now.Unix()
+		}
+		st.LastLogin = now.Unix()
+		st.LoginCount++
+		st.loginTime = now
+	})
+}
+
+// AccumulateSession adds the elapsed session duration to TotalTimePlayed.
+// Caller invokes once per disconnect (before the persist flush).
+func AccumulateSession(username string) {
+	if username == "" {
+		return
+	}
+	now := time.Now()
+	Update(username, func(st *State) {
+		if !st.loginTime.IsZero() {
+			st.TotalTimePlayed += int64(now.Sub(st.loginTime).Seconds())
+			st.loginTime = time.Time{}
+		}
+	})
+}
+
+// AddPvPKill increments the PvP kill counter (handler.ts handleKill when
+// victim isPlayer). No achievement fires.
+func AddPvPKill(st *State) {
+	if st == nil {
+		return
+	}
+	st.PvPKills++
+}
+
+// AddPvPDeath increments the PvP death counter (handler.ts handleDeath when
+// killer isPlayer). No achievement fires.
+func AddPvPDeath(st *State) {
+	if st == nil {
+		return
+	}
+	st.PvPDeaths++
+}
+
 func isMilestone(n int) bool {
 	for _, m := range Milestones {
 		if n == m {
@@ -209,6 +291,9 @@ func isMilestone(n int) bool {
 }
 
 func itoa(n int) string {
+	// VERIFY (itoa dup): strconv.Itoa is identical for the milestone path
+	// (all inputs non-negative), but this local port is kept behavior-frozen
+	// to avoid touching the hot HandleSkill string path. No change.
 	if n == 0 {
 		return "0"
 	}

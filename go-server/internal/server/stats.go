@@ -13,7 +13,7 @@ import (
 )
 
 // statsCopyOf snapshots a player's counters for the persist write path
-// (m5ToPersist).
+// (toPersist).
 func statsCopyOf(username string) stats.Snapshot {
 	return stats.CopyOf(username)
 }
@@ -22,10 +22,16 @@ func statsCopyOf(username string) stats.Snapshot {
 // (persistToM5), converting the storage blob to the domain snapshot.
 func statsInstall(username string, blob persist.StatsBlob) {
 	stats.Install(username, stats.Snapshot{
-		MobKills:    blob.MobKills,
-		MobExamines: blob.MobExamines,
-		Resources:   blob.Resources,
-		Drops:       blob.Drops,
+		MobKills:        blob.MobKills,
+		MobExamines:     blob.MobExamines,
+		Resources:       blob.Resources,
+		Drops:           blob.Drops,
+		PvPKills:        blob.PvPKills,
+		PvPDeaths:       blob.PvPDeaths,
+		CreationTime:    blob.CreationTime,
+		TotalTimePlayed: blob.TotalTimePlayed,
+		LastLogin:       blob.LastLogin,
+		LoginCount:      blob.LoginCount,
 	})
 }
 
@@ -51,10 +57,10 @@ func statsHandleSkill(c *playerConn, skill string) {
 		return
 	}
 	markDirty(c.Username)
-	if m11A[ach] == nil {
+	if achDefs[ach] == nil {
 		return
 	}
-	m11FinishAchievement(c, ach)
+	finishAchievement(c, ach)
 }
 
 // statsRecordKill records a mob kill for the killer (statistics.addMobKill
@@ -95,8 +101,53 @@ func statsAddMobExamine(c *playerConn, key string) {
 		ach, fired = stats.AddMobExamine(st, key)
 	})
 	markDirty(c.Username)
-	if !fired || m11A[ach] == nil {
+	if !fired || achDefs[ach] == nil {
 		return
 	}
-	m11FinishAchievement(c, ach)
+	finishAchievement(c, ach)
+}
+
+// statsRecordLogin stamps the login lifecycle fields (creationTime on first
+// login, lastLogin, loginCount). Called once per loginWelcome, after
+// statsInstall has restored the persisted counters.
+func statsRecordLogin(username string) {
+	if username == "" {
+		return
+	}
+	stats.RecordLogin(username)
+	markDirty(username)
+}
+
+// statsRecordDisconnect accumulates the session duration into
+// TotalTimePlayed. Called once per disconnect, before the persist flush.
+func statsRecordDisconnect(username string) {
+	if username == "" {
+		return
+	}
+	stats.AccumulateSession(username)
+	markDirty(username)
+}
+
+// statsRecordPvPKill increments the killer's PvP kill counter (handler.ts
+// handleKill when victim isPlayer). No achievement fires.
+func statsRecordPvPKill(c *playerConn) {
+	if c == nil || c.Username == "" {
+		return
+	}
+	stats.Update(c.Username, func(st *stats.State) {
+		stats.AddPvPKill(st)
+	})
+	markDirty(c.Username)
+}
+
+// statsRecordPvPDeath increments the victim's PvP death counter (handler.ts
+// handleDeath when killer isPlayer). No achievement fires.
+func statsRecordPvPDeath(c *playerConn) {
+	if c == nil || c.Username == "" {
+		return
+	}
+	stats.Update(c.Username, func(st *stats.State) {
+		stats.AddPvPDeath(st)
+	})
+	markDirty(c.Username)
 }
