@@ -118,6 +118,12 @@ export default class Game {
     public start(): void {
         if (this.started) return;
 
+        console.log(
+            '[DEBUG Game.start] starting game loop, useWebGl:',
+            this.useWebGl,
+            'renderer type:',
+            this.renderer.type
+        );
         this.started = true;
 
         this.tick();
@@ -144,6 +150,12 @@ export default class Game {
         }
 
         this.updater.update();
+        console.log(
+            '[DEBUG Game.tick] renderer type:',
+            this.renderer.type,
+            'useWebGl:',
+            this.useWebGl
+        );
         this.renderer.render();
     }
 

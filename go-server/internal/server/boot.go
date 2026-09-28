@@ -10,7 +10,7 @@ package server
 
 import (
 	"bytes"
-	"compress/gzip"
+	"compress/zlib"
 	crand "crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -29,6 +29,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"rpg-world-server/internal/abilities"
+	"rpg-world-server/internal/account"
 	"rpg-world-server/internal/app"
 	"rpg-world-server/internal/controller"
 	"rpg-world-server/internal/entity"
@@ -164,7 +165,7 @@ func isTestGrass(x, y int) bool {
 // base map, then stamps overlays over the base (replacing tiles, adding where
 // the base was empty): center pond (water 29 c:true), grass 3907 c:false
 // under each demo resource + every showcase grid slot + demo spots (so all 232 stand
-// on walkable). RegionTile shape and [4,base64gzip,bufSize] framing are
+// on walkable). RegionTile shape and [4,base64deflate,bufSize] framing are
 // identical to the real path.
 func getTestRegionData() map[int][]RegionTile {
 	data := getRegionData(100, 100)
@@ -228,8 +229,8 @@ func getTestRegionData() map[int][]RegionTile {
 // getSurroundingRegions; sideLength = 1152/48 = 24). Tiles are extracted
 // from world.json (index = y*width+x, number|[n..] layered) with empty
 // (0/[]) skipped and data>=1 kept, mirroring getRegionTileData
-// (regions.ts:541-563). Framing stays [4,base64gzip,bufSize] with gzip
-// (Utils.compress default) + encodeURI byte length. Built once and cached.
+// (regions.ts:541-563). Framing stays [4,base64deflate,bufSize] with deflate
+// (pako inflate default) + encodeURI byte length. Built once and cached.
 // This is the STATIC base: per-player dynamic re-skins layer on top via
 // buildMapFrameFor (dynmap.go) without changing this frame.
 func buildMapFrame() []any {
@@ -241,8 +242,8 @@ func buildMapFrame() []any {
 	return mapFrame
 }
 
-// encodeMapFrame gzips + base64-framing for region data: the shared
-// [4,base64gzip,bufSize] constructor for the static boot frame and the
+// encodeMapFrame deflate-compresses + base64-framing for region data: the shared
+// [4,base64deflate,bufSize] constructor for the static boot frame and the
 // per-player dynamic variants (identical framing, dynmap.go).
 func encodeMapFrame(data map[int][]RegionTile) []any {
 	regionsJSON, err := json.Marshal(data)
@@ -251,12 +252,12 @@ func encodeMapFrame(data map[int][]RegionTile) []any {
 	}
 
 	var buf bytes.Buffer
-	w := gzip.NewWriter(&buf)
+	w := zlib.NewWriter(&buf)
 	if _, err := w.Write(regionsJSON); err != nil {
-		log.Fatalf("gzip write: %v", err)
+		log.Fatalf("zlib write: %v", err)
 	}
 	if err := w.Close(); err != nil {
-		log.Fatalf("gzip close: %v", err)
+		log.Fatalf("zlib close: %v", err)
 	}
 
 	return mapPkt(base64.StdEncoding.EncodeToString(buf.Bytes()), bufferSize(regionsJSON))
@@ -387,12 +388,19 @@ func welcomePlayer(instance string) PlayerData {
 	}
 	maxHP := meta.HeroMaxHPForLevel(level)
 	maxMana := meta.HeroMaxManaForLevel(level)
+	// Display name: player.ts:2382 data.name = Utils.formatName(username).
+	// Before this the stub hardcoded "hero", so every player — self and others
+	// — saw the same nameplate regardless of who they were.
+	name := "hero"
+	if c, ok := worldcore.Find[*playerConn](instance); ok && c != nil && c.Username != "" {
+		name = account.FormatName(c.Username)
+	}
 	return PlayerData{
 		EntityData: EntityData{
 			Instance:      instance,
 			Type:          EntityPlayer,
 			Key:           "base",
-			Name:          "hero",
+			Name:          name,
 			X:             100,
 			Y:             96,
 			Level:         intp(level),
@@ -1801,6 +1809,8 @@ func rejectLocked(c *playerConn, reason string) bool {
 	log.Printf("anticheat: %s instance=%s score=%d", reason, c.Instance, n)
 	if n > 15 {
 		log.Printf("anticheat: disconnecting %s (score %d > 15)", c.Instance, n)
+		// handler.ts:812 connection.reject('cheating') parity.
+		_ = gnet.Reject(c.WS, gnet.ReasonCheating)
 		return true
 	}
 	return false
@@ -2455,9 +2465,12 @@ type playerConn struct {
 	// Connection lifecycle gates (conn goroutine only — no lock needed):
 	// handshakeDone tracks a successful C Handshake so Login without a
 	// prior Handshake is rejected; loggedIn rejects a second Login
-	// identity switch on the same socket.
+	// identity switch on the same socket; Guest marks a guest session
+	// (incoming.ts Guest opcode: never persisted, and upgradeable to a real
+	// account in place — see upgradeGuest).
 	handshakeDone bool
 	loggedIn      bool
+	Guest         bool
 }
 
 // Entity is the central registry record (M2) alias: canonical owner is the
@@ -2991,11 +3004,19 @@ func initEntities() {
 }
 
 func handleConn(conn *websocket.Conn) {
+	// main.ts:59-66 accept gate parity: the world-full check runs on the
+	// established socket, before any per-conn state exists (so a refusal needs
+	// no cleanup). 'disallowed'/banned/rate gates already ran in gnet.Accept.
+	if loginWorldFull() {
+		log.Printf("world full (%d/%d), rejecting %v", loggedInCount(), loginMaxPlayers(), conn.RemoteAddr())
+		_ = gnet.Reject(conn, gnet.ReasonWorldFull)
+		return
+	}
 	gnet.AddSub(conn)
 
 	// Per-connection player record: random Welcome instance + queued outbox.
 	inst := newPlayerInstance()
-	c := &playerConn{Conn: gnet.NewConn(conn, inst)}
+	c := &playerConn{Conn: gnet.NewConn(conn, inst), regionsLoaded: make(map[int]bool)}
 	worldcore.AddPlayer(conn, c)
 	worldcore.SetEntityPos(inst, 100, 96)
 	worldcore.UpdateRegion(c, 100, 96)
@@ -3061,8 +3082,11 @@ func handleConn(conn *websocket.Conn) {
 			}
 			// Ops limiter: drop inbound frames over the per-conn msg budget.
 			if !gnet.AllowMsg(gnet.AddrID(conn)) {
-				log.Printf("ops: drop frame over msg budget instance=%s", c.Instance)
-				continue
+				// uws.ts:92 connection.reject('ratelimit') parity: TS closes
+				// the socket over the message budget instead of dropping.
+				log.Printf("ops: reject frame over msg budget instance=%s", c.Instance)
+				_ = gnet.Reject(conn, gnet.ReasonRateLimit)
+				return
 			}
 			var id int
 			if err := json.Unmarshal(frame[0], &id); err != nil {
@@ -3079,6 +3103,10 @@ func handleConn(conn *websocket.Conn) {
 					// runs the disconnect fanout (idempotent — no explicit
 					// call here).
 					sendGVerReject(conn, gv)
+					// connection.reject('updated') parity: the notice above is
+					// human-readable, the close code/reason is what the client
+					// actually surfaces (socket.ts:73).
+					_ = gnet.Reject(conn, gnet.ReasonUpdated)
 					return
 				}
 				reply := HandshakeData{
@@ -3097,35 +3125,59 @@ func handleConn(conn *websocket.Conn) {
 				// handshake-less logins that skip the gVer contract).
 				if !c.handshakeDone {
 					log.Printf("login rejected instance=%s (no prior handshake)", c.Instance)
+					_ = gnet.Reject(conn, gnet.ReasonLost)
 					return
+				}
+				var login loginRequest
+				if len(frame) >= 2 {
+					_ = json.Unmarshal(frame[1], &login)
+				}
+				// Guest upgrade affordance: a Register frame on an already
+				// authenticated GUEST socket converts the session in place
+				// (the /register command drives the same path). The socket
+				// keeps its session — unlike a second Login, which switches
+				// identity mid-connection and stays rejected below.
+				if c.loggedIn && c.Guest && login.Opcode == LoginOpcodeRegister {
+					name, reason := upgradeGuest(c, login)
+					if reason != "" {
+						notifyPlayer(c, upgradeFailureText(reason))
+					} else {
+						notifyPlayer(c, fmt.Sprintf(
+							"Account %s created — your progress is saved from now on.",
+							account.FormatName(name)))
+					}
+					continue
 				}
 				// Double Login would switch identity mid-socket (c.Username
 				// overwrite + second Welcome); reject it.
 				if c.loggedIn {
 					log.Printf("login rejected instance=%s (already logged in as %s)", c.Instance, c.Username)
+					_ = gnet.Reject(conn, gnet.ReasonLoggedIn)
 					return
-				}
-				var login struct {
-					Username  string `json:"username"`
-					SeedGold  int    `json:"seedGold,omitempty"`
-					SeedArrow int    `json:"seedArrow,omitempty"`
-					SeedRank  int    `json:"seedRank,omitempty"`
-					SeedPos   []int  `json:"seedPos,omitempty"`
-				}
-				if len(frame) >= 2 {
-					_ = json.Unmarshal(frame[1], &login)
 				}
 				// M13 login gate BEFORE any login state creation (Node
 				// login.go database loader -> connection.reject): banned
 				// users get the 'ban' text frame and a close with no
 				// pstates/SetEntityPos/dirty/seed side effects.
 				if login.Username != "" && checkBan(login.Username) {
-					_ = gnet.WriteText(conn, []byte("ban"), 2*time.Second)
+					// connection.reject('banned') parity (console.ts:148 /
+					// commands.ts:1154): close with the client's known reason.
+					// The old bare "ban" text frame was invisible to the stock
+					// client, which ignores anything not starting with '['.
+					_ = gnet.Reject(conn, gnet.ReasonBanned)
+					return
+				}
+				// Identity resolution (incoming.ts handleLogin parity): the
+				// Login/Register/Guest opcode switch, credential checks,
+				// duplicate-session rejection and the skip-database shortcut.
+				// Every failure closes the socket with its TS reason.
+				if !loginApply(c, login) {
 					return
 				}
 				// M5: Welcome from DB when the login username is known, else
-				// fresh; Container/Skill batches restore visible state.
-				ph, extra := loginWelcome(c, login.Username)
+				// fresh; Container/Skill batches restore visible state. Guests
+				// always start fresh and are never persisted.
+				ph, extra := loginWelcome(c, c.Username)
 				// M6 e2e hook (TESTMAP only): seedGold tops the account up to N
 				// gold, folding the seeded wallet into the single inventory
 				// Container Batch (no double-Batch: the welcome Batch is
@@ -3342,6 +3394,7 @@ func Boot() {
 	startStoreTicker() // M6: stores.json registry + 20s stock refresh
 	ensureQuestTables()    // M11: quests/achievements SQLite tables (schema up-front)
 	ensureCmdTables()    // M13: mute/ban/jail/noclip flags table (schema up-front)
+	ensureAccountTables() // identity: accounts table + email index (schema up-front)
 	abEnsureTables()     // abilities: unlock table (schema up-front)
 	socEnsureTables()    // social: guilds + friends tables (schema up-front)
 	socLoadGuilds()      // social: rebuild the guild registry from the tables

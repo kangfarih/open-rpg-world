@@ -59,14 +59,14 @@ const OutboxSize = 64
 // movement anticheat state (main.go session). The math lives in
 // internal/world; this struct is the transport-owned record of it.
 type Session struct {
-	PlayerX, PlayerY   int
-	Target             string
-	LastStep           time.Time
-	MovementSpeed      int // ms per tile (Welcome default 220)
-	CheatScore         int
-	LastRegionChange   time.Time // region change exemption (1.5s grace)
-	BypassAntiCheat    bool      // teleport bypass flag
-	LatencyMs          int       // client-reported one-way latency (ms); 0 until first timestamped packet
+	PlayerX, PlayerY int
+	Target           string
+	LastStep         time.Time
+	MovementSpeed    int // ms per tile (Welcome default 220)
+	CheatScore       int
+	LastRegionChange time.Time // region change exemption (1.5s grace)
+	BypassAntiCheat  bool      // teleport bypass flag
+	LatencyMs        int       // client-reported one-way latency (ms); 0 until first timestamped packet
 }
 
 // Conn is the per-connection transport record (main.go playerConn, transport
@@ -210,16 +210,23 @@ type Hub struct {
 
 	ipMu   sync.Mutex
 	ipBans map[string]bool
+
+	// reconnMu guards lastConn, the per-IP last-connection-attempt table
+	// backing the 'toofast' reconnect gate (TS socketHandler.updateLastTime
+	// + Network.timeoutThreshold).
+	reconnMu sync.Mutex
+	lastConn map[string]int64
 }
 
 // NewHub returns an admitting Hub with default limits (16/IP, 300 msg/s,
 // chat 3 burst @ 0.5/s — the opsLimiter budgets).
 func NewHub() *Hub {
 	h := &Hub{
-		subs:    make(map[*websocket.Conn]struct{}),
-		limiter: NewLimiterFromConfig(Config{}),
-		conns:   make(map[*websocket.Conn]string),
-		ipBans:  make(map[string]bool),
+		subs:     make(map[*websocket.Conn]struct{}),
+		limiter:  NewLimiterFromConfig(Config{}),
+		conns:    make(map[*websocket.Conn]string),
+		ipBans:   make(map[string]bool),
+		lastConn: make(map[string]int64),
 		Upgrader: websocket.Upgrader{
 			CheckOrigin: func(_ *http.Request) bool { return true },
 		},
@@ -246,27 +253,30 @@ func (h *Hub) DelSub(ws *websocket.Conn) {
 	delete(h.subs, ws)
 }
 
-// Accept gates one HTTP request before the WS upgrade (ops_wire opsAccept):
-// update-mode and IP bans reject first, then the per-IP cap (reject + log
-// over 16), then the upgrade. A failed upgrade releases the acquired slot.
+// Accept gates one HTTP request before the WS upgrade (ops_wire opsAccept).
+//
+// Rejection order mirrors TS: the accept gate runs on an ESTABLISHED socket
+// there (uWS admits first, then main.ts/network.ts reject), and the stock
+// client can only read a rejection from a close frame (code 1010 + reason).
+// So a rejected request from a real WebSocket client is upgraded, then closed
+// with the TS reason; only a request that never becomes a WebSocket (curl,
+// tests) keeps the HTTP status-code answer.
+//
+// Order (see preAcceptReason): disallowed -> banned -> toofast -> toomany.
 func (h *Hub) Accept(w http.ResponseWriter, r *http.Request) (*websocket.Conn, bool) {
-	if !h.accepting.Load() {
-		http.Error(w, "server updating", http.StatusServiceUnavailable)
-		return nil, false
-	}
 	ip := ClientIP(r)
-	h.ipMu.Lock()
-	banned := h.ipBans[ip]
-	h.ipMu.Unlock()
-	if banned {
-		log.Printf("ops: reject banned ip=%s", ip)
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return nil, false
+	now := time.Now().UnixMilli()
+
+	if reason := h.preAcceptReason(ip, now); reason != "" {
+		return nil, h.rejectPreUpgrade(w, r, ip, reason)
 	}
+
+	// Non-banned attempts are timestamped before the rate gates, mirroring
+	// network.ts:68 (updateLastTime runs before the toofast check).
+	h.noteConnection(ip, now)
+
 	if !h.limiter.Acquire(ip) {
-		log.Printf("ops: reject ip=%s over per-IP cap (%d)", ip, DefaultMaxConnectionsPerIP)
-		http.Error(w, "too many connections", http.StatusTooManyRequests)
-		return nil, false
+		return nil, h.rejectPreUpgrade(w, r, ip, ReasonTooMany)
 	}
 	conn, err := h.Upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -279,6 +289,38 @@ func (h *Hub) Accept(w http.ResponseWriter, r *http.Request) (*websocket.Conn, b
 	h.connsMu.Unlock()
 	log.Printf("client connected: %s", r.RemoteAddr)
 	return conn, true
+}
+
+// rejectPreUpgrade delivers a pre-admission rejection the way the client can
+// read it: upgrade first, then close with 1010 + reason. A request that is not
+// a WebSocket upgrade keeps the plain HTTP answer (upgrading it would make
+// gorilla write its own 400 before a status could be set).
+func (h *Hub) rejectPreUpgrade(w http.ResponseWriter, r *http.Request, ip, reason string) bool {
+	if websocket.IsWebSocketUpgrade(r) {
+		if conn, err := h.Upgrader.Upgrade(w, r, nil); err == nil {
+			log.Printf("ops: reject ip=%s reason=%s", ip, reason)
+			_ = h.Reject(conn, reason)
+			return false
+		}
+		return false
+	}
+	log.Printf("ops: reject ip=%s reason=%s (http %d)", ip, reason, httpCloseCode(reason))
+	http.Error(w, reason, httpCloseCode(reason))
+	return false
+}
+
+// httpCloseCode is the HTTP-status form of a reject reason, used only when the
+// request never became a WebSocket (TS has no HTTP equivalent; these keep the
+// pre-existing codes).
+func httpCloseCode(reason string) int {
+	switch reason {
+	case ReasonDisallowed:
+		return http.StatusServiceUnavailable
+	case ReasonTooMany, ReasonTooFast:
+		return http.StatusTooManyRequests
+	default:
+		return http.StatusForbidden
+	}
 }
 
 // Release frees the limiter slot and per-conn msg/chat state for a conn whose

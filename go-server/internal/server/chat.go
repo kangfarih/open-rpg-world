@@ -288,6 +288,12 @@ func parseCommand(c *playerConn, rawText string) {
 		return
 	}
 
+	// Guest -> account upgrade runs first: it is the only command a guest can
+	// usefully issue, and it must not fall through to the rank-gated tables.
+	if guestRegisterCommand(c, command, args) {
+		return
+	}
+
 	chatPlayerCommands(c, command, args)
 	moderatorCommands(c, command, args)
 	craftingCommands(c, command)     // M12: crafting interface opens (/crafting etc.)

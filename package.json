@@ -12,6 +12,7 @@
         "postinstall": "husky install",
         "packages": "FORCE_COLOR=true yarn workspaces foreach --no-private -j 4 -piv run",
         "dev": "yarn packages dev",
+        "dev:go": "cd go-server && PORT=9001 go run ./cmd/server & trap 'kill %1 2>/dev/null' EXIT; CLIENT_REMOTE_PORT=9001 yarn workspace @kaetram/client dev --port 9000 --host 127.0.0.1",
         "hub": "yarn packages hub",
         "start": "yarn packages start",
         "build": "yarn packages build",

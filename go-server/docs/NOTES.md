@@ -77,7 +77,7 @@
 - Boot: `Login(2)` → Welcome + Map only; `Spawn*` moved to `Ready(9)` handler exclusively (`main.go`).
 - `packets.go`: `EntityData` += `enchantments` (`Enchantments`, item.d.ts:5-7) + `hit` (`HitData`, info.d.ts:1-9); `PlayerData`: required `orientation int` (always emitted, shadows embedded optional) + `experience/nextExperience/prevExperience` omitempty (impl/player.ts:15-28).
 - Named consts: full `packets.ts` enum `PacketConnected=0…PacketAdminSync=60` (`PacketLogin=2`, `PacketReady=9` etc); no magic numbers in `main.go`.
-- Map: `compress/gzip` (matches `Utils.compress` default gzip, util/utils.ts:195-201; pako `inflate` handles gzip wrapper) + `bufSize` via `bufferSize()` emulating `Utils.getBufferSize` encodeURI length (util/utils.ts:257-258); Handshake reply += `serverId:1`.
+- Map: `compress/zlib` (zlib format, matches pako `inflate` which handles zlib/gzip) + `bufSize` via `bufferSize()` emulating `Utils.getBufferSize` encodeURI length (util/utils.ts:257-258); Handshake reply += `serverId:1`.
 - Inbound: accepts bulk `[[id,data]]` as well as single `[id,data]` (probe outer[0], fan-out to frame loop).
 - Verify: `go vet ./... && go build ./...` green, `gofmt -l .` empty; scripted WS check PASS — after Login ids `[0,1,3,4]` (no Spawn), Map gunzip → `{}` bufSize 2, Welcome has `orientation:1`, Handshake has `serverId:1`, bulk `[[9,…]]` Ready → 3 Spawns (no type 6). `git status --porcelain` in `/Users/appfuxion/repo/rpg-world-sim` = empty.
 

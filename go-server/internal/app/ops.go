@@ -105,6 +105,13 @@ type OpsDeps struct {
 	GetDB func() *sql.DB
 	// StartTime returns the server boot time for uptime display.
 	StartTime func() time.Time
+	// Accounts serves the password-reset endpoints (hub
+	// /api/v1/requestReset + /api/v1/resetPassword parity). nil disables
+	// them (the endpoints answer {error:"invalid"}).
+	Accounts api.AccountProvider
+	// ResetMailer delivers a reset link when one is minted. nil logs the
+	// link instead (dev fallback; the token is still valid).
+	ResetMailer func(email, link string)
 }
 
 var opsDeps OpsDeps
@@ -144,6 +151,12 @@ func StartAPI() {
 
 	// Uptime (admin dashboard).
 	srv.Uptime = opsUptime{}
+
+	// Password reset (hub /api/v1/* parity): available whenever the account
+	// store is wired, which in the shard role means the same SQLite handle
+	// the login path uses.
+	srv.Accounts = opsDeps.Accounts
+	srv.ResetMailer = opsDeps.ResetMailer
 
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {

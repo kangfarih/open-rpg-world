@@ -7,14 +7,14 @@ Contract: JSON wire identical (`SPEC.md`: bulk `[[id,data]|[id,opcode,data]]` ov
 ### 0. Stack
 
 CURRENT (2026-09-22): Go 1.25 module `rpg-world-server`, `gorilla/websocket`, `modernc.org/sqlite` (pure Go, no cgo) `PRAGMA journal_mode=WAL; synchronous=NORMAL`, single-writer store (`internal/persist`, `SetMaxOpenConns(1)`), 23 `internal/*` packages (TS-mirror layout, see §2), `cmd/server` shim, 15+ black-box e2e harnesses (`go-server/e2e/*`) all green. Root `package main` retains the runtime wiring (transport, registry, dispatch, tick) with thin adapters over the packages.
-TARGET (remaining): `go:embed` data + `meta.world_hash` boot gate; multi-server hub transport; R1–R4 rollout (§12). `gobwas/ws` swap is optional (gorilla serves current scale).
+TARGET (remaining): `go:embed` data + `meta.world_hash` boot gate; R4 chaos drill re-run against the identity layer. Landing status 2026-09-28: multi-server hub transport DONE (R1–R3, §12), identity/accounts layer DONE (A1 below). `gobwas/ws` swap is optional (gorilla serves current scale).
 
 ### 1. Inventory
 
 Subsystems: bootstrap; conn + anti-spam (handshake/login/ready, IP throttle, chat bucket); regions/areas (48 tiles/region, sideLength 24, surroundingRegions); movement + anticheat (speed/collision/entity-grid verify, teleport-back); combat + projectiles (GCD, aggro, poison/burn/freeze/bleed); gathering (deplete→respawn); drops/loot (30–50s despawn); quests + achievements; stores/bank/trade/craft/enchant (stub: stores in-memory only); guilds/friends/hub; chat/commands ~1300 lines; abilities; minigames teamwar/coursing; NPC/pet/stats.
 Data (verified 2026-09-15): `items.json` 525, `mobs.json` 148, `npcs/spawns/tables.json`, `trees/rocks/fishing/foraging.json`, `stores.json`, `crafting/` 7 files, `quests/` 21 + `quest_bases/` 28, `abilities.json`, `minigames.json`, `map/world.json` 1152×1008; `sprites.json` client-only, no port.
 Packets: 61 (0–60 Connected…AdminSync; 59 Resource, 60 AdminSync) + opcodes (movement 0/1/2/3/4/5/7, equipment Batch0, store/guild/quest/ability/minigame sub-ops). Port all 53 `network/impl/*.ts` frames exactly.
-State split — persistent DONE (SQLite, `internal/persist` + subsystem tables): players, equipment/inventory/bank, skills/XP, abilities, quests/achievements, guilds (`guilds`/`guild_members`), friends, m13 flags; dirty-flush every 10s + on disconnect + SIGTERM barrier. TODO: `meta` table (world hash, schema version) + expand-only migration discipline. In-memory: entities, region buckets, combat/aggro/projectiles, loot/chests (30–50s), resource timers, store 20s refresh, minigame lobby/queue, sessions + spam buckets, map frame cache.
+State split — persistent DONE (SQLite, `internal/persist` + subsystem tables): players, equipment/inventory/bank, skills/XP, abilities, quests/achievements, guilds (`guilds`/`guild_members`), friends, m13 flags, accounts (`internal/account`); dirty-flush every 10s + on disconnect + SIGTERM barrier. Schema gating DONE: `meta.schema_version` (`internal/persist/schema.go`, v9) stamps fresh DBs, re-stamps older ones forward after the expand-only DDL converges them, and refuses boot against a newer-than-known schema. TODO: `meta.world_hash` boot gate. In-memory: entities, region buckets, combat/aggro/projectiles, loot/chests (30–50s), resource timers, store 20s refresh, minigame lobby/queue, sessions + spam buckets, map frame cache.
 
 ### 2. Package layout — ACTUAL (TS-mirror; extraction E0–E9 landed, see §4 ledger)
 
@@ -34,7 +34,7 @@ State split — persistent DONE (SQLite, `internal/persist` + subsystem tables):
 - `internal/warps`, `internal/events`, `internal/globals` — pure tables/scheduler/loaders.
 - `internal/api`, `internal/console`, `internal/app`, `internal/sim` — REST, stdin admin, boot config, demo-scene math.
 
-### 3. SQLite schema — TARGET (stub: all in-memory; `meta`/migration TODO)
+### 3. SQLite schema — ACTUAL (single-writer store, expand-only migrations via `meta.schema_version`, currently v9 = v8 + the `accounts` table/index fold-in)
 
 ```sql
 PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;
@@ -70,7 +70,8 @@ In-memory only: live entities, region buckets, combat/aggro/projectiles, loot/ch
 - M11 quests+achievements — DONE (`9356043` + E7 `internal/player/quest`): 21 quests, gated drops, SQLite (`e2e/m11`).
 - M12 trade/craft/enchant — DONE (`c0d76ae` + E1 `internal/controller`): sessions, recipes, shards (`e2e/m12`).
 - M13 commands — DONE (`a42748a` + E8 `internal/controller`, + admin-cheat batch `internal/controller/progression.go`: all 117 `commands.ts` cases incl. addability/addexp/setlevel/max/resetskills/setability/setquickslot/resetabilities/setpet/setrank/openbank/poison/poisonarea/attackrange/debug/resetregions/ipban) (`e2e/m13`).
-- Explicit non-goals (no portable surface): hub account endpoints (`leaderboards`/`isOnline`/`requestReset`/`resetPassword` — Mongo user-account backed, Go login is name-only), admin web panel, NATS transport, background-asset streaming, cross-region atomic trades. Sentry opt-in, Discord hook, and profanity filter remain open optionals.
+- A1 identity + hub client surface — DONE (2026-09-28): `internal/account` (PBKDF2-HMAC-SHA256 210k, email + reset tokens, schema v9) and the `incoming.ts handleLogin` decision tree (Login/Register/Guest opcodes, `SKIP_DATABASE`/`DISABLE_REGISTER`/`MAX_PLAYERS` env, guest nameplates, worldfull gate, guest persistence guards, guest guild restrictions) with 1010 close reasons on every reject (`internal/net/reject.go`); hub client endpoints `GET /all`, `GET /server`, `GET /leaderboards`, `POST /isOnline`, `POST /api/v1/requestReset|resetPassword` (`internal/app/router.go`, `internal/api`); shard presence via `HUB_ADDR` (`internal/server/presence.go`); world ids pinned by `SERVER_ID` on the hub handshake so the router and the shard's own duplicate-login check agree; `/` dispatches hub socket vs liveness body. New in Go (TS has no equivalent): **guest → account upgrade in place** (`/register` in chat, or a `Login.Register` frame on the live guest socket), keeping position/inventory/skills/quests. E2E: `go-server/e2e/login` (14 checks).
+- Explicit non-goals: admin web panel, NATS transport, background-asset streaming, cross-region atomic trades. Sentry opt-in, Discord hook, and profanity filter remain open optionals.
 - P-A abilities+status — DONE (`internal/abilities`, `internal/status`, quest rewards grant; `e2e/abilities`).
 - P-B pets — DONE (`internal/pets` + `internal/entity/pet`; `e2e/pets`).
 - P-C friends/guilds/hub — DONE (`internal/friends`, `internal/guilds`, `internal/hub` all-in-one Router; `e2e/social`).

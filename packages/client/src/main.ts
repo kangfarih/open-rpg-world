@@ -10,5 +10,6 @@ import './lib/sentry';
  */
 
 window.addEventListener('load', () => {
-    new Game(new App());
+    let game = new Game(new App());
+    (window as unknown as { [key: string]: unknown }).game = game;
 });

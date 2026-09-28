@@ -138,7 +138,32 @@ const (
 	// EnvShardRegions is the comma-separated region-id list the shard
 	// simulates (default: unscoped).
 	EnvShardRegions = "SHARD_REGIONS"
+	// EnvServerID is the world id this shard claims on the hub
+	// (config.serverId parity, default 1). The SAME value is posted to
+	// /isOnline, so the hub must know the shard by it: an auto-allocated id
+	// that disagrees with SERVER_ID makes the router report the shard's own
+	// players as online elsewhere (every login rejected 'loggedin').
+	EnvServerID = "SERVER_ID"
 )
+
+// ServerIDFromEnv resolves the shard's claimed world id (SERVER_ID, default 1;
+// junk and non-positive values fall back to 1).
+func ServerIDFromEnv() int {
+	n := 0
+	for _, r := range strings.TrimSpace(os.Getenv(EnvServerID)) {
+		if r < '0' || r > '9' {
+			return 1
+		}
+		n = n*10 + int(r-'0')
+		if n > 1<<16 {
+			return 1
+		}
+	}
+	if n <= 0 {
+		return 1
+	}
+	return n
+}
 
 // Transport cadence. HeartbeatInterval mirrors the TS 5s hub retry cadence;
 // shards idle longer than EvictAfter (3 missed beats) are evicted.
@@ -771,9 +796,12 @@ func (m *Mailer) Deliver(username string) []Message {
 
 // shardEntry is one registered world process.
 type shardEntry struct {
-	conn     *websocket.Conn // nil in unit tests (transport-free)
-	wmu      sync.Mutex      // guards conn writes
-	name     string
+	conn *websocket.Conn // nil in unit tests (transport-free)
+	wmu  sync.Mutex      // guards conn writes
+	name string
+	// id is the hub-assigned world id the client sees on
+	// SerializedServer.id (TS hub: Server.id assigned at registration).
+	id       int
 	players  map[string]struct{}
 	lastBeat time.Time
 	// R1 routing stamps (from HubHandshake/heartbeat; see Register).
@@ -793,6 +821,9 @@ type shardEntry struct {
 // ShardInfo is the transport-free snapshot of one shardEntry for the
 // router server-list (see Server.ListShards / NewestRunning).
 type ShardInfo struct {
+	// ID is the hub-assigned world id (SerializedServer.id). 0 only on the
+	// zero ShardInfo returned with ok=false.
+	ID      int
 	Name    string
 	Addr    string
 	BuildID string
@@ -828,9 +859,11 @@ func effectiveState(state string) string {
 // The zero value is not usable; build with NewServer. now is a test hook
 // (defaults to time.Now).
 type Server struct {
-	mu     sync.Mutex
-	token  string
-	mail   *Mailer
+	mu    sync.Mutex
+	token string
+	mail  *Mailer
+	// nextID is the sequential world-id allocator (TS hub Server.id counter).
+	nextID int
 	shards map[string]*shardEntry
 	// playerShard maps username -> hosting shard name.
 	playerShard map[string]string
@@ -922,8 +955,21 @@ func (s *Server) Register(hs HubHandshake) error {
 	}
 	e := s.shards[hs.Name]
 	if e == nil {
+		s.nextID++
+		id := s.nextID
+		// A shard may pin its own id (HubHandshake.ServerID, SERVER_ID env);
+		// otherwise the hub allocates the next sequential world id, exactly
+		// like the TS hub's serverId counter. Pinned ids still advance the
+		// counter so later auto-ids never collide.
+		if hs.ServerID > 0 {
+			id = hs.ServerID
+			if id > s.nextID {
+				s.nextID = id
+			}
+		}
 		e = &shardEntry{
 			name:      hs.Name,
+			id:        id,
 			players:   make(map[string]struct{}),
 			firstSeen: now,
 		}
@@ -1252,6 +1298,7 @@ func (s *Server) ListShards() []ShardInfo {
 // infoLocked snapshots e. Caller holds mu.
 func (s *Server) infoLocked(e *shardEntry, newest bool) ShardInfo {
 	return ShardInfo{
+		ID:   e.id,
 		Name: e.name, Addr: e.addr, BuildID: e.buildID, GVer: e.gVer,
 		State: effectiveState(e.state), Load: e.load, Newest: newest,
 		Version: e.version, Regions: append([]int(nil), e.regions...),
@@ -2224,6 +2271,9 @@ func (c *Client) handshakeFrame() ([]byte, error) {
 		Type: "hub", Name: c.name, AccessToken: c.token, Players: players,
 		BuildID: buildID, GVer: gVer, State: state, Load: len(players), Addr: game,
 		Version: c.reportedVersion(), Regions: c.reportedRegions(),
+		// Pin the world id the shard reports to /isOnline (SERVER_ID), so the
+		// hub roster and the shard's duplicate-login check agree.
+		ServerID: ServerIDFromEnv(),
 	}
 	return encodeFrame(frameHandshake, nil, hs)
 }

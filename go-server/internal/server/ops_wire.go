@@ -18,6 +18,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
+	"rpg-world-server/internal/account"
 	"rpg-world-server/internal/app"
 	gnet "rpg-world-server/internal/net"
 	worldcore "rpg-world-server/internal/world"
@@ -172,8 +173,37 @@ func opsConfigure() {
 		SaveWorld: flushDirty,
 		GetDB:     func() *sql.DB { return dbConn },
 		StartTime: func() time.Time { return serverStartTime },
+		Accounts:  opsAccounts{},
 	})
 }
+
+// opsAccounts adapts internal/account to the api.AccountProvider seam (the
+// password-reset endpoints). It serializes on dbMu like every other
+// direct-table path; with no DB wired every method answers the TS 'invalid'
+// shape.
+type opsAccounts struct{}
+
+func (opsAccounts) CreateResetToken(email string) (id, token string, ok bool) {
+	if dbConn == nil {
+		return "", "", false
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	return account.CreateResetToken(dbConn, email)
+}
+
+func (opsAccounts) ResetPassword(id, token, password string) bool {
+	if dbConn == nil {
+		return false
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	return account.ResetPassword(dbConn, id, token, password)
+}
+
+func (opsAccounts) ValidEmail(email string) bool { return account.ValidEmail(email) }
+
+func (opsAccounts) ValidPassword(password string) bool { return account.ValidPassword(password) }
 
 func opsPlayerLevel(username string) int {
 	if st := playerStateFor(username); st != nil && st.Level > 0 {

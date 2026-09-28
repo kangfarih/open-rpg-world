@@ -68,7 +68,17 @@ const SchemaVersionKey = "schema_version"
 // = never reset). The background ticker and login path call resets.MaybeReset
 // to detect boundary crossings and bump the timestamps. Older binaries
 // never name these columns.
-const CurrentSchemaVersion = 8
+//
+// v9 adds the `accounts` table plus the email lookup index (expand-only
+// fold-in, DDL identical to account.AccountsDDL): username -> PBKDF2
+// derivation + salt/iterations/algo, email, created_at and the password-reset
+// token hash/expiry. Identity parity with the TS MongoDB account layer; older
+// binaries never name the table, so they keep serving every table they know.
+//
+// v10 adds the `guest_devices` table (expand-only): device_id -> username
+// mapping for persistent guest sessions. A returning device reuses the same
+// guest identity and its persisted state. Older binaries never name the table.
+const CurrentSchemaVersion = 10
 
 // checkSchemaVersion stamps or gates meta.schema_version. Fresh DBs (no
 // row) are stamped with the current version; older versions are re-stamped

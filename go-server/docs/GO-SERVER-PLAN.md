@@ -1,5 +1,10 @@
 # Go Server — Full Recreation Plan (stock web client, custom world)
 
+> Historical planning doc (2026-09-15): it describes the original stub. For the
+> current state — full game parity, the router/shard split, the schema gate and
+> the identity/accounts layer — see `GO-PLAN.md`. Kept for the inventory and
+> port-source checklists below.
+
 Contract: keep JSON wire identical (`SPEC.md`: bulk `[[id,data]|[id,opcode,data]]` over `ws://host:port`). No `packages/*` edits, no client change. All game logic reimplemented in Go.
 
 ## 0. Stack

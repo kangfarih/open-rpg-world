@@ -34,6 +34,7 @@ package api
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"os"
@@ -143,6 +144,23 @@ type UptimeProvider interface {
 	StartTime() time.Time
 }
 
+// AccountProvider supplies the identity operations the password-reset
+// endpoints need. The TS equivalents live on the hub against MongoDB
+// (packages/hub/src/controllers/api.ts:251 requestReset, :290 resetPassword
+// over mongodb.ts createResetToken/resetPassword); the Go port runs them
+// against the shard's own SQLite account table (internal/account).
+//
+// CreateResetToken mints (id, token) for a known email and reports ok=false
+// for an unknown one — the handler answers success either way, exactly like TS
+// (anti-enumeration). ResetPassword consumes the token and rotates the
+// password.
+type AccountProvider interface {
+	CreateResetToken(email string) (id, token string, ok bool)
+	ResetPassword(id, token, password string) bool
+	ValidEmail(email string) bool
+	ValidPassword(password string) bool
+}
+
 // ---------------------------------------------------------------------------
 // Server.
 // ---------------------------------------------------------------------------
@@ -153,12 +171,21 @@ type UptimeProvider interface {
 // Health is optional (nil => /healthz reports a static RUNNING stub);
 // set it after construction to report the live drain state.
 type Server struct {
-	Players     Players
-	Guilds      Guilds
-	Status      StatusProvider
-	Health      HealthProvider
+	Players      Players
+	Guilds       Guilds
+	Status       StatusProvider
+	Health       HealthProvider
 	Leaderboards LeaderboardProvider
-	Uptime      UptimeProvider
+	Uptime       UptimeProvider
+	Accounts     AccountProvider // nil = reset endpoints answer 'invalid'
+
+	// ResetMailer delivers a reset link. Nil = the link is logged instead
+	// (dev fallback: TS requires nodemailer + a live SMTP server, which a local
+	// checkout does not have, but the token is still valid so the flow can be
+	// completed from the log line).
+	ResetMailer func(email, link string)
+	// ResetURLBase prefixes the emailed link; empty uses DefaultResetURLBase.
+	ResetURLBase string
 
 	// SentryDSN enables Sentry error tracking when non-empty (TS config.sentryDsn
 	// parity). Initialize Sentry before constructing the Server; the middleware
@@ -180,7 +207,77 @@ func NewServer(players Players, guilds Guilds, status StatusProvider) *Server {
 	s.mux.HandleFunc("GET /healthz", s.handleHealth)
 	s.mux.HandleFunc("GET /leaderboards", s.handleLeaderboards)
 	s.mux.HandleFunc("GET /admin", s.handleAdmin)
+	// Password reset (TS hub POST /api/v1/requestReset + /api/v1/resetPassword;
+	// the stock client calls both — app.ts:700 and reset.ts:64).
+	s.mux.HandleFunc("POST /api/v1/requestReset", s.HandleRequestReset)
+	s.mux.HandleFunc("POST /api/v1/resetPassword", s.HandleResetPassword)
 	return s
+}
+
+// DefaultResetURLBase is the client page a reset link points at (the stock
+// client reads ?id=&token= from it — packages/client/src/reset.ts).
+const DefaultResetURLBase = "http://127.0.0.1:9000/reset/"
+
+// HandleRequestReset mirrors hub api.ts handleRequestReset: validate the email
+// shape, mint a token, mail it, and ALWAYS answer {status:"success"} so the
+// endpoint cannot be used to probe which emails are registered.
+//
+// Exported because the router role hosts the same two routes (the client POSTs
+// them at the hub base URL — packages/client/src/app.ts forgotPassword and
+// src/reset.ts).
+func (s *Server) HandleRequestReset(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Email string `json:"email"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"error": "invalid"})
+		return
+	}
+	if s.Accounts == nil || !s.Accounts.ValidEmail(body.Email) {
+		writeJSON(w, http.StatusOK, map[string]any{"error": "invalid"})
+		return
+	}
+	id, token, ok := s.Accounts.CreateResetToken(body.Email)
+	if !ok {
+		// Unknown email: same answer as success (api.ts:265 comment).
+		writeJSON(w, http.StatusOK, map[string]any{"status": "success"})
+		return
+	}
+	base := s.ResetURLBase
+	if base == "" {
+		base = DefaultResetURLBase
+	}
+	link := fmt.Sprintf("%s?id=%s&token=%s", base, id, token)
+	if s.ResetMailer != nil {
+		s.ResetMailer(body.Email, link)
+	} else {
+		log.Printf("accounts: password reset link for %s: %s", body.Email, link)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "success"})
+}
+
+// HandleResetPassword mirrors hub api.ts handleResetPassword: id + token +
+// password must be present and the password must satisfy the same length rule
+// as registration. Exported for the router role (see HandleRequestReset).
+func (s *Server) HandleResetPassword(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		ID       string `json:"id"`
+		Token    string `json:"token"`
+		Password string `json:"password"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"error": "invalid"})
+		return
+	}
+	if s.Accounts == nil || body.ID == "" || body.Token == "" || !s.Accounts.ValidPassword(body.Password) {
+		writeJSON(w, http.StatusOK, map[string]any{"error": "invalid"})
+		return
+	}
+	status := "invalid"
+	if s.Accounts.ResetPassword(body.ID, body.Token, body.Password) {
+		status = "success"
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": status})
 }
 
 // Handler returns the read-only route set for the caller's http.Server.

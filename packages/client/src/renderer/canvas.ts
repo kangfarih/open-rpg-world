@@ -89,6 +89,15 @@ export default class Canvas extends Renderer {
         // Draw only tiles with animated indexes if we have rendered a frame.
         if (this.hasRenderedFrame()) return this.drawAnimatedIndexes();
 
+        console.log(
+            '[DEBUG Canvas.draw] forceRendering:',
+            this.forceRendering,
+            'map.data length:',
+            this.map.data.length,
+            'tilesets loaded:',
+            this.map.tilesets.length
+        );
+
         this.clearDrawing();
         this.saveDrawing();
 
@@ -102,6 +111,7 @@ export default class Canvas extends Renderer {
          * all within one function.
          */
 
+        let tilesDrawn = 0;
         for (let y = this.camera.gridY - 2; y < this.camera.gridY + this.camera.gridHeight; y++)
             for (
                 let x = this.camera.gridX - 2;
@@ -113,8 +123,20 @@ export default class Canvas extends Renderer {
 
                 let index = x + y * this.map.width;
 
+                if (this.map.data[index] !== 0) tilesDrawn++;
                 this.parseTile(this.map.data[index], index);
             }
+
+        console.log(
+            '[DEBUG Canvas.draw] tiles drawn:',
+            tilesDrawn,
+            'camera grid:',
+            this.camera.gridX,
+            this.camera.gridY,
+            'grid size:',
+            this.camera.gridWidth,
+            this.camera.gridHeight
+        );
 
         this.saveFrame();
         this.restoreDrawing();
@@ -255,7 +277,10 @@ export default class Canvas extends Renderer {
     ): void {
         let tileset = this.map.getTilesetFromId(tileId);
 
-        if (!tileset) return;
+        if (!tileset) {
+            console.log('[DEBUG Canvas.drawTile] tileset not found for tileId:', tileId);
+            return;
+        }
 
         /**
          * To prevent redrawing and reculating the same tile, we

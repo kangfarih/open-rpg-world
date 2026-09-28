@@ -7,7 +7,7 @@ package main
 
 import (
 	"bytes"
-	"compress/gzip"
+	"compress/zlib"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -189,10 +189,10 @@ func main() {
 
 	gz, err := base64.StdEncoding.DecodeString(mapB64)
 	check(err == nil, "map base64 decodes")
-	zr, err := gzip.NewReader(bytes.NewReader(gz))
-	check(err == nil, "map gzip opens")
+	zr, err := zlib.NewReader(bytes.NewReader(gz))
+	check(err == nil, "map zlib reader opens")
 	rawJSON, err := io.ReadAll(zr)
-	check(err == nil, "map gzip reads")
+	check(err == nil, "map zlib reads")
 	check(int(mapBuf) == len(rawJSON),
 		fmt.Sprintf("map bufSize==json bytes (%d==%d)", int(mapBuf), len(rawJSON)))
 

@@ -29,7 +29,7 @@
 //     most 2^(in-scope gates) entries (on the current map exactly one gate,
 //     queenant, intersects the spawn scope), hard-capped at dynCacheCap with
 //     a full clear on overflow.
-//   - Live updates mirror TS's updateRegion push with the same [4,base64gzip,
+//   - Live updates mirror TS's updateRegion push with the same [4,base64deflate,
 //     bufSize] framing (no packet-shape change): maybePushDynamicMap sends
 //     the player's current frame only when its signature differs from what
 //     that connection last saw. It is called at Ready (covers returning

@@ -174,10 +174,23 @@ func socHandleFriends(c *playerConn, data []byte) { social.HandleFriends(socConn
 func socHandleGuild(c *playerConn, data []byte) { social.HandleGuild(socConn(c), data) }
 
 func socGuildCreate(c *playerConn, name, colour string, outline *int, outlineColour, crest string) {
+	// TS guilds.ts:37 — guests cannot create guilds (the guest check runs
+	// before the gold/tutorial gates, so no gold is ever deducted).
+	if c != nil && c.Guest {
+		notifyPlayer(c, "guilds:NOT_ALLOWED_GUESTS_CREATE")
+		return
+	}
 	social.CreateGuild(socConn(c), name, colour, outline, outlineColour, crest)
 }
 
-func socGuildJoin(c *playerConn, identifier string) { social.JoinGuild(socConn(c), identifier) }
+func socGuildJoin(c *playerConn, identifier string) {
+	// TS guilds.ts:151 — guests cannot join guilds either.
+	if c != nil && c.Guest {
+		notifyPlayer(c, "guilds:NOT_ALLOWED_GUESTS_JOIN")
+		return
+	}
+	social.JoinGuild(socConn(c), identifier)
+}
 
 func socGuildLeave(c *playerConn) { social.LeaveGuild(socConn(c)) }
 

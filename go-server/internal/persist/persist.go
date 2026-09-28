@@ -231,6 +231,10 @@ func (s *Store) EnsureSchema() error {
 		`CREATE TABLE IF NOT EXISTS friends(player TEXT, friend TEXT, PRIMARY KEY(player, friend))`,
 		`CREATE TABLE IF NOT EXISTS quests(player TEXT, quest TEXT, stage INT, substage INT, PRIMARY KEY(player, quest))`,
 		`CREATE TABLE IF NOT EXISTS achievements(player TEXT, ach TEXT, stage INT, PRIMARY KEY(player, ach))`,
+		// v9 fold-in: identities (login name -> password derivation + reset
+		// token). DDL identical to account.AccountsDDL so that package's own
+		// EnsureTables stays idempotent.
+		`CREATE TABLE IF NOT EXISTS accounts(id TEXT PRIMARY KEY, username TEXT UNIQUE, password_hash BLOB, salt BLOB, iterations INT DEFAULT 0, algo TEXT DEFAULT '', email TEXT DEFAULT '', email_norm TEXT DEFAULT '', created_at INT DEFAULT 0, reset_token_hash BLOB, reset_token_exp INT DEFAULT 0)`,
 	} {
 		if _, err := s.db.Exec(ddl); err != nil {
 			return fmt.Errorf("ddl: %w", err)
@@ -259,6 +263,9 @@ func (s *Store) EnsureSchema() error {
 	// DEFAULT 0 (never reset) so pre-v8 rows trigger a reset on first login.
 	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN last_daily_reset INT DEFAULT 0`)
 	_, _ = s.db.Exec(`ALTER TABLE players ADD COLUMN last_weekly_reset INT DEFAULT 0`)
+	// v9: account email lookup index (CREATE INDEX IF NOT EXISTS, so the
+	// account package's own EnsureTables stays idempotent).
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS accounts_email ON accounts(email_norm)`)
 	return s.checkSchemaVersion()
 }
 

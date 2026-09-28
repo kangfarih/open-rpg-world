@@ -71,6 +71,57 @@ import type Resource from '../entity/objects/resource/resource';
 import type { ResourcePacketData } from '@kaetram/common/network/impl/resource';
 import type { NetworkPacketData } from '@kaetram/common/network/impl/network';
 
+// Device fingerprint: a stable identifier stored in localStorage so a returning
+// browser reuses the same guest identity (and its persisted state) across
+// sessions. Combines a random UUID (primary signal) with a lightweight canvas
+// hash (secondary signal, detects browser changes on the same device).
+const DEVICE_ID_KEY = 'rpg_device_id',
+    DEVICE_FP_KEY = 'rpg_device_fp';
+
+function getDeviceId(): string {
+    let id = localStorage.getItem(DEVICE_ID_KEY);
+    if (!id) {
+        // crypto.randomUUID is available in all modern browsers; fall back to
+        // a manual UUID v4 for older environments.
+        id =
+            (crypto as Crypto & { randomUUID?(): string }).randomUUID?.() ??
+            'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+                let r = (Math.random() * 16) | 0;
+                return (c === 'x' ? r : (r & 0x3) | 0x8).toString(16);
+            });
+        localStorage.setItem(DEVICE_ID_KEY, id);
+    }
+    // Canvas fingerprint: draw known text and hash the dataURL. This catches
+    // cases where localStorage is cleared but the browser is the same.
+    let fp = localStorage.getItem(DEVICE_FP_KEY);
+    if (!fp)
+        try {
+            let canvas = document.createElement('canvas');
+            canvas.width = 200;
+            canvas.height = 50;
+            let ctx = canvas.getContext('2d');
+            if (ctx) {
+                ctx.textBaseline = 'top';
+                ctx.font = '14px Arial';
+                ctx.fillStyle = '#f60';
+                ctx.fillRect(0, 0, 200, 50);
+                ctx.fillStyle = '#069';
+                ctx.fillText('RPG World Sim Device FP', 2, 2);
+                let data = canvas.toDataURL(),
+                    hash = 0;
+                for (let i = 0; i < data.length; i++)
+                    hash = ((hash << 5) - hash + (data.codePointAt(i) ?? 0)) | 0;
+
+                fp = Math.abs(hash).toString(16);
+                localStorage.setItem(DEVICE_FP_KEY, fp);
+            }
+        } catch {
+            fp = '0';
+        }
+
+    return `${id}:${fp}`;
+}
+
 export default class Connection {
     /**
      * Keep all game objects as instances in this class
@@ -213,8 +264,13 @@ export default class Connection {
         this.game.player.serverId = data.serverId!;
 
         // Guest login doesn't require any credentials, send the packet right away.
+        // Include a device fingerprint so the server can map returning devices
+        // to the same guest identity (persistent guest sessions).
         if (this.app.isGuest())
-            return this.socket.send(Packets.Login, { opcode: Opcodes.Login.Guest });
+            return this.socket.send(Packets.Login, {
+                opcode: Opcodes.Login.Guest,
+                deviceId: getDeviceId()
+            });
 
         let username = this.app.getUsername(),
             password = this.app.getPassword(),
@@ -270,7 +326,6 @@ export default class Connection {
                 .map((char) => char.charCodeAt(0)),
             inflatedString = inflate(new Uint8Array(bufferData), { to: 'string' }),
             regions = JSON.parse(inflatedString);
-
         this.map.loadRegions(regions);
 
         // Used if the client uses low-power mode, forces redrawing of trees.
