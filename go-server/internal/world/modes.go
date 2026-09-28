@@ -1,9 +1,10 @@
 package world
 
 // Modes selects the map/entity overlay set. Mirrors the main.go TESTMAP /
-// CLEAN / COMBAT globals: TESTMAP defaults ON (cloned base + pond + demo
-// line + showcase grid), CLEAN and COMBAT default OFF (pure terrain; CLEAN
-// adds one adventurer, COMBAT adds the warbot party + boss dummy).
+// CLEAN / COMBAT globals: TESTMAP defaults OFF (proper gameplay with real
+// world regions), CLEAN and COMBAT default OFF (pure terrain; CLEAN adds one
+// adventurer, COMBAT adds the warbot party + boss dummy). Use TESTMAP=1 or
+// --testmap for dev/testing with the showcase grid.
 type Modes struct {
 	Test   bool
 	Clean  bool
@@ -38,7 +39,7 @@ func parseTestMode(env string, args []string) bool {
 			return false
 		}
 	}
-	return true
+	return false // Default OFF for proper gameplay; use TESTMAP=1 or --testmap for dev/testing
 }
 
 func parseFlagMode(env string, args []string, on, off string) bool {
