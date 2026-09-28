@@ -95,10 +95,11 @@ const (
 // REMOVED: HeroMaxHP is now level-scaled via meta.HeroMaxHPForLevel.
 // The MobWorld interface exposes HeroMaxHP(instance) for runtime queries.
 
-// HeroSpawnX/HeroSpawnY is getSpawn(): the stub's fixed spawn point.
+// HeroSpawnX/HeroSpawnY is getSpawn(): the tutorial spawn point
+// (TS parity: TUTORIAL_SPAWN_POINT '133,562' near the Coder NPC).
 const (
-	HeroSpawnX = 100
-	HeroSpawnY = 96
+	HeroSpawnX = 133
+	HeroSpawnY = 562
 )
 
 // Modules mirrors for the damage roll (main.go:930-931).

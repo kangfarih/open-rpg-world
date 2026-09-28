@@ -25,7 +25,6 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"strings"
 	"sync"
 	"time"
 
@@ -36,7 +35,6 @@ import (
 	gnet "rpg-world-server/internal/net"
 	"rpg-world-server/internal/persist"
 	"rpg-world-server/internal/player"
-	"rpg-world-server/internal/player/chat"
 	"rpg-world-server/internal/resets"
 	worldcore "rpg-world-server/internal/world"
 
@@ -245,7 +243,8 @@ func playerStateFor(key string) *playerState {
 	st, ok := pstates[key]
 	if !ok {
 		// New player: level 1, full HP (39 + 1*30 = 69).
-		st = &playerState{X: 100, Y: 96, Level: 1, HP: meta.HeroMaxHPForLevel(1),
+		// Tutorial spawn (TS parity: TUTORIAL_SPAWN_POINT '133,562').
+		st = &playerState{X: entity.HeroSpawnX, Y: entity.HeroSpawnY, Level: 1, HP: meta.HeroMaxHPForLevel(1),
 			HomeX: entity.HeroSpawnX, HomeY: entity.HeroSpawnY,
 			Skills: map[int]*skillDef{}}
 		pstates[key] = st
@@ -765,6 +764,13 @@ func markDirty(key string) {
 	if key == "" || dbConn == nil || persistStore == nil {
 		return
 	}
+	// Guest sessions are never persisted (player.ts:2358 save() early-returns
+	// for isGuest). This is the choke point every gameplay path funnels
+	// through, so one guard covers quests, skills, inventory and statistics.
+	// Exception: device-identified guests (persistentGuests) DO persist.
+	if isGuestKey(key) && !isPersistentGuest(key) {
+		return
+	}
 	persistStore.MarkDirty(key)
 }
 
@@ -883,6 +889,12 @@ func savePlayerSync(key string) {
 	if dbConn == nil || persistStore == nil || key == "" {
 		return
 	}
+	// Guest sessions are never written (player.ts:2358 save() isGuest guard);
+	// this is the synchronous disconnect/flush path, so it needs the same
+	// guard as markDirty. Exception: device-identified guests DO persist.
+	if isGuestKey(key) && !isPersistentGuest(key) {
+		return
+	}
 	st := playerSnapshot(key)
 	dbMu.Lock()
 	if st != nil {
@@ -918,35 +930,50 @@ func loadPlayerState(key string) (*playerState, bool) {
 // is known, else the fresh hero. Also queues Container + Skill batches so a
 // reconnect visibly restores inventory/skills.
 func loginWelcome(c *playerConn, username string) (PlayerData, [][]any) {
-	key := username
+	key := sanitizeUsername(username)
 	if key == "" {
-		key = c.Instance
+		// Instance fallback (legacy behaviour for a login with no name);
+		// instance IDs are generated and never trigger the filter.
+		key = sanitizeUsername(c.Instance)
 	}
-	// Username sanitization (incoming.ts:199): lowercase, slice to 32, trim,
-	// then profanity filter. Applied to the key (username or instance fallback;
-	// instance IDs are generated and won't trigger the filter).
-	key = strings.ToLower(key)
-	if len(key) > 32 {
-		key = key[:32]
-	}
-	key = strings.TrimSpace(key)
-	key = chat.Clean(key)
 	c.Username = key
 	var st *playerState
-	if loaded, ok := loadPlayerState(key); ok {
+	if c.Guest {
+		if isPersistentGuest(key) {
+			// Device-identified returning guest: try to load saved state.
+			if loaded, ok := loadPlayerState(key); ok {
+				st = loaded
+			} else {
+				// First login for this device: fresh state, enable persistence.
+				st = playerStateFor(key)
+				markDirty(key)
+			}
+		} else {
+			// TS guest (incoming.ts:235): player.load(Creator.serialize(player)) —
+			// a fresh default state, never restored from and never written to the
+			// database (player.ts:2358 save() returns early for guests).
+			st = playerStateFor(key)
+			markGuestKey(key)
+		}
+	} else if loaded, ok := loadPlayerState(key); ok {
 		st = loaded
 	} else {
 		st = playerStateFor(key)
 		markDirty(key)
 	}
-	// Statistics: record login lifecycle fields (creationTime on first
-	// login, lastLogin, loginCount) after the counters are restored.
-	statsRecordLogin(key)
-	// Daily/weekly reset: check at login so a player who logs in after a
-	// boundary crossing sees the reset immediately (the 60s ticker handles
-	// players already online). Notifications are sent after the Welcome
-	// frame lands (notifyPlayer needs a connected client).
-	loginResetFired := checkLoginResets(key, time.Now())
+	// Statistics + reset stamps are database writes, so ephemeral guests skip
+	// them. Device-identified persistent guests get full stats tracking.
+	var loginResetFired []resets.Kind
+	if !c.Guest || isPersistentGuest(key) {
+		// Statistics: record login lifecycle fields (creationTime on first
+		// login, lastLogin, loginCount) after the counters are restored.
+		statsRecordLogin(key)
+		// Daily/weekly reset: check at login so a player who logs in after a
+		// boundary crossing sees the reset immediately (the 60s ticker handles
+		// players already online). Notifications are sent after the Welcome
+		// frame lands (notifyPlayer needs a connected client).
+		loginResetFired = checkLoginResets(key, time.Now())
+	}
 	// Rank durability (database.setRank parity): a persisted offline /setrank
 	// lands on the session at login. Fresh rows carry 0 (None), a no-op.
 	c.rank = st.Rank
