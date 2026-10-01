@@ -193,7 +193,7 @@ func ProgressSub(c Conn, d Deps, st *PlayerState, key string) {
 // Talk routes an NPC interaction through quests then achievements
 // (handler.handleTalkToNPC order). Returns true when the quest/achievement
 // consumed the interaction (caller skips the default dialogue).
-func Talk(c Conn, d Deps, npcKey string) bool {
+func Talk(c Conn, d Deps, instance, npcKey string) bool {
 	Load()
 	if !ok || c == nil {
 		return false
@@ -207,7 +207,7 @@ func Talk(c Conn, d Deps, npcKey string) bool {
 		if st.IsFinished(key) || !def.NPCs[npcKey] || !RequirementsOK(d, st, def) {
 			continue
 		}
-		if HandleQuestTalk(c, d, st, key, npcKey) {
+		if HandleQuestTalk(c, d, st, key, instance, npcKey) {
 			return true
 		}
 	}
@@ -222,7 +222,7 @@ func Talk(c Conn, d Deps, npcKey string) bool {
 		if st.Achs[key] >= def.StageCount {
 			continue
 		}
-		if HandleAchTalk(c, d, st, key) {
+		if HandleAchTalk(c, d, st, key, instance) {
 			return true
 		}
 	}
@@ -255,7 +255,7 @@ func RequirementsOK(d Deps, st *PlayerState, def *Quest) bool {
 // (stage text / hasItemText / completedText by search order, including
 // substage NPCs), progression on dialogue end, item requirement consumption
 // and reward grants.
-func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
+func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, instance, npcKey string) bool {
 	def := Quests[key]
 	q := st.Quest(key)
 
@@ -333,7 +333,8 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 	text := dialogue[min(st.TalkIndex, len(dialogue)-1)]
 	endOfDialogue := st.TalkIndex == len(dialogue)-1
 	st.TalkIndex++
-	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketNPC, protocol.NPCTalk, protocol.NpcPacketData{Instance: strPtr(npcKey), Text: &text}))
+	instPtr := &instance
+	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketNPC, protocol.NPCTalk, protocol.NpcPacketData{Instance: instPtr, Text: &text}))
 
 	// quest.ts handleTalk: progression fires when the final line shows.
 	if !endOfDialogue {
@@ -444,7 +445,7 @@ func HandleQuestTalk(c Conn, d Deps, st *PlayerState, key, npcKey string) bool {
 
 // HandleAchTalk ports achievement.handleTalk: hidden/started dialogue,
 // progress on dialogue end (discover stage), item requirements consumed.
-func HandleAchTalk(c Conn, d Deps, st *PlayerState, key string) bool {
+func HandleAchTalk(c Conn, d Deps, st *PlayerState, key, instance string) bool {
 	def := Achs[key]
 	dialogue := def.Raw.DialogueHidden
 	if st.Achs[key] > 0 {
@@ -460,7 +461,8 @@ func HandleAchTalk(c Conn, d Deps, st *PlayerState, key string) bool {
 	text := dialogue[min(st.TalkIndex, len(dialogue)-1)]
 	endOfDialogue := st.TalkIndex == len(dialogue)-1
 	st.TalkIndex++
-	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketNPC, protocol.NPCTalk, protocol.NpcPacketData{Text: &text}))
+	instPtr := &instance
+	d.Bus.SendTo(c.InstanceID(), protocol.PktOp(protocol.PacketNPC, protocol.NPCTalk, protocol.NpcPacketData{Instance: instPtr, Text: &text}))
 	if !endOfDialogue {
 		return true
 	}

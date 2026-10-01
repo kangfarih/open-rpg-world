@@ -103,9 +103,10 @@ type ItemCatalog interface {
 }
 
 // QuestTalk abstracts m11Talk (quest/achievement NPC hook). Returns true
-// when the interaction is consumed.
+// when the interaction is consumed. instance is the entity instance id
+// (e.g. "mk-n-644101") so the NPC talk packet addresses the correct sprite.
 type QuestTalk interface {
-	Talk(c EconomyConn, npcKey string) bool
+	Talk(c EconomyConn, instance, npcKey string) bool
 }
 
 // PetHooks abstracts pets_wire (drop-spawn companion flow).

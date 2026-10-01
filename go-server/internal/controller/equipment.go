@@ -120,7 +120,7 @@ func HandleNPCTarget(c EconomyConn, d EconomyDeps, instance string) {
 
 	// M11: quest/achievement NPCs swallow the interaction before any role
 	// handling (handler.handleTalkToNPC order).
-	if d.Quests != nil && d.Quests.Talk(c, npcKey) {
+	if d.Quests != nil && d.Quests.Talk(c, instance, npcKey) {
 		return
 	}
 	if info.Store != "" {

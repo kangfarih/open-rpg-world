@@ -121,7 +121,7 @@ func TestRoyalpetSubstageFlow(t *testing.T) {
 	store.slots = append(store.slots, fakeSlot{key: "book", count: 3})
 	SetStage(c, d, st, "royal", 1, 0, true)
 
-	if !HandleQuestTalk(c, d, st, "royal", "a") {
+	if !HandleQuestTalk(c, d, st, "royal", "i-r", "a") {
 		t.Fatal("substage talk must consume")
 	}
 	q := st.Quest("royal")
@@ -137,17 +137,17 @@ func TestRoyalpetSubstageFlow(t *testing.T) {
 
 	// Duplicate turn-in replays completedText with no progress.
 	subBefore := q.SubStage
-	HandleQuestTalk(c, d, st, "royal", "a")
+	HandleQuestTalk(c, d, st, "royal", "i-r", "a")
 	if q.SubStage != subBefore || len(q.Completed) != 1 {
 		t.Fatalf("dup a: sub=%d completed=%v, want no change", q.SubStage, q.Completed)
 	}
 
-	HandleQuestTalk(c, d, st, "royal", "b")
+	HandleQuestTalk(c, d, st, "royal", "i-r", "b")
 	if len(st.Quest("royal").Completed) != 2 || st.Quest("royal").Stage != 1 {
 		t.Fatalf("after b: stage=%d completed=%v, want stage 1 len 2",
 			st.Quest("royal").Stage, st.Quest("royal").Completed)
 	}
-	HandleQuestTalk(c, d, st, "royal", "c")
+	HandleQuestTalk(c, d, st, "royal", "i-r", "c")
 	if got := st.Quest("royal").Stage; got != 2 {
 		t.Fatalf("after all three: stage = %d, want 2", got)
 	}
@@ -319,7 +319,7 @@ func TestAbilityLevelDefault(t *testing.T) {
 	c := &fakeConn{instance: "i-ab", username: "u-ab"}
 	st := StateFor("u-ab")
 	st.Quest("abq").Stage = 0
-	HandleQuestTalk(c, d, st, "abq", "bob")
+	HandleQuestTalk(c, d, st, "abq", "i-ab", "bob")
 	if got := rec.levels["u-ab/dash"]; got != 1 {
 		t.Fatalf("quest ability level = %d, want 1", got)
 	}

@@ -289,8 +289,8 @@ func questProgressSub(c *playerConn, st *playerQuestState, key string) {
 // questTalk routes an NPC interaction through quests then achievements
 // (handler.handleTalkToNPC order). Returns true when the quest/achievement
 // consumed the interaction (caller skips the default dialogue).
-func questTalk(c *playerConn, npcKey string) bool {
-	out := quest.Talk(questWrapConn(c), questDeps(), npcKey)
+func questTalk(c *playerConn, instance, npcKey string) bool {
+	out := quest.Talk(questWrapConn(c), questDeps(), instance, npcKey)
 	// Dynmap: talk can advance achievement discovery stages internally
 	// (HandleAchTalk bypasses achProgress); signature-gated no-op
 	// when nothing changed.
@@ -306,14 +306,14 @@ func questRequirementsOK(st *playerQuestState, def *questDef) bool {
 // handleQuestTalk ports handleTalk + getNPCDialogue: dialogue selection
 // (stage text / hasItemText / completedText by search order), progression on
 // dialogue end, item requirement consumption and reward grants.
-func handleQuestTalk(c *playerConn, st *playerQuestState, key, npcKey string) bool {
-	return quest.HandleQuestTalk(questWrapConn(c), questDeps(), st.PlayerState, key, npcKey)
+func handleQuestTalk(c *playerConn, st *playerQuestState, key, instance, npcKey string) bool {
+	return quest.HandleQuestTalk(questWrapConn(c), questDeps(), st.PlayerState, key, instance, npcKey)
 }
 
 // handleAchTalk ports achievement.handleTalk: hidden/started dialogue,
 // progress on dialogue end (discover stage), item requirements consumed.
-func handleAchTalk(c *playerConn, st *playerQuestState, key string) bool {
-	return quest.HandleAchTalk(questWrapConn(c), questDeps(), st.PlayerState, key)
+func handleAchTalk(c *playerConn, st *playerQuestState, key, instance string) bool {
+	return quest.HandleAchTalk(questWrapConn(c), questDeps(), st.PlayerState, key, instance)
 }
 
 // questKill fires on mob death credited to the killer.

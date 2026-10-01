@@ -239,8 +239,8 @@ func (econPeers) WithStoreOpen(key string) []controller.EconomyConn {
 
 type econQuests struct{}
 
-func (econQuests) Talk(c controller.EconomyConn, npcKey string) bool {
-	return questTalk(tradeConn(c), npcKey)
+func (econQuests) Talk(c controller.EconomyConn, instance, npcKey string) bool {
+	return questTalk(tradeConn(c), instance, npcKey)
 }
 
 type econPets struct{}
